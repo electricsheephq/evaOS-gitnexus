@@ -183,6 +183,7 @@ program
   .option('-g, --goal <text>', 'What you want to find')
   .option('-l, --limit <n>', 'Max processes to return (default: 5)')
   .option('--content', 'Include full symbol source code')
+  .option('--max-tokens <n>', 'Truncate output to N estimated tokens')
   .action(createLazyAction(() => import('./tool.js'), 'queryCommand'));
 
 program
@@ -192,6 +193,7 @@ program
   .option('-u, --uid <uid>', 'Direct symbol UID (zero-ambiguity lookup)')
   .option('-f, --file <path>', 'File path to disambiguate common names')
   .option('--content', 'Include full symbol source code')
+  .option('--max-tokens <n>', 'Truncate output to N estimated tokens')
   .action(createLazyAction(() => import('./tool.js'), 'contextCommand'));
 
 program

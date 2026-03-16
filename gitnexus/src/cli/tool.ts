@@ -17,6 +17,7 @@
 
 import { writeSync } from 'node:fs';
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { truncateToTokenBudget } from '../config/ignore-service.js';
 import { cliError } from './cli-message.js';
 
 let _backend: LocalBackend | null = null;
@@ -65,6 +66,7 @@ export async function queryCommand(
     goal?: string;
     limit?: string;
     content?: boolean;
+    maxTokens?: string;
   },
 ): Promise<void> {
   if (!queryText?.trim()) {
@@ -81,7 +83,11 @@ export async function queryCommand(
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+  let text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  if (options?.maxTokens) {
+    text = truncateToTokenBudget(text, parseInt(options.maxTokens));
+  }
+  output(text);
 }
 
 export async function contextCommand(
@@ -91,6 +97,7 @@ export async function contextCommand(
     file?: string;
     uid?: string;
     content?: boolean;
+    maxTokens?: string;
   },
 ): Promise<void> {
   if (!name?.trim() && !options?.uid) {
@@ -106,7 +113,11 @@ export async function contextCommand(
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+  let text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  if (options?.maxTokens) {
+    text = truncateToTokenBudget(text, parseInt(options.maxTokens));
+  }
+  output(text);
 }
 
 export async function impactCommand(
