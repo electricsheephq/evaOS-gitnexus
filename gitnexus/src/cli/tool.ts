@@ -19,6 +19,7 @@ import { writeSync } from 'node:fs';
 import { LocalBackend, VALID_NODE_LABELS } from '../mcp/local/local-backend.js';
 import { cliErrorKey, cliWarnKey } from './cli-message.js';
 import { formatDetectChangesResult } from './detect-changes-format.js';
+import { parseMaxTokens, truncateToTokenBudget } from './token-budget.js';
 
 let _backend: LocalBackend | null = null;
 
@@ -66,6 +67,7 @@ export async function queryCommand(
     goal?: string;
     limit?: string;
     content?: boolean;
+    maxTokens?: string;
   },
 ): Promise<void> {
   if (!queryText?.trim()) {
@@ -82,7 +84,17 @@ export async function queryCommand(
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+  const maxTokens = parseMaxTokens(options?.maxTokens);
+  if (maxTokens.error) {
+    cliErrorKey('tool.usage.query');
+    process.stderr.write(`  --max-tokens ${maxTokens.error}\n`);
+    process.exit(1);
+  }
+  let text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  if (maxTokens.value) {
+    text = truncateToTokenBudget(text, maxTokens.value);
+  }
+  output(text);
 }
 
 export async function contextCommand(
@@ -92,6 +104,7 @@ export async function contextCommand(
     file?: string;
     uid?: string;
     content?: boolean;
+    maxTokens?: string;
   },
 ): Promise<void> {
   // Reject a `--`-prefixed uid swallowed from a following flag (see impactCommand).
@@ -112,7 +125,17 @@ export async function contextCommand(
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+  const maxTokens = parseMaxTokens(options?.maxTokens);
+  if (maxTokens.error) {
+    cliErrorKey('tool.usage.context');
+    process.stderr.write(`  --max-tokens ${maxTokens.error}\n`);
+    process.exit(1);
+  }
+  let text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  if (maxTokens.value) {
+    text = truncateToTokenBudget(text, maxTokens.value);
+  }
+  output(text);
 }
 
 export async function impactCommand(

@@ -40,6 +40,7 @@ import {
 import { logger } from '../core/logger.js';
 import { cliInfo, cliWarn, cliError } from './cli-message.js';
 import { formatDetectChangesResult } from './detect-changes-format.js';
+import { parseMaxTokens, truncateToTokenBudget } from './token-budget.js';
 
 export { formatDetectChangesResult } from './detect-changes-format.js';
 
@@ -450,13 +451,27 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
         }
 
         // Call tool, format result as text, append next-step hint
+        const maxTokens = parseMaxTokens(args.maxTokens);
+        delete args.maxTokens; // Don't pass to backend
+        if (maxTokens.error) {
+          res.setHeader('Content-Type', 'text/plain');
+          res.writeHead(400);
+          res.end(`Error: maxTokens ${maxTokens.error}`);
+          return;
+        }
         const result = await backend.callTool(toolName, args);
-        const formatted = formatToolResult(toolName, result);
+        let formatted = formatToolResult(toolName, result);
         const hint = getNextStepHint(toolName);
+        formatted = formatted + hint;
+
+        // Apply token budget if specified
+        if (maxTokens.value) {
+          formatted = truncateToTokenBudget(formatted, maxTokens.value);
+        }
 
         res.setHeader('Content-Type', 'text/plain');
         res.writeHead(200);
-        res.end(formatted + hint);
+        res.end(formatted);
         return;
       }
 
