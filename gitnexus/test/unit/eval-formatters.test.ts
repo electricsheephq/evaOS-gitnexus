@@ -12,6 +12,8 @@ import {
   formatCypherResult,
   formatDetectChangesResult,
   formatListReposResult,
+  formatHealthPayload,
+  isBearerAuthorized,
   MAX_BODY_SIZE,
   validateHost,
 } from '../../src/cli/eval-server.js';
@@ -77,6 +79,32 @@ describe('validateHost', () => {
 describe('MAX_BODY_SIZE', () => {
   it('is 1MB', () => {
     expect(MAX_BODY_SIZE).toBe(1024 * 1024);
+  });
+});
+
+describe('eval-server auth helpers', () => {
+  it('allows requests when auth is disabled', () => {
+    expect(isBearerAuthorized(null, undefined)).toBe(true);
+  });
+
+  it('requires an exact bearer token when auth is enabled', () => {
+    expect(isBearerAuthorized('secret', 'Bearer secret')).toBe(true);
+    expect(isBearerAuthorized('secret', undefined)).toBe(false);
+    expect(isBearerAuthorized('secret', 'Bearer wrong')).toBe(false);
+  });
+
+  it('redacts repo names from unauthenticated health payloads', () => {
+    expect(formatHealthPayload(['repo-a'], false)).toEqual({
+      status: 'ok',
+      auth: 'required',
+    });
+  });
+
+  it('includes repo names in authenticated health payloads', () => {
+    expect(formatHealthPayload(['repo-a'], true)).toEqual({
+      status: 'ok',
+      repos: ['repo-a'],
+    });
   });
 });
 

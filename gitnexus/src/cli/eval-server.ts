@@ -354,6 +354,19 @@ function getNextStepHint(toolName: string): string {
   }
 }
 
+export function isBearerAuthorized(authToken: string | null, authHeader: string | undefined): boolean {
+  return !authToken || authHeader === `Bearer ${authToken}`;
+}
+
+export function formatHealthPayload(repoNames: string[], includeRepos: boolean): {
+  status: 'ok';
+  repos?: string[];
+  auth?: 'required';
+} {
+  if (includeRepos) return { status: 'ok', repos: repoNames };
+  return { status: 'ok', auth: 'required' };
+}
+
 // ─── Server ───────────────────────────────────────────────────────────
 
 export async function evalServerCommand(options?: EvalServerOptions): Promise<void> {
@@ -395,10 +408,10 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
     'GitNexus eval-server: repos loaded',
   );
 
-  // Bearer token auth — if GITNEXUS_AUTH_TOKEN is set, all requests must authenticate
+  // Bearer token auth — if GITNEXUS_AUTH_TOKEN is set, mutating/tool requests must authenticate.
   const authToken = process.env.GITNEXUS_AUTH_TOKEN || null;
   if (authToken) {
-    console.error('GitNexus eval-server: Bearer token auth enabled');
+    cliInfo('GitNexus eval-server: Bearer token auth enabled');
   }
 
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -415,24 +428,29 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
 
   const server = http.createServer(async (req, res) => {
     resetIdleTimer();
-
-    // Auth check — if GITNEXUS_AUTH_TOKEN is set, verify Bearer token
-    if (authToken) {
-      const authHeader = req.headers.authorization;
-      if (!authHeader || authHeader !== `Bearer ${authToken}`) {
-        res.setHeader('Content-Type', 'application/json');
-        res.writeHead(401);
-        res.end(JSON.stringify({ error: 'Unauthorized — set Authorization: Bearer <token> header' }));
-        return;
-      }
-    }
+    const authorized = isBearerAuthorized(authToken, req.headers.authorization);
 
     try {
       // Health check
       if (req.method === 'GET' && req.url === '/health') {
         res.setHeader('Content-Type', 'application/json');
         res.writeHead(200);
-        res.end(JSON.stringify({ status: 'ok', repos: repos.map((r) => r.name) }));
+        res.end(
+          JSON.stringify(
+            formatHealthPayload(
+              repos.map((r) => r.name),
+              authorized,
+            ),
+          ),
+        );
+        return;
+      }
+
+      // Auth check — if GITNEXUS_AUTH_TOKEN is set, all non-health requests must authenticate.
+      if (!authorized) {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(401);
+        res.end(JSON.stringify({ error: 'Unauthorized — set Authorization: Bearer <token> header' }));
         return;
       }
 
@@ -473,7 +491,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
         if (maxTokens.error) {
           res.setHeader('Content-Type', 'text/plain');
           res.writeHead(400);
-          res.end(`Error: maxTokens ${maxTokens.error}`);
+          res.end(`Error: ${maxTokens.error}`);
           return;
         }
         const result = await backend.callTool(toolName, args);

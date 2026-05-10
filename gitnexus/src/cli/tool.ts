@@ -74,6 +74,12 @@ export async function queryCommand(
     cliErrorKey('tool.usage.query');
     process.exit(1);
   }
+  const maxTokens = parseMaxTokens(options?.maxTokens);
+  if (maxTokens.error) {
+    cliErrorKey('tool.usage.query');
+    process.stderr.write(`  --max-tokens ${maxTokens.error}\n`);
+    process.exit(1);
+  }
 
   const backend = await getBackend();
   const result = await backend.callTool('query', {
@@ -84,12 +90,6 @@ export async function queryCommand(
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  const maxTokens = parseMaxTokens(options?.maxTokens);
-  if (maxTokens.error) {
-    cliErrorKey('tool.usage.query');
-    process.stderr.write(`  --max-tokens ${maxTokens.error}\n`);
-    process.exit(1);
-  }
   let text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
   if (maxTokens.value) {
     text = truncateToTokenBudget(text, maxTokens.value);
@@ -116,6 +116,12 @@ export async function contextCommand(
     cliErrorKey('tool.usage.context');
     process.exit(1);
   }
+  const maxTokens = parseMaxTokens(options?.maxTokens);
+  if (maxTokens.error) {
+    cliErrorKey('tool.usage.context');
+    process.stderr.write(`  --max-tokens ${maxTokens.error}\n`);
+    process.exit(1);
+  }
 
   const backend = await getBackend();
   const result = await backend.callTool('context', {
@@ -125,12 +131,6 @@ export async function contextCommand(
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  const maxTokens = parseMaxTokens(options?.maxTokens);
-  if (maxTokens.error) {
-    cliErrorKey('tool.usage.context');
-    process.stderr.write(`  --max-tokens ${maxTokens.error}\n`);
-    process.exit(1);
-  }
   let text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
   if (maxTokens.value) {
     text = truncateToTokenBudget(text, maxTokens.value);

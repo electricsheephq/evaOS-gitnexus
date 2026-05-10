@@ -516,6 +516,35 @@ describe('LocalBackend.callTool', () => {
     expect(result.symbol.filePath).toBe('src/App.tsx');
   });
 
+  it('context tool normalizes symbol/file aliases before dispatch', async () => {
+    (executeParameterized as any).mockResolvedValue([
+      {
+        id: 'func:handleConnect:1',
+        name: 'handleConnect',
+        type: 'Function',
+        filePath: 'src/lib/socket.ts',
+        startLine: 10,
+        endLine: 20,
+      },
+      {
+        id: 'func:handleConnect:2',
+        name: 'handleConnect',
+        type: 'Function',
+        filePath: 'src/App.tsx',
+        startLine: 42,
+        endLine: 60,
+      },
+    ]);
+
+    const result = await backend.callTool('context', {
+      symbol: 'handleConnect',
+      file: 'App.tsx',
+    });
+
+    expect(result.status).toBe('found');
+    expect(result.symbol.filePath).toBe('src/App.tsx');
+  });
+
   it('context tool promotes top candidate via scoring when multiple rows survive DB pre-filter (#470)', async () => {
     // This test explicitly exercises the scored-promotion path (#470
     // review): both candidates satisfy the file_path hint (so DB
@@ -679,6 +708,47 @@ describe('LocalBackend.callTool', () => {
     for (const [, cypher] of calls) {
       expect(cypher).not.toMatch(/WHERE n\.name = \$symName/);
     }
+  });
+
+  it('impact tool normalizes name alias and defaults direction to upstream', async () => {
+    (executeParameterized as any).mockResolvedValue([
+      {
+        id: 'func:login',
+        name: 'login',
+        type: 'Function',
+        filePath: 'src/auth.ts',
+        startLine: 5,
+        endLine: 15,
+      },
+    ]);
+    (executeQuery as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('impact', { name: 'login' });
+
+    expect(result.target.name).toBe('login');
+    expect(result.direction).toBe('upstream');
+  });
+
+  it('impact tool normalizes symbol alias before dispatch', async () => {
+    (executeParameterized as any).mockResolvedValue([
+      {
+        id: 'func:logout',
+        name: 'logout',
+        type: 'Function',
+        filePath: 'src/auth.ts',
+        startLine: 20,
+        endLine: 30,
+      },
+    ]);
+    (executeQuery as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('impact', {
+      symbol: 'logout',
+      direction: 'downstream',
+    });
+
+    expect(result.target.name).toBe('logout');
+    expect(result.direction).toBe('downstream');
   });
 
   it('dispatches impact tool', async () => {
