@@ -48,7 +48,9 @@ function mcpReadOnlyMode(): boolean {
 }
 
 function defaultRepo(): string {
-  return process.env.OPENCLAW_CODE_INDEX_DEFAULT_REPO || process.env.GITNEXUS_MCP_DEFAULT_REPO || '';
+  return (
+    process.env.OPENCLAW_CODE_INDEX_DEFAULT_REPO || process.env.GITNEXUS_MCP_DEFAULT_REPO || ''
+  );
 }
 
 function configuredAllowedRepos(): Set<string> | null {
@@ -93,7 +95,9 @@ function assertMcpReadOnlyResource(uri: string): void {
   if (!mcpReadOnlyMode()) return;
   const match = /^gitnexus:\/\/repo\/([^/]+)/u.exec(uri);
   if (match && !repoAllowed(decodeURIComponent(match[1]!))) {
-    throw new Error(`Resource repo "${decodeURIComponent(match[1]!)}" is not in the GitNexus MCP allow-list.`);
+    throw new Error(
+      `Resource repo "${decodeURIComponent(match[1]!)}" is not in the GitNexus MCP allow-list.`,
+    );
   }
   if (/^gitnexus:\/\/group\//u.test(uri)) {
     throw new Error('Group resources are not available in GitNexus MCP read-only mode.');

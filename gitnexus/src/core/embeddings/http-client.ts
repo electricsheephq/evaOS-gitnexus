@@ -105,8 +105,10 @@ const httpEmbedBatch = async (
   dimensions: number | undefined,
   batchIndex = 0,
 ): Promise<EmbeddingItem[]> => {
-  const body: { input: string[]; model: string; dimensions?: number; output_dimension?: number } =
-    { input: batch, model };
+  const body: { input: string[]; model: string; dimensions?: number; output_dimension?: number } = {
+    input: batch,
+    model,
+  };
   if (dimensions !== undefined) {
     let host = '';
     try {
