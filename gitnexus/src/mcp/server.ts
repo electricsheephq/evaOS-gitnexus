@@ -28,6 +28,7 @@ import { installGlobalStdoutSentinel } from './stdio-context.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 import { parseMaxTokens, truncateToTokenBudget } from '../cli/token-budget.js';
+import { defaultRepo, mcpReadOnlyMode, repoAllowed } from './config.js';
 
 const MCP_READ_ONLY_TOOLS = new Set([
   'list_repos',
@@ -42,33 +43,6 @@ const MCP_QUERY_LIMIT_MAX = 20;
 const MCP_QUERY_SYMBOLS_MAX = 50;
 const MCP_IMPACT_DEPTH_MAX = 8;
 const MCP_IMPACT_TIMEOUT_MAX = 60_000;
-
-function mcpReadOnlyMode(): boolean {
-  return process.env.OPENCLAW_CODE_INDEX_MCP === '1' || process.env.GITNEXUS_MCP_READ_ONLY === '1';
-}
-
-function defaultRepo(): string {
-  return (
-    process.env.OPENCLAW_CODE_INDEX_DEFAULT_REPO || process.env.GITNEXUS_MCP_DEFAULT_REPO || ''
-  );
-}
-
-function configuredAllowedRepos(): Set<string> | null {
-  const raw =
-    process.env.GITNEXUS_MCP_ALLOWED_REPOS || process.env.OPENCLAW_CODE_INDEX_ALLOWED_REPOS || '';
-  const names = raw
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  return names.length ? new Set(names) : null;
-}
-
-function repoAllowed(repo: string): boolean {
-  const allowed = configuredAllowedRepos();
-  if (allowed) return allowed.has(repo);
-  if (process.env.OPENCLAW_CODE_INDEX_MCP === '1') return /^openclaw(?:-|$)/u.test(repo);
-  return true;
-}
 
 function normalizeArgsForMcp(toolName: string, args: any): any {
   const normalized = { ...(args || {}) };

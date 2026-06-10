@@ -43,6 +43,7 @@ import {
 import { PhaseTimer } from '../../core/search/phase-timer.js';
 import { checkStalenessAsync, checkCwdMatch } from '../../core/git-staleness.js';
 import { logger } from '../../core/logger.js';
+import { mcpDefaultRepo, mcpReadOnlyMode, repoAllowed } from '../config.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -54,35 +55,6 @@ const MCP_READ_ONLY_TOOLS = new Set([
   'detect_changes',
   'cypher',
 ]);
-
-function mcpReadOnlyMode(): boolean {
-  return process.env.OPENCLAW_CODE_INDEX_MCP === '1' || process.env.GITNEXUS_MCP_READ_ONLY === '1';
-}
-
-function configuredAllowedRepos(): Set<string> | null {
-  const raw =
-    process.env.GITNEXUS_MCP_ALLOWED_REPOS || process.env.OPENCLAW_CODE_INDEX_ALLOWED_REPOS || '';
-  const names = raw
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  return names.length ? new Set(names) : null;
-}
-
-function mcpDefaultRepo(): string | undefined {
-  return (
-    process.env.OPENCLAW_CODE_INDEX_DEFAULT_REPO ||
-    process.env.GITNEXUS_MCP_DEFAULT_REPO ||
-    undefined
-  );
-}
-
-function repoAllowedByMcp(name: string): boolean {
-  const allowed = configuredAllowedRepos();
-  if (allowed) return allowed.has(name);
-  if (process.env.OPENCLAW_CODE_INDEX_MCP === '1') return /^openclaw(?:-|$)/u.test(name);
-  return true;
-}
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -485,7 +457,7 @@ export class LocalBackend {
   }
 
   private visibleRepoEntries(): Array<[string, RepoHandle]> {
-    return [...this.repos.entries()].filter(([, handle]) => repoAllowedByMcp(handle.name));
+    return [...this.repos.entries()].filter(([, handle]) => repoAllowed(handle.name));
   }
 
   private visibleRepoHandles(): RepoHandle[] {

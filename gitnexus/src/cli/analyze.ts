@@ -405,9 +405,11 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
       repoPath,
       {
         // Pipeline re-index — OR'd with --skills because skill generation
-        // needs a fresh pipelineResult. Has no bearing on the registry
-        // collision guard (see allowDuplicateName below).
-        force: options?.force || options?.skills,
+        // needs a fresh pipelineResult. When --skip-ai-context suppresses
+        // skill generation, keep the up-to-date fast path available.
+        // Has no bearing on the registry collision guard (see
+        // allowDuplicateName below).
+        force: options?.force || (options?.skills && !options?.skipAiContext),
         embeddings: embeddingsEnabled,
         embeddingsNodeLimit,
         dropEmbeddings: options?.dropEmbeddings,

@@ -73,6 +73,10 @@ export class CompatibleStdioServerTransport implements Transport {
     this.onerror?.(error);
   };
 
+  private readonly _onend = () => {
+    void this.close();
+  };
+
   async start() {
     if (this._started) {
       throw new Error('CompatibleStdioServerTransport already started!');
@@ -84,9 +88,7 @@ export class CompatibleStdioServerTransport implements Transport {
     // EOF on stdin means the client/parent is gone — close the transport so the
     // server's stdin 'end' / shutdown path runs deterministically rather than
     // leaving a flowing-mode 'data' listener spinning the event loop.
-    this._stdin.on('end', () => {
-      void this.close();
-    });
+    this._stdin.on('end', this._onend);
   }
 
   private detectFraming(): StdioFraming | null {
@@ -209,6 +211,7 @@ export class CompatibleStdioServerTransport implements Transport {
   async close() {
     this._stdin.off('data', this._ondata);
     this._stdin.off('error', this._onerror);
+    this._stdin.off('end', this._onend);
 
     const remainingDataListeners = this._stdin.listenerCount('data');
     if (remainingDataListeners === 0) {

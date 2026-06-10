@@ -113,4 +113,22 @@ describe('analyzeCommand --embeddings [limit] parsing', () => {
     const opts = runFullAnalysisMock.mock.calls[0][1];
     expect(opts.skipAiContext).toBe(true);
   });
+
+  it('does not force a reindex when --skills is paired with --skip-ai-context', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { skills: true, skipAiContext: true });
+
+    const opts = runFullAnalysisMock.mock.calls[0][1];
+    expect(opts.force).toBe(false);
+  });
+
+  it('still forces a reindex when --skills will generate AI context', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { skills: true });
+
+    const opts = runFullAnalysisMock.mock.calls[0][1];
+    expect(opts.force).toBe(true);
+  });
 });
