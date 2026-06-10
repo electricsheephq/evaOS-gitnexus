@@ -10,6 +10,7 @@ import TypeScript from 'tree-sitter-typescript';
 import Python from 'tree-sitter-python';
 import Java from 'tree-sitter-java';
 import CSharp from 'tree-sitter-c-sharp';
+import { requireVendoredGrammar } from '../../src/core/tree-sitter/vendored-grammars.js';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
 import CPP from 'tree-sitter-cpp';
@@ -17,18 +18,10 @@ import PHP from 'tree-sitter-php';
 import { SupportedLanguages } from '../../src/config/supported-languages.js';
 import { getProvider } from '../../src/core/ingestion/languages/index.js';
 
-let Kotlin: Parser.Language | null = null;
-try {
-  Kotlin = require('tree-sitter-kotlin') as Parser.Language;
-  const testParser = new Parser();
-  testParser.setLanguage(Kotlin);
-} catch {
-  Kotlin = null;
-}
-
-const describeKotlin = Kotlin ? describe : describe.skip;
+// Vendored grammar — loaded from vendor/ by absolute path, never node_modules (#2111).
+const Kotlin = requireVendoredGrammar('tree-sitter-kotlin');
+const describeKotlin = describe;
 const setKotlinLanguage = (parser: Parser) => {
-  if (!Kotlin) throw new Error('tree-sitter-kotlin not available');
   parser.setLanguage(Kotlin);
 };
 
