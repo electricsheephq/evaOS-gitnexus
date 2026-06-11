@@ -219,6 +219,20 @@ describe('CompatibleStdioServerTransport', () => {
     );
   });
 
+  it('removes the stdin EOF listener when closed', async () => {
+    await transport.start();
+    expect(stdin.listenerCount('end')).toBe(1);
+
+    await transport.close();
+    expect(stdin.listenerCount('end')).toBe(0);
+
+    await transport.start();
+    expect(stdin.listenerCount('end')).toBe(1);
+
+    await transport.close();
+    expect(stdin.listenerCount('end')).toBe(0);
+  });
+
   it('does not detect content-length framing from short ambiguous prefix', async () => {
     await transport.start();
     const onError = vi.fn();

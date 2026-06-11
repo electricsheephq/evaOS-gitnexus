@@ -43,8 +43,18 @@ import {
 import { PhaseTimer } from '../../core/search/phase-timer.js';
 import { checkStalenessAsync, checkCwdMatch } from '../../core/git-staleness.js';
 import { logger } from '../../core/logger.js';
+import { mcpDefaultRepo, mcpReadOnlyMode, repoAllowed } from '../config.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
+
+const MCP_READ_ONLY_TOOLS = new Set([
+  'list_repos',
+  'query',
+  'context',
+  'impact',
+  'detect_changes',
+  'cypher',
+]);
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -358,7 +368,8 @@ export class LocalBackend {
    * while the MCP server was running.
    */
   async resolveRepo(repoParam?: string): Promise<RepoHandle> {
-    const result = this.resolveRepoFromCache(repoParam);
+    const effectiveRepo = repoParam || mcpDefaultRepo();
+    const result = this.resolveRepoFromCache(effectiveRepo);
     if (result) {
       // Issue: silent graph drift across sibling clones.
       // If the caller's cwd lives in a *different* on-disk clone of
@@ -374,15 +385,19 @@ export class LocalBackend {
 
     // Miss — refresh registry and try once more
     await this.refreshRepos();
-    const retried = this.resolveRepoFromCache(repoParam);
+    const retried = this.resolveRepoFromCache(effectiveRepo);
     if (retried) {
       this.maybeWarnSiblingDrift(retried).catch(() => {});
       return retried;
     }
 
     // Still no match — throw with helpful message
+    const visibleHandles = this.visibleRepoHandles();
     if (this.repos.size === 0) {
       throw new Error('No indexed repositories. Run: gitnexus analyze');
+    }
+    if (visibleHandles.length === 0) {
+      throw new Error('No repositories match the configured GitNexus MCP allow-list.');
     }
 
     // Build a disambiguated "Available: …" list (#829). When two handles
@@ -390,16 +405,16 @@ export class LocalBackend {
     // caller can actually pick the right one. Single-name entries render
     // identically to pre-#829 output.
     const nameCounts = new Map<string, number>();
-    for (const h of this.repos.values()) {
+    for (const h of visibleHandles) {
       const key = h.name.toLowerCase();
       nameCounts.set(key, (nameCounts.get(key) ?? 0) + 1);
     }
-    const labels = [...this.repos.values()].map((h) =>
+    const labels = visibleHandles.map((h) =>
       (nameCounts.get(h.name.toLowerCase()) ?? 0) > 1 ? `${h.name} (${h.repoPath})` : h.name,
     );
 
-    if (repoParam) {
-      throw new Error(`Repository "${repoParam}" not found. Available: ${labels.join(', ')}`);
+    if (effectiveRepo) {
+      throw new Error(`Repository "${effectiveRepo}" not found. Available: ${labels.join(', ')}`);
     }
     throw new Error(
       `Multiple repositories indexed. Specify which one with the "repo" parameter. Available: ${labels.join(', ')}`,
@@ -410,33 +425,43 @@ export class LocalBackend {
    * Try to resolve a repo from the in-memory cache. Returns null on miss.
    */
   private resolveRepoFromCache(repoParam?: string): RepoHandle | null {
-    if (this.repos.size === 0) return null;
+    const entries = this.visibleRepoEntries();
+    if (entries.length === 0) return null;
 
     if (repoParam) {
       const paramLower = repoParam.toLowerCase();
       // Match by id
-      if (this.repos.has(paramLower)) return this.repos.get(paramLower)!;
+      const byId = entries.find(([id]) => id === paramLower);
+      if (byId) return byId[1];
       // Match by name (case-insensitive)
-      for (const handle of this.repos.values()) {
+      for (const [, handle] of entries) {
         if (handle.name.toLowerCase() === paramLower) return handle;
       }
       // Match by path (substring)
       const resolved = path.resolve(repoParam);
-      for (const handle of this.repos.values()) {
+      for (const [, handle] of entries) {
         if (handle.repoPath === resolved) return handle;
       }
       // Match by partial name
-      for (const handle of this.repos.values()) {
+      for (const [, handle] of entries) {
         if (handle.name.toLowerCase().includes(paramLower)) return handle;
       }
       return null;
     }
 
-    if (this.repos.size === 1) {
-      return this.repos.values().next().value!;
+    if (entries.length === 1) {
+      return entries[0]![1];
     }
 
     return null; // Multiple repos, no param — ambiguous
+  }
+
+  private visibleRepoEntries(): Array<[string, RepoHandle]> {
+    return [...this.repos.entries()].filter(([, handle]) => repoAllowed(handle.name));
+  }
+
+  private visibleRepoHandles(): RepoHandle[] {
+    return this.visibleRepoEntries().map(([, handle]) => handle);
   }
 
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
@@ -538,7 +563,7 @@ export class LocalBackend {
     }>
   > {
     await this.refreshRepos();
-    const handles = [...this.repos.values()];
+    const handles = this.visibleRepoHandles();
 
     // Pre-group registered handles by `remoteUrl` so the sibling
     // lookup is O(1) per handle. We reuse the in-memory `this.repos`
@@ -650,15 +675,25 @@ export class LocalBackend {
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
   async callTool(method: string, params: any): Promise<any> {
+    if (mcpReadOnlyMode() && !MCP_READ_ONLY_TOOLS.has(method)) {
+      throw new Error(`Tool "${method}" is not available in GitNexus MCP read-only mode.`);
+    }
+
     if (method === 'list_repos') {
       return this.listRepos();
     }
 
     if (method.startsWith('group_')) {
+      if (mcpReadOnlyMode()) {
+        throw new Error('Group mode is not available in GitNexus MCP read-only mode.');
+      }
       return this.handleGroupTool(method, params || {});
     }
 
     const p = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
+    if (mcpReadOnlyMode() && typeof p.repo === 'string' && p.repo.startsWith('@')) {
+      throw new Error('Group mode is not available in GitNexus MCP read-only mode.');
+    }
     if (
       (method === 'impact' || method === 'query' || method === 'context') &&
       typeof p.repo === 'string' &&

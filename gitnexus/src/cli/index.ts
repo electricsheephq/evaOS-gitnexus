@@ -35,6 +35,10 @@ program
   )
   .option('--skills', 'Generate repo-specific skill files from detected communities')
   .option('--skip-agents-md', 'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md')
+  .option(
+    '--skip-ai-context',
+    'Skip all AI context side effects: AGENTS.md, CLAUDE.md, and bundled GitNexus skills',
+  )
   .option('--no-stats', 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md')
   .option(
     '--skip-git',

@@ -7,7 +7,7 @@
  * These are pure unit tests that mock the LadybugDB layer to test
  * the dispatch and error handling logic in isolation.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // We need to mock the LadybugDB adapter and repo-manager BEFORE importing LocalBackend.
 // local-backend.ts imports from core/lbug/pool-adapter.js; the mcp/core/lbug-adapter.js
@@ -82,6 +82,21 @@ import {
 } from '../../src/mcp/core/lbug-adapter.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
+
+const MCP_ENV_KEYS = [
+  'GITNEXUS_MCP_ALLOWED_REPOS',
+  'OPENCLAW_CODE_INDEX_ALLOWED_REPOS',
+  'GITNEXUS_MCP_DEFAULT_REPO',
+  'OPENCLAW_CODE_INDEX_DEFAULT_REPO',
+  'GITNEXUS_MCP_READ_ONLY',
+  'OPENCLAW_CODE_INDEX_MCP',
+];
+
+afterEach(() => {
+  for (const key of MCP_ENV_KEYS) {
+    delete process.env[key];
+  }
+});
 
 const MOCK_REPO_ENTRY = {
   name: 'test-project',
@@ -1111,6 +1126,33 @@ describe('LocalBackend.listRepos', () => {
     await backend.callTool('list_repos', {});
     // listRegisteredRepos called: once in init, once per listRepos
     expect(listRegisteredRepos).toHaveBeenCalledTimes(3);
+  });
+
+  it('filters listed and default repos using the MCP allow-list', async () => {
+    process.env.GITNEXUS_MCP_ALLOWED_REPOS = 'other-project';
+    process.env.GITNEXUS_MCP_DEFAULT_REPO = 'other-project';
+    setupMultipleRepos();
+    await backend.init();
+
+    const repos = await backend.callTool('list_repos', {});
+    expect(repos).toHaveLength(1);
+    expect(repos[0].name).toBe('other-project');
+
+    const resolved = await backend.resolveRepo();
+    expect(resolved.name).toBe('other-project');
+    await expect(backend.resolveRepo('test-project')).rejects.toThrow(
+      'Repository "test-project" not found',
+    );
+  });
+
+  it('rejects mutating tools in MCP read-only mode', async () => {
+    process.env.GITNEXUS_MCP_READ_ONLY = '1';
+    setupSingleRepo();
+    await backend.init();
+
+    await expect(
+      backend.callTool('rename', { repo: 'test-project', from: 'oldName', to: 'newName' }),
+    ).rejects.toThrow('read-only mode');
   });
 });
 

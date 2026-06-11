@@ -90,16 +90,40 @@ interface EmbeddingItem {
  * @param batch - Texts to embed
  * @param model - Model name for the request body
  * @param apiKey - Bearer token (only used in Authorization header)
+ * @param dimensions - Optional output-vector size. When provided, sent as
+ *   the appropriate Matryoshka field for the host:
+ *     - `dimensions` for OpenAI text-embedding-3-* / Cohere embed-v3 /
+ *       OpenAI-compatible endpoints
+ *     - `output_dimension` for Voyage (voyageai.com)
  * @param batchIndex - Logical batch number (for error context)
- * @param attempt - Current retry attempt (internal)
  */
 const httpEmbedBatch = async (
   url: string,
   batch: string[],
   model: string,
   apiKey: string,
+  dimensions: number | undefined,
   batchIndex = 0,
 ): Promise<EmbeddingItem[]> => {
+  const body: { input: string[]; model: string; dimensions?: number; output_dimension?: number } = {
+    input: batch,
+    model,
+  };
+  if (dimensions !== undefined) {
+    let host = '';
+    try {
+      host = new URL(url).hostname.toLowerCase();
+    } catch {
+      /* malformed URL will fail in fetch below */
+    }
+    const isVoyageHost = host === 'voyageai.com' || host.endsWith('.voyageai.com');
+    if (isVoyageHost) {
+      body.output_dimension = dimensions;
+    } else {
+      body.dimensions = dimensions;
+    }
+  }
+
   let resp: Response;
   try {
     resp = await resilientFetch(
@@ -111,7 +135,7 @@ const httpEmbedBatch = async (
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
         },
-        body: JSON.stringify({ input: batch, model }),
+        body: JSON.stringify(body),
       },
       {
         breakerKey: HTTP_BREAKER_KEY,
@@ -169,7 +193,14 @@ export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
   for (let i = 0; i < texts.length; i += HTTP_BATCH_SIZE) {
     const batch = texts.slice(i, i + HTTP_BATCH_SIZE);
     const batchIndex = Math.floor(i / HTTP_BATCH_SIZE);
-    const items = await httpEmbedBatch(url, batch, config.model, config.apiKey, batchIndex);
+    const items = await httpEmbedBatch(
+      url,
+      batch,
+      config.model,
+      config.apiKey,
+      config.dimensions,
+      batchIndex,
+    );
 
     if (items.length !== batch.length) {
       throw new Error(
@@ -212,7 +243,7 @@ export const httpEmbedQuery = async (text: string): Promise<number[]> => {
   if (!config) throw new Error('HTTP embedding not configured');
 
   const url = `${config.baseUrl}/embeddings`;
-  const items = await httpEmbedBatch(url, [text], config.model, config.apiKey);
+  const items = await httpEmbedBatch(url, [text], config.model, config.apiKey, config.dimensions);
   if (!items.length) {
     throw new Error(`Embedding endpoint returned empty response (${safeUrl(url)})`);
   }

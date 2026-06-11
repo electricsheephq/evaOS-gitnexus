@@ -27,6 +27,82 @@ import { GITNEXUS_TOOLS } from './tools.js';
 import { installGlobalStdoutSentinel } from './stdio-context.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
+import { parseMaxTokens, truncateToTokenBudget } from '../cli/token-budget.js';
+import { defaultRepo, mcpReadOnlyMode, repoAllowed } from './config.js';
+
+const MCP_READ_ONLY_TOOLS = new Set([
+  'list_repos',
+  'query',
+  'context',
+  'impact',
+  'detect_changes',
+  'cypher',
+]);
+const BUDGETED_TOOLS = new Set(['query', 'context', 'impact']);
+const MCP_QUERY_LIMIT_MAX = 20;
+const MCP_QUERY_SYMBOLS_MAX = 50;
+const MCP_IMPACT_DEPTH_MAX = 8;
+const MCP_IMPACT_TIMEOUT_MAX = 60_000;
+
+function normalizeArgsForMcp(toolName: string, args: any): any {
+  const normalized = { ...(args || {}) };
+  if (toolName !== 'list_repos' && !normalized.repo && defaultRepo()) {
+    normalized.repo = defaultRepo();
+  }
+  if (toolName === 'query') {
+    normalized.limit = clampPositiveInteger(normalized.limit, MCP_QUERY_LIMIT_MAX);
+    normalized.max_symbols = clampPositiveInteger(normalized.max_symbols, MCP_QUERY_SYMBOLS_MAX);
+  }
+  if (toolName === 'impact') {
+    normalized.maxDepth = clampPositiveInteger(normalized.maxDepth, MCP_IMPACT_DEPTH_MAX);
+    normalized.crossDepth = clampPositiveInteger(normalized.crossDepth, MCP_IMPACT_DEPTH_MAX);
+    normalized.timeoutMs = clampPositiveInteger(
+      normalized.timeoutMs ?? normalized.timeout,
+      MCP_IMPACT_TIMEOUT_MAX,
+    );
+    normalized.timeout = undefined;
+  }
+  return normalized;
+}
+
+function assertMcpReadOnlyResource(uri: string): void {
+  if (!mcpReadOnlyMode()) return;
+  const match = /^gitnexus:\/\/repo\/([^/]+)/u.exec(uri);
+  if (match && !repoAllowed(decodeURIComponent(match[1]!))) {
+    throw new Error(
+      `Resource repo "${decodeURIComponent(match[1]!)}" is not in the GitNexus MCP allow-list.`,
+    );
+  }
+  if (/^gitnexus:\/\/group\//u.test(uri)) {
+    throw new Error('Group resources are not available in GitNexus MCP read-only mode.');
+  }
+}
+
+function clampPositiveInteger(raw: unknown, max: number): number | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) return undefined;
+  return Math.min(value, max);
+}
+
+function toolForMcp(tool: (typeof GITNEXUS_TOOLS)[number]): (typeof GITNEXUS_TOOLS)[number] {
+  if (!mcpReadOnlyMode()) return tool;
+  if (!['query', 'context', 'impact', 'detect_changes', 'cypher'].includes(tool.name)) return tool;
+  const repoText = defaultRepo()
+    ? `This read-only MCP defaults omitted repo parameters to ${defaultRepo()}.`
+    : 'This read-only MCP requires an explicit repo parameter when more than one repo is allowed.';
+  return {
+    ...tool,
+    description: `${tool.description}\n\nGITNEXUS MCP: ${repoText} Use maxTokens on query/context/impact for bounded retrieval slices.`,
+  };
+}
+
+function applyTokenBudget(toolName: string, args: any, text: string): string {
+  if (!BUDGETED_TOOLS.has(toolName)) return text;
+  const parsed = parseMaxTokens(args?.maxTokens);
+  if (parsed.error) throw new Error(`maxTokens ${parsed.error}`);
+  return parsed.value ? truncateToTokenBudget(text, parsed.value) : text;
+}
 
 /**
  * Next-step hints appended to tool responses.
@@ -129,6 +205,7 @@ export function createMCPServer(backend: LocalBackend): Server {
     const { uri } = request.params;
 
     try {
+      assertMcpReadOnlyResource(uri);
       const content = await readResource(uri, backend);
       return {
         contents: [
@@ -154,12 +231,14 @@ export function createMCPServer(backend: LocalBackend): Server {
 
   // Handle list tools request
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: GITNEXUS_TOOLS.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-      annotations: tool.annotations,
-    })),
+    tools: GITNEXUS_TOOLS.filter((tool) => !mcpReadOnlyMode() || MCP_READ_ONLY_TOOLS.has(tool.name))
+      .map((tool) => toolForMcp(tool))
+      .map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        annotations: tool.annotations,
+      })),
   }));
 
   // Handle tool calls — append next-step hints to guide agent workflow
@@ -167,15 +246,17 @@ export function createMCPServer(backend: LocalBackend): Server {
     const { name, arguments: args } = request.params;
 
     try {
-      const result = await backend.callTool(name, args);
+      const normalizedArgs = normalizeArgsForMcp(name, args);
+      const result = await backend.callTool(name, normalizedArgs);
       const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-      const hint = getNextStepHint(name, args as Record<string, any> | undefined);
+      const hint = getNextStepHint(name, normalizedArgs as Record<string, any> | undefined);
+      const responseText = applyTokenBudget(name, normalizedArgs, resultText + hint);
 
       return {
         content: [
           {
             type: 'text',
-            text: resultText + hint,
+            text: responseText,
           },
         ],
       };
@@ -308,6 +389,22 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   const transport = new CompatibleStdioServerTransport(process.stdin, safeStdout);
   await server.connect(transport);
 
+  // Orphan guard: if the client process that launched this stdio server dies,
+  // self-terminate. Independent of stdin-EOF / SIGTERM delivery (both proved
+  // unreliable when the parent is SIGKILLed, leaving the server spinning at
+  // ~18% CPU as a `ppid=1` orphan and OOMing the host). The interval is unref'd
+  // so it never keeps an otherwise-idle process alive; the MCP DB is opened
+  // read-only, so the hard exit below cannot corrupt anything.
+  const launchedByPid = process.ppid;
+  const orphanGuard = setInterval(() => {
+    try {
+      process.kill(launchedByPid, 0); // signal 0 = liveness probe, delivers nothing
+    } catch {
+      process.exit(0); // ESRCH: launching client is gone -> exit now
+    }
+  }, 3000);
+  orphanGuard.unref();
+
   // Surface the redirect counter on shutdown so users see the volume of
   // stray writes even when individual payloads were truncated/suppressed.
   process.on('exit', () => sentinel.flushSummary());
@@ -321,6 +418,11 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   const shutdown = async (exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    // Force-exit watchdog: never let a hung backend.disconnect()/server.close()
+    // keep the process alive (the original orphan-spin bug — SIGTERM appeared
+    // "ignored" because its handler awaited these). unref'd so it doesn't itself
+    // hold the event loop open.
+    setTimeout(() => process.exit(exitCode), 3000).unref();
     try {
       await backend.disconnect();
     } catch {}
