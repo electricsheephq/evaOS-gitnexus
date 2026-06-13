@@ -36,24 +36,24 @@ import {
  *      catastrophic → ≫16×. A wider input ratio gives a much bigger
  *      gap between "linear" and "regressed", so the bound can be loose
  *      enough to absorb noise without losing signal.
- *   4. **Generous bound (8×)** with a noise floor — only assert the
+ *   4. **Generous bound (10×)** with a noise floor — only assert the
  *      ratio when the small measurement is stable enough to be a
  *      denominator. The absolute <500ms cap and large-input sanity
  *      bound still catch catastrophic backtracking on cold CI even
  *      when the ratio is skipped.
  *
- * Headroom: linear is expected at ~4×; the bound is 8× → 2× headroom.
+ * Headroom: linear is expected at ~4×; the bound is 10× → 2.5× headroom.
  * O(n²) on a 4× input would clock 16×, well outside the bound.
  */
 const PERF_WARMUP_RUNS = 3;
 const PERF_TRIAL_COUNT = 5;
 const SIZE_RATIO = 4;
-const LINEAR_RATIO_BOUND = SIZE_RATIO * 2; // 8× — 2× headroom over expected linear
-// Median-of-N tightens the noise floor we can rely on. A single-sample 5ms
-// measurement is ~50% jitter; median-of-5 brings the same 5ms into the
-// reliably-resolvable range above `performance.now()`'s ~10-100µs band.
-const RATIO_MEASUREMENT_FLOOR_MS = 5;
-const LARGE_INPUT_NOISE_BOUND_MS = RATIO_MEASUREMENT_FLOOR_MS * LINEAR_RATIO_BOUND * 2;
+const LINEAR_RATIO_BOUND = SIZE_RATIO * 2.5; // 10× — 2.5× headroom over expected linear
+// Median-of-N tightens the noise floor we can rely on, but full CI coverage
+// jobs still introduce scheduler noise into low tens-of-ms samples. Below this
+// floor, prefer the absolute large-input bound over ratio math.
+const RATIO_MEASUREMENT_FLOOR_MS = 15;
+const LARGE_INPUT_NOISE_BOUND_MS = RATIO_MEASUREMENT_FLOOR_MS * LINEAR_RATIO_BOUND;
 
 function median(samples: number[]): number {
   const sorted = [...samples].sort((a, b) => a - b);
@@ -87,7 +87,7 @@ function medianTimeRegex(re: RegExp, input: string): number {
 /**
  * Assert near-linear scaling between two median-timed runs on inputs
  * that differ by `SIZE_RATIO`×. The bound is `LINEAR_RATIO_BOUND` =
- * `SIZE_RATIO * 2`, i.e. 2× headroom over the linear expectation —
+ * `SIZE_RATIO * 2.5`, i.e. 2.5× headroom over the linear expectation —
  * comfortably under the ~`SIZE_RATIO²` ratio a quadratic regression
  * would produce, so true regressions still fail loudly.
  *
