@@ -1,9 +1,9 @@
 name: Release Candidate
 
 on:
-  # Publish a release-candidate build whenever a merge/commit lands on main.
+  # Validate release-candidate readiness whenever a merge/commit lands on main.
   # Docs/README-only changes are filtered out so prose updates don't
-  # cut a release.
+  # run release validation.
   push:
     branches: [main]
     paths-ignore:
@@ -28,6 +28,14 @@ on:
           - major
       force:
         description: 'Publish even when HEAD already has an rc marker'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      publish:
+        description: 'Actually publish npm/GitHub/Docker RC artifacts'
         required: false
         default: 'false'
         type: choice
@@ -162,10 +170,18 @@ jobs:
     secrets: inherit
 
   # ── Publish the rc build to npm + create GitHub prerelease ───────────
+  #
+  # Push-to-main runs stop after CI so main can prove release readiness without
+  # requiring private publish credentials. Actual publishing is manual-only:
+  # dispatch this workflow with publish=true after RELEASE_PUSH_TOKEN and
+  # NPM_TOKEN are configured.
   publish:
     name: Publish release candidate to npm
     needs: [guard, ci]
-    if: needs.guard.outputs.should_run == 'true'
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish == 'true' &&
+      needs.guard.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -183,6 +199,26 @@ jobs:
     outputs:
       vtag: ${{ steps.reltag.outputs.vtag }}
     steps:
+      - name: Check release publishing credentials
+        shell: bash
+        env:
+          RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${RELEASE_PUSH_TOKEN:-}" ]; then
+            echo "::error::Missing RELEASE_PUSH_TOKEN secret; refusing to publish release candidate."
+            missing=1
+          fi
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "::error::Missing NPM_TOKEN secret; refusing to publish release candidate."
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
