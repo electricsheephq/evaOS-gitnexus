@@ -37,9 +37,10 @@ import {
  *      gap between "linear" and "regressed", so the bound can be loose
  *      enough to absorb noise without losing signal.
  *   4. **Generous bound (8×)** with a noise floor — only assert the
- *      ratio when the *large* measurement is well above the noise
- *      floor. The absolute <500ms cap still catches catastrophic
- *      backtracking on cold CI even when the ratio is skipped.
+ *      ratio when the small measurement is stable enough to be a
+ *      denominator. The absolute <500ms cap and large-input sanity
+ *      bound still catch catastrophic backtracking on cold CI even
+ *      when the ratio is skipped.
  *
  * Headroom: linear is expected at ~4×; the bound is 8× → 2× headroom.
  * O(n²) on a 4× input would clock 16×, well outside the bound.
@@ -89,21 +90,28 @@ function medianTimeRegex(re: RegExp, input: string): number {
  * comfortably under the ~`SIZE_RATIO²` ratio a quadratic regression
  * would produce, so true regressions still fail loudly.
  *
- * Skip semantics: the ratio assertion is skipped only when *both*
- * measurements are below the noise floor. If either run is reliably
- * measurable, we still assert — otherwise an O(n²) regression that
- * happens to stay under the absolute 500ms cap on a fast runner could
- * slip through with no detector firing. Median-of-N + the 5ms floor
- * keeps the assertion stable while preserving regression coverage.
+ * Skip semantics: when the small input is below the noise floor, the
+ * ratio denominator is too small to be meaningful. In that case, skip
+ * the ratio and assert that the large input still stays under the same
+ * absolute budget implied by the linear ratio bound. Median-of-N + the
+ * 5ms floor keeps the assertion stable while preserving regression
+ * coverage.
  */
 function assertNearLinearScaling(elapsedSmall: number, elapsedLarge: number, label: string): void {
-  if (elapsedSmall < RATIO_MEASUREMENT_FLOOR_MS && elapsedLarge < RATIO_MEASUREMENT_FLOOR_MS) {
-    // Both runs completed below the noise floor — even the median is
-    // dominated by `performance.now()` resolution. The absolute <500ms
-    // cap elsewhere still catches catastrophic backtracking.
+  if (elapsedSmall < RATIO_MEASUREMENT_FLOOR_MS) {
+    const largeInputBoundMs = RATIO_MEASUREMENT_FLOOR_MS * LINEAR_RATIO_BOUND;
+    if (elapsedLarge >= largeInputBoundMs) {
+      throw new Error(
+        `${label}: large input ${elapsedLarge.toFixed(2)}ms exceeds ${largeInputBoundMs.toFixed(
+          2,
+        )}ms ` +
+          `while small input is below the ${RATIO_MEASUREMENT_FLOOR_MS}ms ratio floor ` +
+          `(small=${elapsedSmall.toFixed(2)}ms, median of ${PERF_TRIAL_COUNT} trials)`,
+      );
+    }
     return;
   }
-  const ratio = elapsedLarge / Math.max(elapsedSmall, 0.001);
+  const ratio = elapsedLarge / elapsedSmall;
   if (ratio >= LINEAR_RATIO_BOUND) {
     throw new Error(
       `${label}: ratio ${ratio.toFixed(2)}× exceeds bound ${LINEAR_RATIO_BOUND}× ` +

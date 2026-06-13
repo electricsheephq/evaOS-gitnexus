@@ -10,13 +10,27 @@ import TypeScript from 'tree-sitter-typescript';
 import Python from 'tree-sitter-python';
 import Java from 'tree-sitter-java';
 import CSharp from 'tree-sitter-c-sharp';
-import Kotlin from 'tree-sitter-kotlin';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
 import CPP from 'tree-sitter-cpp';
 import PHP from 'tree-sitter-php';
 import { SupportedLanguages } from '../../src/config/supported-languages.js';
 import { getProvider } from '../../src/core/ingestion/languages/index.js';
+
+let Kotlin: Parser.Language | null = null;
+try {
+  Kotlin = require('tree-sitter-kotlin') as Parser.Language;
+  const testParser = new Parser();
+  testParser.setLanguage(Kotlin);
+} catch {
+  Kotlin = null;
+}
+
+const describeKotlin = Kotlin ? describe : describe.skip;
+const setKotlinLanguage = (parser: Parser) => {
+  if (!Kotlin) throw new Error('tree-sitter-kotlin not available');
+  parser.setLanguage(Kotlin);
+};
 
 /**
  * Helper: parse code, run the language query, and return all @call captures
@@ -232,9 +246,9 @@ describe('inferCallForm', () => {
     });
   });
 
-  describe('Kotlin', () => {
+  describeKotlin('Kotlin', () => {
     it('detects free call', () => {
-      parser.setLanguage(Kotlin);
+      setKotlinLanguage(parser);
       const code = `fun main() { doStuff() }`;
       const captures = extractCallCaptures(parser, code, SupportedLanguages.Kotlin);
       const match = captures.find((c) => c.calledName === 'doStuff');
@@ -243,7 +257,7 @@ describe('inferCallForm', () => {
     });
 
     it('detects member call via navigation_expression', () => {
-      parser.setLanguage(Kotlin);
+      setKotlinLanguage(parser);
       const code = `fun main() { user.save() }`;
       const captures = extractCallCaptures(parser, code, SupportedLanguages.Kotlin);
       const match = captures.find((c) => c.calledName === 'save');
@@ -252,7 +266,7 @@ describe('inferCallForm', () => {
     });
 
     it('Foo() is a free call (constructor_invocation only in heritage context)', () => {
-      parser.setLanguage(Kotlin);
+      setKotlinLanguage(parser);
       const code = `fun main() { val x = Foo() }`;
       const captures = extractCallCaptures(parser, code, SupportedLanguages.Kotlin);
       const match = captures.find((c) => c.calledName === 'Foo');
@@ -263,7 +277,7 @@ describe('inferCallForm', () => {
     });
 
     it('detects constructor_invocation in heritage delegation as constructor', () => {
-      parser.setLanguage(Kotlin);
+      setKotlinLanguage(parser);
       const code = `open class Base\nclass Derived : Base()`;
       const captures = extractCallCaptures(parser, code, SupportedLanguages.Kotlin);
       const match = captures.find((c) => c.calledName === 'Base');
@@ -408,9 +422,9 @@ describe('extractReceiverName', () => {
     });
   });
 
-  describe('Kotlin', () => {
+  describeKotlin('Kotlin', () => {
     it('extracts receiver from navigation_expression', () => {
-      parser.setLanguage(Kotlin);
+      setKotlinLanguage(parser);
       const code = `fun main() { user.save() }`;
       const captures = extractCallCaptures(parser, code, SupportedLanguages.Kotlin);
       const match = captures.find((c) => c.calledName === 'save');
@@ -419,7 +433,7 @@ describe('extractReceiverName', () => {
     });
 
     it('extracts receiver from safe navigation user?.save()', () => {
-      parser.setLanguage(Kotlin);
+      setKotlinLanguage(parser);
       const code = `fun main() { user?.save() }`;
       const captures = extractCallCaptures(parser, code, SupportedLanguages.Kotlin);
       const match = captures.find((c) => c.calledName === 'save');
