@@ -4,17 +4,6 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
-### Fixed
-
-- **Hook db-lock probe no longer strands unkillable `lsof`/`ps` orphans** — the probe's `lsof`/`ps` subprocesses are now wrapped in a self-tested coreutils `timeout`/`gtimeout` (`timeout -k 1 …`), so a hook SIGKILLed by the runner's 10s timeout can no longer leave `lsof` running forever (orphan lifetime bounded at ~3s); `acquireHookSlot` now also gates the probe itself, capping concurrent probes at 3 per repo. Opt out with `GITNEXUS_HOOK_TIMEOUT_PATH=disabled`. (#2163)
-- **Hook augment CLI no longer strands orphans either** — `runGitNexusCli` in the Claude, plugin, and Antigravity hook adapters now wraps the `gitnexus augment` subprocess (the longest-lived hook child: 7s local / 12s npx inner budgets) in the same self-tested coreutils `timeout` guard as the probe's `lsof`/`ps`, with a budget of ceil(inner/1000)+1 seconds — strictly above the inner `spawnSync` timeout, so on the supervised path Node's SIGTERM still fires first and observable behavior is unchanged. Once the hook itself has been SIGKILLed the guard takes over, with per-branch semantics: on the direct-exec branches (the CLI is the guard's child) it SIGTERMs at budget and `-k 1` SIGKILLs 1s later; on the npx branches (the CLI is a *grandchild* behind npx) it uses `-s KILL`, SIGKILLing the whole process group at budget — a TERM-first guard there would only kill the obedient npx parent and exit before its `-k` escalation fires, stranding a SIGTERM-immune CLI. Two npx-branch caveats remain (both no worse than the pre-fix behavior, where the grandchild received no signal at all): the group-wide KILL is coreutils semantics, so a busybox `timeout` — which passes the self-test — still signals only its direct child and cannot reach the grandchild; and on the supervised path (hook alive, inner `spawnSync` timeout SIGTERMs the guard) coreutils forwards TERM rather than KILL, so a SIGTERM-immune CLI grandchild is still not reaped there. The guard self-test now also requires exit-status propagation (`sh -c 'exit 42'` must yield 42), so an always-exit-0 stub at `GITNEXUS_HOOK_TIMEOUT_PATH` can no longer be adopted and silently swallow the probe and augment. Windows, `GITNEXUS_HOOK_TIMEOUT_PATH=disabled`, and Unix hosts with no usable coreutils `timeout`/`gtimeout` at all (e.g. macOS without Homebrew coreutils) keep the exact pre-wrap unguarded invocation — every guard-less Unix run, whatever the reason (disabled, nothing usable, probe version skew), is now diagnosed once per hook run under `GITNEXUS_DEBUG`. The Cursor hook is not wrapped yet (it does not install the probe helper) but now reports its slot-saturated skip under `GITNEXUS_DEBUG`. (#2163 follow-up)
-
-### Changed
-- Migrated from KuzuDB to LadybugDB v0.15 (`@ladybugdb/core`, `@ladybugdb/wasm-core`)
-- Renamed all internal paths from `kuzu` to `lbug` (storage: `.gitnexus/kuzu` → `.gitnexus/lbug`)
-- Added automatic cleanup of stale KuzuDB index files
-- LadybugDB v0.15 requires explicit VECTOR extension loading for semantic search
-
 ## [1.5.3] - 2026-04-01
 
 ### Added
