@@ -13,12 +13,29 @@ import {
   runPipelineFromRepo,
   type PipelineResult,
 } from './helpers.js';
+import {
+  isLanguageAvailable,
+  loadParser,
+  loadLanguage,
+} from '../../../src/core/tree-sitter/parser-loader.js';
+import { SupportedLanguages } from '../../../src/config/supported-languages.js';
+
+let kotlinAvailable = isLanguageAvailable(SupportedLanguages.Kotlin);
+if (kotlinAvailable) {
+  try {
+    await loadParser();
+    await loadLanguage(SupportedLanguages.Kotlin);
+  } catch {
+    kotlinAvailable = false;
+  }
+}
+const describeKotlin = kotlinAvailable ? describe : describe.skip;
 
 // ---------------------------------------------------------------------------
 // Heritage: data class extends + implements interfaces (delegation specifiers)
 // ---------------------------------------------------------------------------
 
-describe('Kotlin heritage resolution', () => {
+describeKotlin('Kotlin heritage resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -114,7 +131,7 @@ describe('Kotlin heritage resolution', () => {
 // Ambiguous: Handler + Runnable in two packages, explicit imports disambiguate
 // ---------------------------------------------------------------------------
 
-describe('Kotlin ambiguous symbol resolution', () => {
+describeKotlin('Kotlin ambiguous symbol resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -163,7 +180,7 @@ describe('Kotlin ambiguous symbol resolution', () => {
   });
 });
 
-describe('Kotlin call resolution with arity filtering', () => {
+describeKotlin('Kotlin call resolution with arity filtering', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -184,7 +201,7 @@ describe('Kotlin call resolution with arity filtering', () => {
 // Member-call resolution: obj.method() resolves through pipeline
 // ---------------------------------------------------------------------------
 
-describe('Kotlin member-call resolution', () => {
+describeKotlin('Kotlin member-call resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -209,7 +226,7 @@ describe('Kotlin member-call resolution', () => {
 // Receiver-constrained resolution: typed variables disambiguate same-named methods
 // ---------------------------------------------------------------------------
 
-describe('Kotlin receiver-constrained resolution', () => {
+describeKotlin('Kotlin receiver-constrained resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -242,7 +259,7 @@ describe('Kotlin receiver-constrained resolution', () => {
 // Alias import resolution: import com.example.User as U resolves U → User
 // ---------------------------------------------------------------------------
 
-describe('Kotlin alias import resolution', () => {
+describeKotlin('Kotlin alias import resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -274,7 +291,7 @@ describe('Kotlin alias import resolution', () => {
 // Constructor-call resolution: User("alice") resolves to User constructor
 // ---------------------------------------------------------------------------
 
-describe('Kotlin constructor-call resolution', () => {
+describeKotlin('Kotlin constructor-call resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -321,7 +338,7 @@ describe('Kotlin constructor-call resolution', () => {
 // Variadic resolution: vararg doesn't get filtered by arity
 // ---------------------------------------------------------------------------
 
-describe('Kotlin variadic call resolution', () => {
+describeKotlin('Kotlin variadic call resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -341,7 +358,7 @@ describe('Kotlin variadic call resolution', () => {
 // Local shadow: same-file definition takes priority over imported name
 // ---------------------------------------------------------------------------
 
-describe('Kotlin local definition shadows import', () => {
+describeKotlin('Kotlin local definition shadows import', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -369,7 +386,7 @@ describe('Kotlin local definition shadows import', () => {
 // disambiguates user.save() vs repo.save() via TypeEnv constructor inference
 // ---------------------------------------------------------------------------
 
-describe('Kotlin constructor-inferred type resolution', () => {
+describeKotlin('Kotlin constructor-inferred type resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -415,7 +432,7 @@ describe('Kotlin constructor-inferred type resolution', () => {
 // this.save() resolves to enclosing class's / object's own method
 // ---------------------------------------------------------------------------
 
-describe('Kotlin this resolution', () => {
+describeKotlin('Kotlin this resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -452,7 +469,7 @@ describe('Kotlin this resolution', () => {
 // call_expression values, enabling return type inference from function results.
 // ---------------------------------------------------------------------------
 
-describe('Kotlin return type inference', () => {
+describeKotlin('Kotlin return type inference', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -498,7 +515,7 @@ describe('Kotlin return type inference', () => {
 // Parent class resolution: EXTENDS + IMPLEMENTS edges
 // ---------------------------------------------------------------------------
 
-describe('Kotlin parent resolution', () => {
+describeKotlin('Kotlin parent resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -540,7 +557,7 @@ describe('Kotlin parent resolution', () => {
 // super.save() resolves to parent class's save method
 // ---------------------------------------------------------------------------
 
-describe('Kotlin super resolution', () => {
+describeKotlin('Kotlin super resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -569,7 +586,7 @@ describe('Kotlin super resolution', () => {
 // For-each loop variable type resolution: for (user: User in users) { user.save() }
 // ---------------------------------------------------------------------------
 
-describe('Kotlin for-each loop type resolution', () => {
+describeKotlin('Kotlin for-each loop type resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -630,7 +647,7 @@ describe('Kotlin for-each loop type resolution', () => {
 // super.save() resolves to generic parent class's save method
 // ---------------------------------------------------------------------------
 
-describe('Kotlin generic parent super resolution', () => {
+describeKotlin('Kotlin generic parent super resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -662,7 +679,7 @@ describe('Kotlin generic parent super resolution', () => {
 // Nullable receiver unwrapping: user?.save() with User? type resolves through ?.
 // ---------------------------------------------------------------------------
 
-describe('Kotlin nullable receiver resolution (safe calls)', () => {
+describeKotlin('Kotlin nullable receiver resolution (safe calls)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -712,7 +729,7 @@ describe('Kotlin nullable receiver resolution (safe calls)', () => {
 // Assignment chain propagation
 // ---------------------------------------------------------------------------
 
-describe('Kotlin assignment chain propagation', () => {
+describeKotlin('Kotlin assignment chain propagation', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -787,7 +804,7 @@ describe('Kotlin assignment chain propagation', () => {
 // for function-local val/var inside class methods.
 // ---------------------------------------------------------------------------
 
-describe('Kotlin assignment chain inside class method', () => {
+describeKotlin('Kotlin assignment chain inside class method', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -844,7 +861,7 @@ describe('Kotlin assignment chain inside class method', () => {
 // is correctly handled by extractCallChain (Phase 5 review Finding 1, Round 3).
 // ---------------------------------------------------------------------------
 
-describe('Kotlin chained method call resolution (Phase 5 review fix)', () => {
+describeKotlin('Kotlin chained method call resolution (Phase 5 review fix)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -887,7 +904,7 @@ describe('Kotlin chained method call resolution (Phase 5 review fix)', () => {
 // Kotlin unannotated for-loop Tier 1c: for (user in users) with List<User>
 // ---------------------------------------------------------------------------
 
-describe('Kotlin unannotated for-loop type resolution (Tier 1c)', () => {
+describeKotlin('Kotlin unannotated for-loop type resolution (Tier 1c)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -931,7 +948,7 @@ describe('Kotlin unannotated for-loop type resolution (Tier 1c)', () => {
 // Kotlin when/is pattern binding: when (obj) { is User -> obj.save() }
 // ---------------------------------------------------------------------------
 
-describe('Kotlin when/is pattern binding', () => {
+describeKotlin('Kotlin when/is pattern binding', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -986,7 +1003,7 @@ describe('Kotlin when/is pattern binding', () => {
 // Kotlin HashMap .values navigation_expression resolution
 // ---------------------------------------------------------------------------
 
-describe('Kotlin HashMap .values for-loop resolution', () => {
+describeKotlin('Kotlin HashMap .values for-loop resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1066,7 +1083,7 @@ describe('Kotlin HashMap .values for-loop resolution', () => {
 // Kotlin when/is complex patterns: 3+ arms, multi-call, else branch
 // ---------------------------------------------------------------------------
 
-describe('Kotlin when/is complex pattern binding', () => {
+describeKotlin('Kotlin when/is complex pattern binding', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1216,7 +1233,7 @@ describe('Kotlin when/is complex pattern binding', () => {
 // Phase 7.3: call_expression iterable resolution via ReturnTypeLookup
 // ---------------------------------------------------------------------------
 
-describe('Kotlin for-loop call_expression iterable resolution (Phase 7.3)', () => {
+describeKotlin('Kotlin for-loop call_expression iterable resolution (Phase 7.3)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1271,7 +1288,7 @@ describe('Kotlin for-loop call_expression iterable resolution (Phase 7.3)', () =
 // Phase 8: Field/property type resolution (1-level)
 // ---------------------------------------------------------------------------
 
-describe('Field type resolution (Kotlin)', () => {
+describeKotlin('Field type resolution (Kotlin)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1324,7 +1341,7 @@ describe('Field type resolution (Kotlin)', () => {
 // Phase 8A: Deep field chain resolution (3-level)
 // ---------------------------------------------------------------------------
 
-describe('Deep field chain resolution (Kotlin)', () => {
+describeKotlin('Deep field chain resolution (Kotlin)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1368,7 +1385,7 @@ describe('Deep field chain resolution (Kotlin)', () => {
 // Kotlin data class primary constructor val/var properties
 // ---------------------------------------------------------------------------
 
-describe('Kotlin data class primary constructor property capture', () => {
+describeKotlin('Kotlin data class primary constructor property capture', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1406,7 +1423,7 @@ describe('Kotlin data class primary constructor property capture', () => {
 // ACCESSES write edges from assignment expressions
 // ---------------------------------------------------------------------------
 
-describe('Write access tracking (Kotlin)', () => {
+describeKotlin('Write access tracking (Kotlin)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1449,7 +1466,7 @@ describe('Write access tracking (Kotlin)', () => {
 // Call-result variable binding (Phase 9): val user = getUser(); user.save()
 // ---------------------------------------------------------------------------
 
-describe('Kotlin call-result variable binding (Tier 2b)', () => {
+describeKotlin('Kotlin call-result variable binding (Tier 2b)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1469,7 +1486,7 @@ describe('Kotlin call-result variable binding (Tier 2b)', () => {
 // Method chain binding (Phase 9C): getUser() → .address → .getCity() → .save()
 // ---------------------------------------------------------------------------
 
-describe('Kotlin method chain binding via unified fixpoint (Phase 9C)', () => {
+describeKotlin('Kotlin method chain binding via unified fixpoint (Phase 9C)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1494,7 +1511,7 @@ describe('Kotlin method chain binding via unified fixpoint (Phase 9C)', () => {
 // greet() is defined on A, accessed via C. Tests BFS depth-2 parent traversal.
 // ---------------------------------------------------------------------------
 
-describe('Kotlin grandparent method resolution via MRO (Phase B)', () => {
+describeKotlin('Kotlin grandparent method resolution via MRO (Phase B)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1538,7 +1555,7 @@ describe('Kotlin grandparent method resolution via MRO (Phase B)', () => {
 // NOTE: depends on nullable_type capture being fixed in jvm.ts
 // ---------------------------------------------------------------------------
 
-describe('Kotlin null-check narrowing resolution (Phase C)', () => {
+describeKotlin('Kotlin null-check narrowing resolution (Phase C)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1582,7 +1599,7 @@ describe('Kotlin null-check narrowing resolution (Phase C)', () => {
 
 // ── Phase P: Overload Disambiguation via Parameter Types ─────────────────
 
-describe('Kotlin overload disambiguation by parameter types', () => {
+describeKotlin('Kotlin overload disambiguation by parameter types', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1620,7 +1637,7 @@ describe('Kotlin overload disambiguation by parameter types', () => {
 
 // ── Phase P: Same-arity overloads — cross-file + chain resolution ─────────
 
-describe('Kotlin same-arity overload cross-file and chain resolution', () => {
+describeKotlin('Kotlin same-arity overload cross-file and chain resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1692,7 +1709,7 @@ describe('Kotlin same-arity overload cross-file and chain resolution', () => {
 
 // ── Phase P: Virtual Dispatch via Constructor Type (cross-file) ──────────
 
-describe('Kotlin virtual dispatch via constructor type (cross-file)', () => {
+describeKotlin('Kotlin virtual dispatch via constructor type (cross-file)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1715,7 +1732,7 @@ describe('Kotlin virtual dispatch via constructor type (cross-file)', () => {
 
 // ── Phase P: Default Parameter Arity Resolution ──────────────────────────
 
-describe('Kotlin default parameter arity resolution', () => {
+describeKotlin('Kotlin default parameter arity resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1736,7 +1753,7 @@ describe('Kotlin default parameter arity resolution', () => {
 // → u is typed User via cross-file return type propagation
 // ---------------------------------------------------------------------------
 
-describe('Kotlin cross-file binding propagation', () => {
+describeKotlin('Kotlin cross-file binding propagation', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1795,7 +1812,7 @@ describe('Kotlin cross-file binding propagation', () => {
 // Method enrichment: abstract, static, annotations, parameterTypes
 // ---------------------------------------------------------------------------
 
-describe('Kotlin method enrichment', () => {
+describeKotlin('Kotlin method enrichment', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1900,7 +1917,7 @@ describe('Kotlin method enrichment', () => {
 // Repository interface with find/save, SqlRepository implements them
 // ---------------------------------------------------------------------------
 
-describe('Kotlin interface dispatch (METHOD_IMPLEMENTS)', () => {
+describeKotlin('Kotlin interface dispatch (METHOD_IMPLEMENTS)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1947,7 +1964,7 @@ describe('Kotlin interface dispatch (METHOD_IMPLEMENTS)', () => {
 // correctly distinguish between overloaded signatures.
 // ---------------------------------------------------------------------------
 
-describe('Kotlin overloaded method disambiguation', () => {
+describeKotlin('Kotlin overloaded method disambiguation', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -1996,7 +2013,7 @@ describe('Kotlin overloaded method disambiguation', () => {
 // SM-9: lookupMethodByOwnerWithMRO — child.parentMethod() via implements-split walk
 // ---------------------------------------------------------------------------
 
-describe('Kotlin Child extends Parent — inherited method resolution (SM-9)', () => {
+describeKotlin('Kotlin Child extends Parent — inherited method resolution (SM-9)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -2031,7 +2048,7 @@ describe('Kotlin Child extends Parent — inherited method resolution (SM-9)', (
 // SM-11: Kotlin User : Validator — interface default method via implements-split
 // ---------------------------------------------------------------------------
 
-describe('Kotlin User implements Validator — interface default method (SM-11)', () => {
+describeKotlin('Kotlin User implements Validator — interface default method (SM-11)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
