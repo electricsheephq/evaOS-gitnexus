@@ -58,10 +58,7 @@ export function resolveRerankConfig(repoName: string): RerankConfig | null {
     model: process.env.GITNEXUS_RERANK_MODEL || DEFAULT_RERANK_MODEL,
     apiKey,
     candidates: positiveIntegerEnv('GITNEXUS_RERANK_CANDIDATES', DEFAULT_RERANK_CANDIDATES),
-    maxDocChars: positiveIntegerEnv(
-      'GITNEXUS_RERANK_MAX_DOC_CHARS',
-      DEFAULT_RERANK_MAX_DOC_CHARS,
-    ),
+    maxDocChars: positiveIntegerEnv('GITNEXUS_RERANK_MAX_DOC_CHARS', DEFAULT_RERANK_MAX_DOC_CHARS),
   };
 }
 

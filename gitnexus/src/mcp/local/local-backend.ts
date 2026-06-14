@@ -759,12 +759,14 @@ export class LocalBackend {
 
       const resolvePathMatch = (): RepoHandle | undefined => {
         const canonicalTarget = canonicalizePath(repoParam);
-        return entries.map(([, handle]) => handle).find((handle) => {
-          const stored = canonicalizePath(handle.repoPath);
-          return process.platform === 'win32'
-            ? stored.toLowerCase() === canonicalTarget.toLowerCase()
-            : stored === canonicalTarget;
-        });
+        return entries
+          .map(([, handle]) => handle)
+          .find((handle) => {
+            const stored = canonicalizePath(handle.repoPath);
+            return process.platform === 'win32'
+              ? stored.toLowerCase() === canonicalTarget.toLowerCase()
+              : stored === canonicalTarget;
+          });
       };
 
       // Path-like params first (absolute or contains separators) — aligns with

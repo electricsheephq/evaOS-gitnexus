@@ -23,7 +23,7 @@ describe('run-analyze module', () => {
   });
 
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
-    const tmpRepo = await createTempDir('gitnexus-run-analyze-fast-path-');
+    const tmpRepo = await createTempDir('gitnexus-test-run-analyze-fast-path-');
     try {
       execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
       execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
@@ -61,8 +61,13 @@ describe('run-analyze module', () => {
   });
 
   it('skips AGENTS.md, CLAUDE.md, and bundled skills when skipAiContext is enabled', async () => {
-    const tmpRepo = await createTempDir('gitnexus-run-analyze-no-ai-context-');
+    const tmpRepo = await createTempDir('gitnexus-test-run-analyze-no-ai-context-');
+    const previousHome = process.env.GITNEXUS_HOME;
     try {
+      const gitnexusHome = path.join(tmpRepo.dbPath, '.gitnexus-home');
+      await fs.mkdir(gitnexusHome, { recursive: true });
+      process.env.GITNEXUS_HOME = gitnexusHome;
+
       await fs.writeFile(
         path.join(tmpRepo.dbPath, 'index.ts'),
         'export function hello() { return 1; }\n',
@@ -89,6 +94,11 @@ describe('run-analyze module', () => {
       await expect(fs.stat(path.join(tmpRepo.dbPath, 'CLAUDE.md'))).rejects.toThrow();
       await expect(fs.stat(path.join(tmpRepo.dbPath, '.claude'))).rejects.toThrow();
     } finally {
+      if (previousHome === undefined) {
+        delete process.env.GITNEXUS_HOME;
+      } else {
+        process.env.GITNEXUS_HOME = previousHome;
+      }
       await tmpRepo.cleanup();
     }
   });

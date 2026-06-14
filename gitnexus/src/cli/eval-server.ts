@@ -354,11 +354,17 @@ function getNextStepHint(toolName: string): string {
   }
 }
 
-export function isBearerAuthorized(authToken: string | null, authHeader: string | undefined): boolean {
+export function isBearerAuthorized(
+  authToken: string | null,
+  authHeader: string | undefined,
+): boolean {
   return !authToken || authHeader === `Bearer ${authToken}`;
 }
 
-export function formatHealthPayload(repoNames: string[], includeRepos: boolean): {
+export function formatHealthPayload(
+  repoNames: string[],
+  includeRepos: boolean,
+): {
   status: 'ok';
   repos?: string[];
   auth?: 'required';
@@ -450,7 +456,9 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       if (!authorized) {
         res.setHeader('Content-Type', 'application/json');
         res.writeHead(401);
-        res.end(JSON.stringify({ error: 'Unauthorized — set Authorization: Bearer <token> header' }));
+        res.end(
+          JSON.stringify({ error: 'Unauthorized — set Authorization: Bearer <token> header' }),
+        );
         return;
       }
 

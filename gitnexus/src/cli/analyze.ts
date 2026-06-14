@@ -790,7 +790,8 @@ const analyzeCommandImpl = async (
     // git call. Detection is best-effort and never blocks analyze.
     const cliBranch = cliOptions?.defaultBranch;
     const configBranch = fileConfig?.defaultBranch;
-    const willGenerateContext = !options.indexOnly && !options.skipAiContext && !options.skipAgentsMd;
+    const willGenerateContext =
+      !options.indexOnly && !options.skipAiContext && !options.skipAgentsMd;
     let detectedBranch: string | null = null;
     if (
       cliBranch === undefined &&
@@ -922,9 +923,7 @@ const analyzeCommandImpl = async (
     return;
   }
 
-  if (
-    !setPositiveEnv('--embedding-dims', 'GITNEXUS_EMBEDDING_DIMS', options.embeddingDims)
-  ) {
+  if (!setPositiveEnv('--embedding-dims', 'GITNEXUS_EMBEDDING_DIMS', options.embeddingDims)) {
     return;
   }
 

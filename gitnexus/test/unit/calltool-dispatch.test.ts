@@ -390,10 +390,7 @@ describe('LocalBackend.callTool', () => {
       ]),
       expect.objectContaining({ model: 'rerank-2.5' }),
     );
-    expect(result.definitions.map((definition: any) => definition.name)).toEqual([
-      'Beta',
-      'Alpha',
-    ]);
+    expect(result.definitions.map((definition: any) => definition.name)).toEqual(['Beta', 'Alpha']);
     expect(result.timing).toHaveProperty('rerank');
   });
 
