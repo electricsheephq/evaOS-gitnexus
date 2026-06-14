@@ -53,6 +53,10 @@ program
   )
   .option('--skip-agents-md', 'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md')
   .option(
+    '--skip-ai-context',
+    'Skip all AI context side effects: AGENTS.md, CLAUDE.md, and bundled GitNexus skills',
+  )
+  .option(
     '--default-branch <branch>',
     'Default branch used in the generated regression-compare example (base_ref). ' +
       'Falls back to .gitnexusrc, then auto-detected origin/HEAD, then "main".',
@@ -101,6 +105,10 @@ program
   .option('--embedding-batch-size <n>', 'Number of nodes per embedding batch')
   .option('--embedding-sub-batch-size <n>', 'Number of chunks per embedding model call')
   .option('--embedding-device <device>', 'Embedding device: auto, cpu, dml, cuda, or wasm')
+  .option('--embedding-base-url <url>', 'HTTP embedding API base URL')
+  .option('--embedding-model <model>', 'HTTP embedding model name')
+  .option('--embedding-auth-token <token>', 'HTTP embedding bearer token')
+  .option('--embedding-dims <n>', 'HTTP embedding output dimensions')
   .addHelpText('after', () => t('help.analyze.environment'))
   .action(createLbugLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 

@@ -111,6 +111,8 @@ export interface AnalyzeOptions {
   skipGit?: boolean;
   /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
   skipAgentsMd?: boolean;
+  /** Skip all AI context writes: AGENTS.md, CLAUDE.md, and bundled GitNexus skills. */
+  skipAiContext?: boolean;
   /** Omit volatile symbol/relationship counts from AGENTS.md and CLAUDE.md. */
   noStats?: boolean;
   /** Skip installing standard GitNexus skill files to .claude/skills/gitnexus/. */
@@ -840,64 +842,70 @@ export async function runFullAnalysis(
     }
 
     if (!embeddingSkipped) {
-      const { isHttpMode } = await import('./embeddings/http-client.js');
+      const { isHttpMode, isVoyageHttpMode } = await import('./embeddings/http-client.js');
       const httpMode = isHttpMode();
-      progress(
-        'embeddings',
-        90,
-        httpMode ? 'Connecting to embedding endpoint...' : 'Loading embedding model...',
-      );
-      const { runEmbeddingPipeline } = await import('./embeddings/embedding-pipeline.js');
-      // Build a Map<nodeId, contentHash> from cached embeddings for incremental mode
-      let existingEmbeddings: Map<string, string> | undefined;
-      if (cachedEmbeddingNodeIds.size > 0) {
-        existingEmbeddings = new Map<string, string>();
-        for (const e of cachedEmbeddings) {
-          existingEmbeddings.set(e.nodeId, e.contentHash ?? STALE_HASH_SENTINEL);
-        }
-      }
-
-      const { readServerMapping } = await import('./embeddings/server-mapping.js');
-      // Mirror the registry's name-resolution chain so the server-mapping
-      // lookup key stays aligned with the final registry name (#1259):
+      // Mirror the registry's name-resolution chain so premium embedding gates,
+      // server mapping, and the final registry name all agree (#1259):
       //   --name → remote-derived → canonical-root basename
-      // (preserved-alias is intentionally NOT consulted here — server
-      // mappings are addressed by the operationally-meaningful name the
-      // user configures, not by a sticky registry-only alias they may not
-      // know about. The previous canonical-only logic ignored both --name
-      // and remote-derived names, silently breaking server-mapping for
-      // anyone with a `--name` alias or remote-named repo.)
       const projectName =
         options.registryName ??
         getInferredRepoName(repoPath) ??
         path.basename(resolveRepoIdentityRoot(repoPath));
-      const serverName = await readServerMapping(projectName);
-      const embeddingResult = await runEmbeddingPipeline(
-        executeQuery,
-        executeWithReusedStatement,
-        (p) => {
-          const scaled = 90 + Math.round((p.percent / 100) * 8);
-          const label =
-            p.phase === 'loading-model'
-              ? httpMode
-                ? 'Connecting to embedding endpoint...'
-                : 'Loading embedding model...'
-              : `Embedding ${p.nodesProcessed || 0}/${p.totalNodes || '?'}`;
-          progress('embeddings', scaled, label);
-        },
-        {},
-        cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
-        { repoName: projectName, serverName },
-        existingEmbeddings,
-      );
-      if (embeddingResult.semanticMode === 'exact-scan') {
-        semanticMode = 'exact-scan';
-        log(
-          'Semantic embeddings were generated without a VECTOR index; ' +
-            'queries will use exact-scan fallback within the configured limit.',
+      if (isVoyageHttpMode()) {
+        const { premiumRepoAllowed } = await import('./rerank/voyage-reranker.js');
+        if (!premiumRepoAllowed(projectName)) {
+          embeddingSkipped = true;
+          log(
+            `Voyage embeddings skipped for "${projectName}": repo is not listed in ` +
+              'GITNEXUS_PREMIUM_REPO_ALLOWLIST.',
+          );
+        }
+      }
+      if (!embeddingSkipped) {
+        progress(
+          'embeddings',
+          90,
+          httpMode ? 'Connecting to embedding endpoint...' : 'Loading embedding model...',
         );
-      } else {
-        semanticMode = 'vector-index';
+        const { runEmbeddingPipeline } = await import('./embeddings/embedding-pipeline.js');
+        // Build a Map<nodeId, contentHash> from cached embeddings for incremental mode
+        let existingEmbeddings: Map<string, string> | undefined;
+        if (cachedEmbeddingNodeIds.size > 0) {
+          existingEmbeddings = new Map<string, string>();
+          for (const e of cachedEmbeddings) {
+            existingEmbeddings.set(e.nodeId, e.contentHash ?? STALE_HASH_SENTINEL);
+          }
+        }
+
+        const { readServerMapping } = await import('./embeddings/server-mapping.js');
+        const serverName = await readServerMapping(projectName);
+        const embeddingResult = await runEmbeddingPipeline(
+          executeQuery,
+          executeWithReusedStatement,
+          (p) => {
+            const scaled = 90 + Math.round((p.percent / 100) * 8);
+            const label =
+              p.phase === 'loading-model'
+                ? httpMode
+                  ? 'Connecting to embedding endpoint...'
+                  : 'Loading embedding model...'
+                : `Embedding ${p.nodesProcessed || 0}/${p.totalNodes || '?'}`;
+            progress('embeddings', scaled, label);
+          },
+          {},
+          cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
+          { repoName: projectName, serverName },
+          existingEmbeddings,
+        );
+        if (embeddingResult.semanticMode === 'exact-scan') {
+          semanticMode = 'exact-scan';
+          log(
+            'Semantic embeddings were generated without a VECTOR index; ' +
+              'queries will use exact-scan fallback within the configured limit.',
+          );
+        } else {
+          semanticMode = 'vector-index';
+        }
       }
     }
 
@@ -1026,40 +1034,42 @@ export async function runFullAnalysis(
     // Keep generated .gitnexus contents ignored without editing the user's root .gitignore.
     await ensureGitNexusIgnored(repoPath);
 
-    // ── Generate AI context files (best-effort) ───────────────────────
-    let aggregatedClusterCount = 0;
-    if (pipelineResult.communityResult?.communities) {
-      const groups = new Map<string, number>();
-      for (const c of pipelineResult.communityResult.communities) {
-        const label = c.heuristicLabel || c.label || 'Unknown';
-        groups.set(label, (groups.get(label) || 0) + c.symbolCount);
+    if (!options.skipAiContext) {
+      // ── Generate AI context files (best-effort) ───────────────────────
+      let aggregatedClusterCount = 0;
+      if (pipelineResult.communityResult?.communities) {
+        const groups = new Map<string, number>();
+        for (const c of pipelineResult.communityResult.communities) {
+          const label = c.heuristicLabel || c.label || 'Unknown';
+          groups.set(label, (groups.get(label) || 0) + c.symbolCount);
+        }
+        aggregatedClusterCount = Array.from(groups.values()).filter((count) => count >= 5).length;
       }
-      aggregatedClusterCount = Array.from(groups.values()).filter((count) => count >= 5).length;
-    }
 
-    try {
-      await generateAIContextFiles(
-        repoPath,
-        storagePath,
-        projectName,
-        {
-          files: pipelineResult.totalFileCount,
-          nodes: stats.nodes,
-          edges: stats.edges,
-          communities: pipelineResult.communityResult?.stats.totalCommunities,
-          clusters: aggregatedClusterCount,
-          processes: pipelineResult.processResult?.stats.totalProcesses,
-        },
-        undefined,
-        {
-          skipAgentsMd: options.skipAgentsMd,
-          skipSkills: options.skipSkills,
-          noStats: options.noStats,
-          defaultBranch: options.defaultBranch,
-        },
-      );
-    } catch {
-      // Best-effort — don't fail the entire analysis for context file issues
+      try {
+        await generateAIContextFiles(
+          repoPath,
+          storagePath,
+          projectName,
+          {
+            files: pipelineResult.totalFileCount,
+            nodes: stats.nodes,
+            edges: stats.edges,
+            communities: pipelineResult.communityResult?.stats.totalCommunities,
+            clusters: aggregatedClusterCount,
+            processes: pipelineResult.processResult?.stats.totalProcesses,
+          },
+          undefined,
+          {
+            skipAgentsMd: options.skipAgentsMd,
+            skipSkills: options.skipSkills,
+            noStats: options.noStats,
+            defaultBranch: options.defaultBranch,
+          },
+        );
+      } catch {
+        // Best-effort — don't fail the entire analysis for context file issues
+      }
     }
 
     // ── Close LadybugDB ──────────────────────────────────────────────

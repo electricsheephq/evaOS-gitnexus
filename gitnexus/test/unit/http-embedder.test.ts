@@ -141,6 +141,30 @@ describe('HTTP embedding backend', () => {
       expect(result.length).toBe(1024);
     });
 
+    it('forwards GITNEXUS_EMBEDDING_DIMS as output_dimension for Voyage', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'https://api.voyageai.com/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'voyage-code-3';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '2048';
+
+      const vec2048 = Array.from({ length: 2048 }, (_, i) => i / 2048);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          ok: true,
+          json: async () => ({ data: [{ embedding: vec2048 }] }),
+        }),
+      );
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      const result = await embedText('test text');
+
+      const body = JSON.parse((fetch as any).mock.calls[0][1].body);
+      expect(body.output_dimension).toBe(2048);
+      expect(body.dimensions).toBeUndefined();
+      expect(body.model).toBe('voyage-code-3');
+      expect(result.length).toBe(2048);
+    });
+
     it('forwards dimensions on the single-query path', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'text-embedding-3-large';

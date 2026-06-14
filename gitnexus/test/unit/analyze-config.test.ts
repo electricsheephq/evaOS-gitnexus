@@ -98,7 +98,7 @@ describe('analyze-config (.gitnexusrc support, #243)', () => {
     await writeRc(JSON.stringify({ branch: 'develop', skipAiContext: true, embeddings: false }));
     expect(loadAnalyzeConfig(dir)).toEqual({
       defaultBranch: 'develop',
-      skipAgentsMd: true, // skipAiContext → skipAgentsMd
+      skipAiContext: true,
       embeddings: false,
     });
   });

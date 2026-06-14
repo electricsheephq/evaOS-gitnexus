@@ -63,6 +63,17 @@ const readConfig = (): HttpConfig | null => {
  */
 export const isHttpMode = (): boolean => readConfig() !== null;
 
+export const isVoyageHttpMode = (): boolean => {
+  const config = readConfig();
+  if (!config) return false;
+  try {
+    const host = new URL(config.baseUrl).hostname.toLowerCase();
+    return host === 'voyageai.com' || host.endsWith('.voyageai.com');
+  } catch {
+    return false;
+  }
+};
+
 /**
  * Return the configured embedding dimensions for HTTP mode, or undefined
  * if HTTP mode is not active or no explicit dimensions are set.
@@ -95,11 +106,10 @@ interface EmbeddingItem {
  * @param apiKey - Bearer token (only used in Authorization header)
  * @param batchIndex - Logical batch number (for error context)
  * @param dimensions - Optional output-vector size. When provided, sent as
- *   the `dimensions` field in the request body. Endpoints that implement
- *   Matryoshka truncation (OpenAI text-embedding-3-*, Cohere embed-v3,
- *   Voyage) return a truncated vector at that size; endpoints that do not
- *   recognise the field may ignore it or return 400. Leave
- *   `GITNEXUS_EMBEDDING_DIMS` unset for strict backends that reject
+ *   the appropriate Matryoshka field for the host:
+ *     - `dimensions` for OpenAI-compatible endpoints
+ *     - `output_dimension` for Voyage (voyageai.com)
+ *   Leave `GITNEXUS_EMBEDDING_DIMS` unset for strict backends that reject
  *   unknown fields.
  */
 const httpEmbedBatch = async (
@@ -110,12 +120,28 @@ const httpEmbedBatch = async (
   batchIndex = 0,
   dimensions?: number,
 ): Promise<EmbeddingItem[]> => {
-  const requestBody: { input: string[]; model: string; dimensions?: number } = {
+  const requestBody: {
+    input: string[];
+    model: string;
+    dimensions?: number;
+    output_dimension?: number;
+  } = {
     input: batch,
     model,
   };
   if (dimensions !== undefined) {
-    requestBody.dimensions = dimensions;
+    let host = '';
+    try {
+      host = new URL(url).hostname.toLowerCase();
+    } catch {
+      /* malformed URL will fail in fetch below */
+    }
+    const isVoyageHost = host === 'voyageai.com' || host.endsWith('.voyageai.com');
+    if (isVoyageHost) {
+      requestBody.output_dimension = dimensions;
+    } else {
+      requestBody.dimensions = dimensions;
+    }
   }
 
   let resp: Response;

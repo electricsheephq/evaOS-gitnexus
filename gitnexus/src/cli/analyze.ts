@@ -555,6 +555,10 @@ const ANALYZE_CLI_ENV_KEYS = [
   'GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS',
   'GITNEXUS_WAL_CHECKPOINT_THRESHOLD',
   'GITNEXUS_WAL_MANUAL_CHECKPOINT',
+  'GITNEXUS_EMBEDDING_URL',
+  'GITNEXUS_EMBEDDING_MODEL',
+  'GITNEXUS_EMBEDDING_API_KEY',
+  'GITNEXUS_EMBEDDING_DIMS',
   'GITNEXUS_EMBEDDING_THREADS',
   'GITNEXUS_EMBEDDING_BATCH_SIZE',
   'GITNEXUS_EMBEDDING_SUB_BATCH_SIZE',
@@ -599,6 +603,8 @@ export interface AnalyzeOptions {
   verbose?: boolean;
   /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
   skipAgentsMd?: boolean;
+  /** Skip all AI context writes: AGENTS.md, CLAUDE.md, and bundled GitNexus skills. */
+  skipAiContext?: boolean;
   /**
    * Stats inclusion in AGENTS.md and CLAUDE.md.
    *
@@ -655,6 +661,10 @@ export interface AnalyzeOptions {
   embeddingBatchSize?: string;
   embeddingSubBatchSize?: string;
   embeddingDevice?: string;
+  embeddingBaseUrl?: string;
+  embeddingModel?: string;
+  embeddingAuthToken?: string;
+  embeddingDims?: string;
 }
 
 /**
@@ -671,9 +681,10 @@ export interface AnalyzeOptions {
  * without booting the full analyze pipeline (#742 review).
  */
 export const shouldGenerateCommunitySkillFiles = (
-  options: Pick<AnalyzeOptions, 'skills' | 'indexOnly'> | undefined,
+  options: Pick<AnalyzeOptions, 'skills' | 'indexOnly' | 'skipAiContext'> | undefined,
   pipelineResult: unknown,
-): boolean => Boolean(options?.skills && pipelineResult && !options?.indexOnly);
+): boolean =>
+  Boolean(options?.skills && pipelineResult && !options?.indexOnly && !options?.skipAiContext);
 
 export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOptions) => {
   if (await ensureHeap()) return;
@@ -779,7 +790,7 @@ const analyzeCommandImpl = async (
     // git call. Detection is best-effort and never blocks analyze.
     const cliBranch = cliOptions?.defaultBranch;
     const configBranch = fileConfig?.defaultBranch;
-    const willGenerateContext = !options.indexOnly && !options.skipAgentsMd;
+    const willGenerateContext = !options.indexOnly && !options.skipAiContext && !options.skipAgentsMd;
     let detectedBranch: string | null = null;
     if (
       cliBranch === undefined &&
@@ -911,6 +922,20 @@ const analyzeCommandImpl = async (
     return;
   }
 
+  if (
+    !setPositiveEnv('--embedding-dims', 'GITNEXUS_EMBEDDING_DIMS', options.embeddingDims)
+  ) {
+    return;
+  }
+
+  const setTrimmedEnv = (envName: string, value: string | undefined): void => {
+    const trimmed = value?.trim();
+    if (trimmed) process.env[envName] = trimmed;
+  };
+  setTrimmedEnv('GITNEXUS_EMBEDDING_URL', options.embeddingBaseUrl);
+  setTrimmedEnv('GITNEXUS_EMBEDDING_MODEL', options.embeddingModel);
+  setTrimmedEnv('GITNEXUS_EMBEDDING_API_KEY', options.embeddingAuthToken);
+
   if (options.embeddingDevice) {
     const allowed = new Set(['auto', 'cpu', 'dml', 'cuda', 'wasm']);
     if (!allowed.has(options.embeddingDevice)) {
@@ -936,9 +961,9 @@ const analyzeCommandImpl = async (
   // pipeline re-index ran but no skill files appeared. The pipeline still
   // re-runs (see `force: options.force || options.skills` below); the warning
   // is purely about the dropped post-index write step.
-  if (options.indexOnly && options.skills) {
+  if ((options.indexOnly || options.skipAiContext) && options.skills) {
     console.log(
-      '  Note: --index-only overrides --skills; community skill files will not be written.\n',
+      '  Note: --index-only overrides --skills; --skip-ai-context does the same. Community skill files will not be written.\n',
     );
   }
 
@@ -1073,7 +1098,7 @@ const analyzeCommandImpl = async (
 
   // ── Run shared analysis orchestrator ───────────────────────────────
   try {
-    const skipAll = options.indexOnly;
+    const skipAll = options.indexOnly || options.skipAiContext;
     const skipAgentsMd = skipAll || options.skipAgentsMd;
     const skipSkills = skipAll || options.skipSkills;
     const result = await runFullAnalysis(
@@ -1082,7 +1107,7 @@ const analyzeCommandImpl = async (
         // Pipeline re-index — OR'd with --skills because skill generation
         // needs a fresh pipelineResult. Has no bearing on the registry
         // collision guard (see allowDuplicateName below).
-        force: options.force || options.skills,
+        force: options.force || (options.skills && !skipAll),
         repairFts: options.repairFts,
         embeddings: embeddingsEnabled,
         embeddingsNodeLimit,
@@ -1090,6 +1115,7 @@ const analyzeCommandImpl = async (
         verbose: options.verbose,
         skipGit: options.skipGit,
         skipAgentsMd,
+        skipAiContext: skipAll,
         skipSkills,
         // Resolved default branch (CLI > .gitnexusrc > auto-detect > "main")
         // threaded into the generated regression-compare example (#243).

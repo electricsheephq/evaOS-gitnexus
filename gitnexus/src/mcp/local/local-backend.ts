@@ -49,11 +49,26 @@ import {
   isVectorExtensionSupportedByPlatform,
 } from '../../core/platform/capabilities.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
+import {
+  rerankDocuments,
+  resolveRerankConfig,
+  type RerankConfig,
+} from '../../core/rerank/voyage-reranker.js';
 import { checkStalenessAsync, checkCwdMatch } from '../../core/git-staleness.js';
 import { logger } from '../../core/logger.js';
 import { LIST_REPOS_DEFAULT_LIMIT, LIST_REPOS_MAX_LIMIT } from '../tools.js';
+import { mcpDefaultRepo, mcpReadOnlyMode, repoAllowed } from '../config.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
+
+const MCP_READ_ONLY_TOOLS = new Set([
+  'list_repos',
+  'query',
+  'context',
+  'impact',
+  'detect_changes',
+  'cypher',
+]);
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -353,6 +368,8 @@ interface ImpactParams {
   offset?: number;
   summaryOnly?: boolean;
 }
+
+type MergedQueryCandidate = [string, { score: number; data: any }];
 
 /**
  * One repository entry as returned by {@link LocalBackend.listRepos} and in each
@@ -659,17 +676,18 @@ export class LocalBackend {
    * while the MCP server was running.
    */
   async resolveRepo(repoParam?: string): Promise<RepoHandle> {
+    const effectiveRepo = repoParam || mcpDefaultRepo();
     let refreshedAfterAmbiguity = false;
     let result: RepoHandle | null;
     try {
-      result = this.resolveRepoFromCache(repoParam);
+      result = this.resolveRepoFromCache(effectiveRepo);
     } catch (err) {
       if (!(err instanceof RegistryAmbiguousTargetError)) throw err;
       // Stale in-memory duplicate siblings can linger after unregister; refresh
       // once before re-throwing so a resolved registry can disambiguate (#1658).
       await this.refreshRepos();
       refreshedAfterAmbiguity = true;
-      result = this.resolveRepoFromCache(repoParam);
+      result = this.resolveRepoFromCache(effectiveRepo);
     }
 
     if (result) {
@@ -689,15 +707,19 @@ export class LocalBackend {
     if (!refreshedAfterAmbiguity) {
       await this.refreshRepos();
     }
-    const retried = this.resolveRepoFromCache(repoParam);
+    const retried = this.resolveRepoFromCache(effectiveRepo);
     if (retried) {
       this.maybeWarnSiblingDrift(retried).catch(() => {});
       return retried;
     }
 
     // Still no match — throw with helpful message
+    const visibleHandles = this.visibleRepoHandles();
     if (this.repos.size === 0) {
       throw new Error('No indexed repositories. Run: gitnexus analyze');
+    }
+    if (visibleHandles.length === 0) {
+      throw new Error('No repositories match the configured GitNexus MCP allow-list.');
     }
 
     // Build a disambiguated "Available: …" list (#829). When two handles
@@ -705,16 +727,16 @@ export class LocalBackend {
     // caller can actually pick the right one. Single-name entries render
     // identically to pre-#829 output.
     const nameCounts = new Map<string, number>();
-    for (const h of this.repos.values()) {
+    for (const h of visibleHandles) {
       const key = h.name.toLowerCase();
       nameCounts.set(key, (nameCounts.get(key) ?? 0) + 1);
     }
-    const labels = [...this.repos.values()].map((h) =>
+    const labels = visibleHandles.map((h) =>
       (nameCounts.get(h.name.toLowerCase()) ?? 0) > 1 ? `${h.name} (${h.repoPath})` : h.name,
     );
 
-    if (repoParam) {
-      throw new Error(`Repository "${repoParam}" not found. Available: ${labels.join(', ')}`);
+    if (effectiveRepo) {
+      throw new Error(`Repository "${effectiveRepo}" not found. Available: ${labels.join(', ')}`);
     }
     throw new Error(
       `Multiple repositories indexed. Specify which one with the "repo" parameter. Available: ${labels.join(', ')}`,
@@ -727,7 +749,8 @@ export class LocalBackend {
    * multiple handles by name and cwd cannot disambiguate (#1658).
    */
   private resolveRepoFromCache(repoParam?: string): RepoHandle | null {
-    if (this.repos.size === 0) return null;
+    const entries = this.visibleRepoEntries();
+    if (entries.length === 0) return null;
 
     if (repoParam) {
       const paramLower = repoParam.toLowerCase();
@@ -736,7 +759,7 @@ export class LocalBackend {
 
       const resolvePathMatch = (): RepoHandle | undefined => {
         const canonicalTarget = canonicalizePath(repoParam);
-        return [...this.repos.values()].find((handle) => {
+        return entries.map(([, handle]) => handle).find((handle) => {
           const stored = canonicalizePath(handle.repoPath);
           return process.platform === 'win32'
             ? stored.toLowerCase() === canonicalTarget.toLowerCase()
@@ -754,9 +777,9 @@ export class LocalBackend {
 
       // Exact name before id — the first duplicate sibling keeps id === name
       // (e.g. id "shared"), so a name lookup must not be captured by the id tier.
-      const nameMatches = [...this.repos.values()].filter(
-        (handle) => handle.name.toLowerCase() === paramLower,
-      );
+      const nameMatches = entries
+        .map(([, handle]) => handle)
+        .filter((handle) => handle.name.toLowerCase() === paramLower);
       if (nameMatches.length === 1) return nameMatches[0];
       if (nameMatches.length > 1) {
         const cwdPick = this.pickRepoHandleForCwd(nameMatches);
@@ -768,7 +791,8 @@ export class LocalBackend {
       }
 
       // Stable hashed id (e.g. "shared-abc123") from repoId() collision suffix
-      if (this.repos.has(paramLower)) return this.repos.get(paramLower)!;
+      const byId = entries.find(([id]) => id === paramLower);
+      if (byId) return byId[1];
 
       // Bare name resolved as a cwd-relative path (e.g. "myrepo" against process.cwd()),
       // after name/id tiers. Path-like strings with separators were handled at the top.
@@ -778,19 +802,27 @@ export class LocalBackend {
       }
 
       // Partial name — only when unambiguous
-      const partialMatches = [...this.repos.values()].filter((handle) =>
-        handle.name.toLowerCase().includes(paramLower),
-      );
+      const partialMatches = entries
+        .map(([, handle]) => handle)
+        .filter((handle) => handle.name.toLowerCase().includes(paramLower));
       if (partialMatches.length === 1) return partialMatches[0];
 
       return null;
     }
 
-    if (this.repos.size === 1) {
-      return this.repos.values().next().value!;
+    if (entries.length === 1) {
+      return entries[0]![1];
     }
 
     return null; // Multiple repos, no param — ambiguous
+  }
+
+  private visibleRepoEntries(): Array<[string, RepoHandle]> {
+    return [...this.repos.entries()].filter(([, handle]) => repoAllowed(handle.name));
+  }
+
+  private visibleRepoHandles(): RepoHandle[] {
+    return this.visibleRepoEntries().map(([, handle]) => handle);
   }
 
   /**
@@ -922,7 +954,7 @@ export class LocalBackend {
    */
   async listRepos(): Promise<RepoListing[]> {
     await this.refreshRepos();
-    const handles = [...this.repos.values()];
+    const handles = this.visibleRepoHandles();
 
     // Pre-group registered handles by `remoteUrl` so the sibling
     // lookup is O(1) per handle. We reuse the in-memory `this.repos`
@@ -1086,6 +1118,10 @@ export class LocalBackend {
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
   async callTool(method: string, params: any): Promise<any> {
+    if (mcpReadOnlyMode() && !MCP_READ_ONLY_TOOLS.has(method)) {
+      throw new Error(`Tool "${method}" is not available in GitNexus MCP read-only mode.`);
+    }
+
     if (method === 'list_repos') {
       // Paginated tool surface (#2119). `listRepos()` is unchanged for internal
       // callers; the tool wraps it in { repositories, pagination } and forwards
@@ -1094,10 +1130,16 @@ export class LocalBackend {
     }
 
     if (method.startsWith('group_')) {
+      if (mcpReadOnlyMode()) {
+        throw new Error('Group mode is not available in GitNexus MCP read-only mode.');
+      }
       return this.handleGroupTool(method, params || {});
     }
 
     const p = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
+    if (mcpReadOnlyMode() && typeof p.repo === 'string' && p.repo.startsWith('@')) {
+      throw new Error('Group mode is not available in GitNexus MCP read-only mode.');
+    }
     if (
       (method === 'impact' || method === 'query' || method === 'context') &&
       typeof p.repo === 'string' &&
@@ -1242,10 +1284,25 @@ export class LocalBackend {
       }
     }
 
-    const merged = Array.from(scoreMap.entries())
+    let merged = Array.from(scoreMap.entries())
       .sort((a, b) => b[1].score - a[1].score)
-      .slice(0, searchLimit);
+      .slice(0, searchLimit) as MergedQueryCandidate[];
     timer.stop(); // merge
+
+    let rerankWarning: string | undefined;
+    try {
+      const config = resolveRerankConfig(repo.name);
+      if (config) {
+        merged = await timer.time(
+          'rerank',
+          this.rerankMergedCandidates(repo, searchQuery, merged, config),
+        );
+      }
+    } catch (err) {
+      rerankWarning =
+        'Rerank unavailable — using existing BM25/vector ranking. ' +
+        (err instanceof Error ? err.message : String(err));
+    }
 
     // Step 2: For each match with a nodeId, trace to process(es)
     timer.start('symbol_lookup');
@@ -1500,6 +1557,9 @@ export class LocalBackend {
         'Symbol enrichment partially failed — some process/cohesion/content data may be missing from these results (see server logs).',
       );
     }
+    if (rerankWarning) {
+      warnings.push(rerankWarning);
+    }
 
     return {
       processes,
@@ -1514,6 +1574,80 @@ export class LocalBackend {
   /**
    * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
    */
+  private async rerankMergedCandidates(
+    repo: RepoHandle,
+    query: string,
+    merged: MergedQueryCandidate[],
+    config: RerankConfig,
+  ): Promise<MergedQueryCandidate[]> {
+    const candidateCount = Math.min(config.candidates, merged.length);
+    if (candidateCount <= 1) return merged;
+
+    const candidates = merged.slice(0, candidateCount);
+    const contents = new Map<string, string>();
+    const nodeIds = candidates
+      .map(([, item]) => item.data?.nodeId)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+
+    if (nodeIds.length > 0) {
+      try {
+        const rows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (n)
+          WHERE n.id IN $nodeIds
+          RETURN n.id AS nodeId, n.content AS content
+        `,
+          { nodeIds },
+        );
+        for (const row of rows) {
+          const nodeId = row.nodeId ?? row[0];
+          const content = row.content ?? row[1];
+          if (typeof nodeId === 'string' && typeof content === 'string' && content.trim()) {
+            contents.set(nodeId, content);
+          }
+        }
+      } catch (err) {
+        logQueryError('query:rerank-content-fetch', err);
+      }
+    }
+
+    const documents = candidates.map(([, item]) => {
+      const sym = item.data ?? {};
+      const rawContent = typeof sym.nodeId === 'string' ? contents.get(sym.nodeId) : undefined;
+      const content =
+        rawContent && rawContent.length > config.maxDocChars
+          ? rawContent.slice(0, config.maxDocChars)
+          : rawContent;
+      return [
+        `name: ${sym.name ?? ''}`,
+        `type: ${sym.type ?? 'Unknown'}`,
+        `file: ${sym.filePath ?? ''}`,
+        sym.startLine || sym.endLine ? `lines: ${sym.startLine ?? '?'}-${sym.endLine ?? '?'}` : '',
+        content ? `content:\n${content}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    });
+
+    const ranked = await rerankDocuments(query, documents, config);
+    if (ranked.length === 0) return merged;
+
+    const used = new Set<number>();
+    const reordered: MergedQueryCandidate[] = [];
+    for (const item of ranked) {
+      if (used.has(item.index)) continue;
+      const candidate = candidates[item.index];
+      if (!candidate) continue;
+      used.add(item.index);
+      reordered.push(candidate);
+    }
+    for (let i = 0; i < candidates.length; i++) {
+      if (!used.has(i)) reordered.push(candidates[i]!);
+    }
+    return [...reordered, ...merged.slice(candidateCount)];
+  }
+
   private async bm25Search(
     repo: RepoHandle,
     query: string,

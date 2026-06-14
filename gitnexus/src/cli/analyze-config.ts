@@ -71,10 +71,11 @@ interface KeySpec {
  *
  * Aliases intentionally collapse onto a shared target:
  *   - `branch` is the legacy alias for `defaultBranch` (issue-comment shape).
- *   - `skipContextFiles` / `skipAiContext` are aliases for `skipAgentsMd` — they
- *     suppress the AGENTS.md / CLAUDE.md block ONLY. They do not imply
- *     `skipSkills`, and they are weaker than `indexOnly` (which skips all
- *     file injection). This matches the existing CLI semantics exactly.
+ *   - `skipContextFiles` is an alias for `skipAgentsMd` — it suppresses the
+ *     AGENTS.md / CLAUDE.md block ONLY.
+ *   - `skipAiContext` is the stronger no-file-injection switch: AGENTS.md,
+ *     CLAUDE.md, bundled GitNexus skills, and generated community skills.
+ *     It is weaker than `indexOnly` only in name; both skip all AI context writes.
  *   - `noStats` is the negation of `stats`.
  */
 const KEY_SPECS: Record<string, KeySpec> = {
@@ -82,7 +83,7 @@ const KEY_SPECS: Record<string, KeySpec> = {
   branch: { target: 'defaultBranch', kind: 'branch' },
   skipAgentsMd: { target: 'skipAgentsMd', kind: 'boolean' },
   skipContextFiles: { target: 'skipAgentsMd', kind: 'boolean' },
-  skipAiContext: { target: 'skipAgentsMd', kind: 'boolean' },
+  skipAiContext: { target: 'skipAiContext', kind: 'boolean' },
   skipSkills: { target: 'skipSkills', kind: 'boolean' },
   indexOnly: { target: 'indexOnly', kind: 'boolean' },
   stats: { target: 'stats', kind: 'boolean' },

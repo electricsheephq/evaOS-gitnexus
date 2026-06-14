@@ -16,7 +16,7 @@ import path from 'path';
 // local-backend.ts imports from core/lbug/pool-adapter.js; the mcp/core/lbug-adapter.js
 // re-exports from the same module, so we mock the canonical source.
 // vi.hoisted runs before vi.mock hoisting, making the fns available to both factories.
-const { lbugMocks, platformMocks } = vi.hoisted(() => ({
+const { lbugMocks, platformMocks, rerankMocks } = vi.hoisted(() => ({
   lbugMocks: {
     initLbug: vi.fn().mockResolvedValue(undefined),
     executeQuery: vi.fn().mockResolvedValue([]),
@@ -26,6 +26,10 @@ const { lbugMocks, platformMocks } = vi.hoisted(() => ({
   },
   platformMocks: {
     isVectorExtensionSupportedByPlatform: vi.fn().mockReturnValue(true),
+  },
+  rerankMocks: {
+    resolveRerankConfig: vi.fn().mockReturnValue(null),
+    rerankDocuments: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -85,6 +89,10 @@ vi.mock('../../src/mcp/core/embedder.js', () => ({
   getEmbeddingDims: vi.fn().mockReturnValue(384),
 }));
 
+vi.mock('../../src/core/rerank/voyage-reranker.js', () => ({
+  ...rerankMocks,
+}));
+
 import {
   LocalBackend,
   REPO_ID_HASH_LENGTH,
@@ -111,6 +119,11 @@ const MOCK_REPO_ENTRY = {
   lastCommit: 'abc1234567890',
   stats: { files: 10, nodes: 50, edges: 100, communities: 3, processes: 5 },
 };
+
+beforeEach(() => {
+  rerankMocks.resolveRerankConfig.mockReturnValue(null);
+  rerankMocks.rerankDocuments.mockResolvedValue([]);
+});
 
 function setupSingleRepo() {
   (listRegisteredRepos as any).mockResolvedValue([MOCK_REPO_ENTRY]);
@@ -305,6 +318,83 @@ describe('LocalBackend.callTool', () => {
     const result = await backend.callTool('query', { query: 'auth' });
     expect(result).toHaveProperty('processes');
     expect(result).toHaveProperty('definitions');
+  });
+
+  it('reranks merged query candidates when the premium repo gate is configured', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      ftsAvailable: true,
+      results: [
+        { filePath: 'src/alpha.ts', nodeIds: ['node-alpha'], score: 10 },
+        { filePath: 'src/beta.ts', nodeIds: ['node-beta'], score: 9 },
+      ],
+    });
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
+    rerankMocks.resolveRerankConfig.mockReturnValue({
+      baseUrl: 'https://api.voyageai.com/v1',
+      model: 'rerank-2.5',
+      apiKey: 'test-key',
+      candidates: 2,
+      maxDocChars: 3000,
+    });
+    rerankMocks.rerankDocuments.mockResolvedValueOnce([
+      { index: 1, relevance_score: 0.99 },
+      { index: 0, relevance_score: 0.25 },
+    ]);
+
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 0 }];
+      return [];
+    });
+    (executeParameterized as any).mockImplementation(
+      async (_repoId: string, cypher: string, params?: { nodeIds?: string[] }) => {
+        if (cypher.includes('RETURN n.id AS id')) {
+          return (params?.nodeIds ?? []).map((id) =>
+            id === 'node-alpha'
+              ? {
+                  id,
+                  name: 'Alpha',
+                  type: 'Function',
+                  filePath: 'src/alpha.ts',
+                  startLine: 1,
+                  endLine: 10,
+                }
+              : {
+                  id,
+                  name: 'Beta',
+                  type: 'Function',
+                  filePath: 'src/beta.ts',
+                  startLine: 20,
+                  endLine: 30,
+                },
+          );
+        }
+        if (cypher.includes('RETURN n.id AS nodeId, n.content AS content')) {
+          return (params?.nodeIds ?? []).map((id) => ({
+            nodeId: id,
+            content: id === 'node-alpha' ? 'alpha implementation' : 'beta implementation',
+          }));
+        }
+        return [];
+      },
+    );
+
+    const result = await backend.callTool('query', { query: 'auth', limit: 1, max_symbols: 2 });
+
+    expect(rerankMocks.resolveRerankConfig).toHaveBeenCalledWith('test-project');
+    expect(rerankMocks.rerankDocuments).toHaveBeenCalledWith(
+      'auth',
+      expect.arrayContaining([
+        expect.stringContaining('alpha implementation'),
+        expect.stringContaining('beta implementation'),
+      ]),
+      expect.objectContaining({ model: 'rerank-2.5' }),
+    );
+    expect(result.definitions.map((definition: any) => definition.name)).toEqual([
+      'Beta',
+      'Alpha',
+    ]);
+    expect(result.timing).toHaveProperty('rerank');
   });
 
   it('includes FTS-unavailable warning when ftsAvailable is false (#1403)', async () => {
