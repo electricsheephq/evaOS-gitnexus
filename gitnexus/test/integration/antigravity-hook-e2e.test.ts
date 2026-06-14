@@ -124,7 +124,7 @@ describe('antigravity hook adapter e2e', () => {
       expect(output).not.toBeNull();
       expect(output!.hookEventName).toBe('AfterTool');
       expect(output!.additionalContext).toContain('index is stale');
-      expect(output!.additionalContext).toContain('npx gitnexus@latest analyze');
+      expect(output!.additionalContext).toContain('npx -y gitnexus@latest analyze');
 
       // Mirror to stderr so terminal users see the hint even when the agent
       // discards additionalContext
@@ -211,7 +211,7 @@ describe('antigravity hook adapter e2e', () => {
 
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
-      expect(output!.additionalContext).toContain('npx gitnexus@latest analyze --embeddings');
+      expect(output!.additionalContext).toContain('npx -y gitnexus@latest analyze --embeddings');
     });
 
     it('treats missing meta.json as stale', () => {

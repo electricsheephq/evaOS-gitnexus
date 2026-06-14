@@ -190,9 +190,9 @@ withTestLbugDB(
         it('deleteNodesForFile with non-existent path returns zero deleted', async () => {
           const { deleteNodesForFile } = await import('../../src/core/lbug/lbug-adapter.js');
 
-          // deleteNodesForFile has per-query try/catch, returns {deletedNodes: 0} for missing paths
+          // deleteNodesForFile has per-query try/catch, returns empty counts for missing paths
           const result = await deleteNodesForFile('/absolutely/nonexistent/path/file.ts');
-          expect(result).toEqual({ deletedNodes: 0 });
+          expect(result).toEqual({ deletedNodes: 0, deletedNodeIds: [] });
         });
       });
 

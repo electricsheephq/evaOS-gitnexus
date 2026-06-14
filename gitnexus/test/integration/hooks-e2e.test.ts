@@ -87,7 +87,7 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
       expect(output!.additionalContext).toContain('stale');
-      expect(output!.additionalContext).toContain('npx gitnexus@latest analyze');
+      expect(output!.additionalContext).toContain('npx -y gitnexus@latest analyze');
     });
 
     it('prefers pnpm dlx when GITNEXUS_INVOCATION=pnpm', () => {
@@ -231,7 +231,7 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
 
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
-      expect(output!.additionalContext).toContain('npx gitnexus@latest analyze --embeddings');
+      expect(output!.additionalContext).toContain('npx -y gitnexus@latest analyze --embeddings');
     });
 
     it('treats missing meta.json as stale', () => {

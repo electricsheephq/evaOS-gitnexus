@@ -1154,8 +1154,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       setCodePanelOpen(false);
       setCodeReferenceFocus(null);
 
-      let connectedRepo: BackendRepo | undefined;
-      let pNameStr = repoName || 'server-project';
+      let pNameStr: string | undefined;
 
       try {
         const result: ConnectResult = await connectToServer(
@@ -1202,7 +1201,6 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
         setProjectName(pName);
         repoRef.current = pName;
 
-        connectedRepo = result.repoInfo;
         pNameStr = pName;
 
         const newGraph = createKnowledgeGraph();

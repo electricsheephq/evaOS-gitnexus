@@ -1,12 +1,12 @@
 name: Publish
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sole publisher for the `gitnexus` npm package, GitHub Releases, and Docker
-# images. Replaces the former two-workflow design — see issue #1609 for the
-# double-publish race this unification closes.
+# Sole publisher for the `gitnexus` npm package, GitHub Releases, tags, and
+# Docker images. Pushes to main validate through release-candidate.yml only and
+# never publish artifacts.
 #
 # Two release modes, both routed through this file:
-#   • Release candidate (rc)  — triggered by push to `main` or workflow_dispatch.
+#   • Release candidate (rc)  — triggered by workflow_dispatch.
 #       The RC path computes the next rc version, applies it in-CI, pushes a
 #       detached release commit with v<X.Y.Z>-rc.<N> + rc/<SHA> marker
 #       atomically, then publishes to npm with --tag rc and creates a GitHub
@@ -28,11 +28,6 @@ name: Publish
 
 on:
   push:
-    branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
     tags:
       # Negative-globbed exclusion of RC tags this workflow itself produces
       # (see the SELF-TRIGGER INVARIANT in the header comment).
@@ -118,9 +113,6 @@ jobs:
               ;;
             push)
               case "${GH_REF}" in
-                refs/heads/main)
-                  MODE="rc"
-                  ;;
                 refs/tags/v*)
                   # The trigger filter already excluded v*-rc.* tags. Anything
                   # reaching here is either a stable semver or a malformed v*.
@@ -784,6 +776,7 @@ jobs:
       #   Workflow:    publish.yml
       #   Environment: (none)
       - name: Publish to npm
+        id: npm-publish
         shell: bash
         working-directory: gitnexus
         env:
@@ -836,19 +829,23 @@ jobs:
             ) || '' }}
 
       # ── RC partial-failure cleanup ───────────────────────────────────────
-      # If anything after the atomic tag-push step failed (npm publish
-      # blew up, GitHub Release call timed out, etc.), the v-tag and
-      # rc/<SHA> marker are already on origin. External consumers
+      # If npm publish fails after the atomic tag-push step, the v-tag and
+      # rc/<SHA> marker are already on origin but no immutable npm version
+      # exists. External consumers
       # (Renovate, Dependabot, Releases RSS) can ingest a phantom tag for
       # a version that was never published to npm. This step deletes them
       # automatically so the operator's recovery is just "redispatch with
       # force=true on the next commit", not a manual ref cleanup.
       #
+      # If npm publish succeeds and a later GitHub Release step fails, keep the
+      # provenance tags: npm versions are immutable, and the recovery is to
+      # repair the release record, not to remove source tags for a real artifact.
+      #
       # Scoped strictly to RC + real (non-dry-run) + the rc-tags step
       # actually produced a vtag (otherwise nothing to clean up). The
       # App token is still valid (~1h TTL, job timeout 20min).
       - name: Cleanup pushed tags on partial failure
-        if: ${{ failure() && needs.route.outputs.mode == 'rc' && steps.rc-tags.outputs.vtag != '' }}
+        if: ${{ failure() && needs.route.outputs.mode == 'rc' && steps.rc-tags.outputs.vtag != '' && steps.npm-publish.conclusion != 'success' }}
         shell: bash
         working-directory: gitnexus
         env:

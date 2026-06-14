@@ -152,6 +152,7 @@ function writeExecutable(filePath: string, content: string) {
 function createHookToolDir(options: {
   gitnexusStderr?: string;
   gitnexusMarkerPath?: string;
+  gitnexusSleepMs?: number;
   lsofOutput?: string;
   lsofOutputLines?: string[];
   psOutput?: string;
@@ -161,8 +162,9 @@ function createHookToolDir(options: {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-hook-bin-'));
   const gitnexusStderr = JSON.stringify(options.gitnexusStderr ?? '');
   const markerPath = JSON.stringify(options.gitnexusMarkerPath ?? '');
+  const gitnexusSleepMs = Number(options.gitnexusSleepMs ?? 0);
 
-  const fakeGitNexus = `#!/usr/bin/env node\nconst fs = require('fs');\nconst marker = ${markerPath};\nif (marker) fs.writeFileSync(marker, 'called');\nprocess.stderr.write(${gitnexusStderr});\n`;
+  const fakeGitNexus = `#!/usr/bin/env node\nconst fs = require('fs');\nconst marker = ${markerPath};\nif (marker) fs.appendFileSync(marker, 'called\\n');\nprocess.stderr.write(${gitnexusStderr});\nconst sleepMs = ${gitnexusSleepMs};\nif (sleepMs > 0) setTimeout(() => {}, sleepMs);\n`;
   writeExecutable(path.join(binDir, 'gitnexus'), fakeGitNexus);
   writeExecutable(path.join(binDir, 'gitnexus-cli.js'), fakeGitNexus);
 
@@ -540,8 +542,6 @@ describe('extractPattern coverage', () => {
 // ─── PostToolUse: git mutation regex coverage ───────────────────────
 
 describe('Git mutation regex', () => {
-  const GIT_REGEX = /\\bgit\\s\+\(commit\|merge\|rebase\|cherry-pick\|pull\)/;
-
   for (const [label, hookPath] of [
     ['CJS', CJS_HOOK],
     ['Plugin', PLUGIN_HOOK],
@@ -743,104 +743,65 @@ describe('PreToolUse concurrency guard (integration)', () => {
     });
 
     it(`${label}: hook does not exceed MAX_INFLIGHT under simultaneous bursts (hard cap)`, async () => {
-      // Spawn many hook processes concurrently and assert that at most
-      // MAX_INFLIGHT (3) slot files end up populated by live pids. The
-      // O_CREAT|O_EXCL slot scheme makes this a hard cap, not the soft cap
-      // that the count-then-claim approach gives.
+      // Spawn many real hook processes concurrently and assert that at most
+      // MAX_INFLIGHT (3) slot files end up populated by live pids while the
+      // slow fake gitnexus CLI keeps winning hooks alive.
       const { spawn } = await import('child_process');
       const lockDir = path.join(gitNexusDir, '.hook-locks');
-      // Clean any leftover slot files.
-      try {
-        for (const f of fs.readdirSync(lockDir)) fs.unlinkSync(path.join(lockDir, f));
-      } catch {
-        /* dir may not exist yet */
-      }
-      fs.mkdirSync(lockDir, { recursive: true });
-
-      // We use child workers that just claim a slot via the same algorithm
-      // and then sleep, so we can observe the on-disk state under contention
-      // without spawning the real gitnexus augment CLI.
-      const claimerScript = `
-        const fs = require('fs'); const path = require('path');
-        const lockDir = ${JSON.stringify(lockDir)};
-        const MAX = 3;
-        const STALE = 30000;
-        const myPid = String(process.pid);
-        function tryAcquire() {
-          for (let slot = 0; slot < MAX; slot++) {
-            const p = path.join(lockDir, 'slot-' + slot + '.lock');
-            for (let a = 0; a < 2; a++) {
-              try { fs.writeFileSync(p, myPid, { flag: 'wx' }); return p; }
-              catch {
-                let stat; try { stat = fs.statSync(p); } catch { continue; }
-                let live = false;
-                try {
-                  const s = fs.readFileSync(p, 'utf-8').trim();
-                  if (s === '') live = true;
-                  else { const o = Number.parseInt(s, 10);
-                    if (Number.isFinite(o) && o > 0) { try { process.kill(o, 0); live = true; } catch {} }
-                  }
-                } catch {}
-                if (live && Date.now() - stat.mtimeMs > STALE) live = false;
-                if (live) break;
-                try { fs.unlinkSync(p); } catch {}
-              }
-            }
-          }
-          return null;
-        }
-        const claimed = tryAcquire();
-        if (claimed) {
-          process.stdout.write('CLAIMED:' + claimed + '\\n');
-          setTimeout(() => {}, 5000);
-        } else {
-          process.stdout.write('SKIPPED\\n');
-        }
-      `;
+      fs.rmSync(lockDir, { recursive: true, force: true });
 
       const N = 10;
+      const markerPath = path.join(os.tmpdir(), `gitnexus-hook-cap-${process.pid}-${label}`);
+      fs.rmSync(markerPath, { force: true });
+      const binDir = createHookToolDir({ gitnexusMarkerPath: markerPath, gitnexusSleepMs: 250 });
+      const hookInput = JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Grep',
+        tool_input: { pattern: 'validateUser' },
+        cwd: tmpDir,
+      });
       const claimers = Array.from({ length: N }, () =>
-        spawn(process.execPath, ['-e', claimerScript], {
-          stdio: ['ignore', 'pipe', 'ignore'],
+        // Test-only: CodeQL treats the temp marker/lock interaction as a
+        // file-race sink, but this process is deliberately exercising the
+        // hook's concurrent lock cap against an isolated mkdtemp fixture.
+        // codeql[js/file-system-race]
+        spawn(process.execPath, [hookPath], {
+          cwd: tmpDir,
+          env: hookEnv(binDir),
+          stdio: ['pipe', 'pipe', 'pipe'],
           detached: false,
         }),
       );
       try {
-        // Wait until every claimer has printed its decision.
-        const decisions = await Promise.all(
+        for (const c of claimers) {
+          c.stdin.end(hookInput);
+        }
+
+        await Promise.all(
           claimers.map(
             (c) =>
-              new Promise<string>((resolve) => {
-                let buf = '';
-                c.stdout!.on('data', (d) => {
-                  buf += d.toString();
-                  if (buf.includes('\n')) resolve(buf.split('\n')[0]);
-                });
-                c.on('exit', () => resolve(buf.split('\n')[0] || 'EXIT'));
+              new Promise<void>((resolve) => {
+                if (c.exitCode !== null || c.signalCode !== null) {
+                  resolve();
+                  return;
+                }
+                const done = () => {
+                  clearTimeout(timeout);
+                  resolve();
+                };
+                const timeout = setTimeout(resolve, 3000);
+                c.once('exit', done);
               }),
           ),
         );
-        const claimedCount = decisions.filter((d) => d.startsWith('CLAIMED:')).length;
-        const skippedCount = decisions.filter((d) => d === 'SKIPPED').length;
 
-        // HARD CAP: never more than 3 winners, regardless of how many bursts.
-        expect(claimedCount).toBeLessThanOrEqual(3);
-        // And the remainder must have all explicitly skipped.
-        expect(claimedCount + skippedCount).toBe(N);
-
-        // On-disk state matches.
-        const liveSlots = fs
-          .readdirSync(lockDir)
-          .filter((f) => /^slot-\d+\.lock$/.test(f))
-          .filter((f) => {
-            try {
-              const o = Number.parseInt(fs.readFileSync(path.join(lockDir, f), 'utf-8').trim(), 10);
-              return Number.isFinite(o) && o > 0;
-            } catch {
-              return false;
-            }
-          });
-        expect(liveSlots.length).toBeLessThanOrEqual(3);
+        // HARD CAP: never more than 3 hooks reach the augment CLI, regardless
+        // of how many burst concurrently.
+        const calls = fs.existsSync(markerPath)
+          ? fs.readFileSync(markerPath, 'utf-8').trim().split('\n').filter(Boolean)
+          : [];
+        expect(calls.length).toBeGreaterThan(0);
+        expect(calls.length).toBeLessThanOrEqual(3);
       } finally {
         for (const c of claimers) {
           try {
@@ -849,16 +810,26 @@ describe('PreToolUse concurrency guard (integration)', () => {
             /* ignore */
           }
         }
-        try {
-          for (const f of fs.readdirSync(lockDir)) fs.unlinkSync(path.join(lockDir, f));
-        } catch {
-          /* ignore */
-        }
-        try {
-          fs.rmdirSync(lockDir);
-        } catch {
-          /* ignore */
-        }
+        await Promise.all(
+          claimers.map(
+            (c) =>
+              new Promise<void>((resolve) => {
+                if (c.exitCode !== null || c.signalCode !== null) {
+                  resolve();
+                  return;
+                }
+                const done = () => {
+                  clearTimeout(timeout);
+                  resolve();
+                };
+                const timeout = setTimeout(resolve, 500);
+                c.once('exit', done);
+              }),
+          ),
+        );
+        fs.rmSync(markerPath, { force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+        fs.rmSync(lockDir, { recursive: true, force: true });
       }
     });
   }
@@ -1090,6 +1061,38 @@ describe.skipIf(process.platform === 'win32')(
           gitnexusMarkerPath: markerPath,
           lsofOutput: '99903\n',
           psOutput: 'node /repo/node_modules/gitnexus/dist/cli/index.js serve\n',
+        });
+        try {
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env: hookEnv(binDir) },
+          );
+          expect(result.stdout.trim()).toBe('');
+          expect(result.status).toBe(0);
+          expect(result.stderr).toContain('[GitNexus] augment skipped');
+          expect(fs.existsSync(markerPath)).toBe(false);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+
+      it(`${label}: skips augment for gitnexus eval-server child`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-eval-server-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          lsofOutput: '99904\n',
+          psOutput: 'node /repo/node_modules/gitnexus/dist/cli/index.js eval-server\n',
         });
         try {
           const result = runHook(
@@ -1741,8 +1744,18 @@ describe('PostToolUse with missing/corrupt meta.json', () => {
   ] as const) {
     it(`${label}: emits stale when meta.json does not exist`, () => {
       const metaPath = path.join(gitNexusDir, 'meta.json');
-      const hadMeta = fs.existsSync(metaPath);
-      if (hadMeta) fs.unlinkSync(metaPath);
+      let originalMeta: string | null = null;
+      try {
+        originalMeta = fs.readFileSync(metaPath, 'utf-8');
+      } catch {
+        originalMeta = null;
+      }
+
+      try {
+        fs.unlinkSync(metaPath);
+      } catch {
+        // Missing is the intended test state.
+      }
 
       try {
         const result = runHook(hookPath, {
@@ -1757,8 +1770,9 @@ describe('PostToolUse with missing/corrupt meta.json', () => {
         expect(output).not.toBeNull();
         expect(output!.additionalContext).toContain('never');
       } finally {
-        // Restore meta.json for subsequent tests
-        fs.writeFileSync(metaPath, JSON.stringify({ lastCommit: 'old', stats: {} }));
+        if (originalMeta !== null) {
+          fs.writeFileSync(metaPath, originalMeta);
+        }
       }
     });
 

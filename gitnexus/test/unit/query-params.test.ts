@@ -9,6 +9,15 @@ describe('isValidQueryParams', () => {
     expect(isValidQueryParams(Object.create(null))).toBe(true);
   });
 
+  it('accepts arrays of scalar bind values for IN filters', () => {
+    expect(
+      isValidQueryParams({ ids: ['Function:src/index.ts:main', 'Class:src/app.ts:App'] }),
+    ).toBe(true);
+    expect(isValidQueryParams({ limits: [1, 10], flags: [true, false], nullable: [null] })).toBe(
+      true,
+    );
+  });
+
   it('rejects null and arrays', () => {
     expect(isValidQueryParams(null)).toBe(false);
     expect(isValidQueryParams([])).toBe(false);
@@ -25,6 +34,7 @@ describe('isValidQueryParams', () => {
     expect(isValidQueryParams(new Date())).toBe(false);
     expect(isValidQueryParams(new Map())).toBe(false);
     expect(isValidQueryParams({ nested: { value: 1 } })).toBe(false);
-    expect(isValidQueryParams({ list: ['x'] })).toBe(false);
+    expect(isValidQueryParams({ list: [['x']] })).toBe(false);
+    expect(isValidQueryParams({ list: [{ value: 'x' }] })).toBe(false);
   });
 });

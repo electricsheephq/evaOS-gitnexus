@@ -139,4 +139,28 @@ describe('analyzeCommand --embeddings [limit] parsing', () => {
     expect(process.env.GITNEXUS_EMBEDDING_API_KEY).toBe(prior.apiKey);
     expect(process.env.GITNEXUS_EMBEDDING_DIMS).toBe(prior.dims);
   });
+
+  it('applies --embedding-dims before LadybugDB embedding schema is imported', async () => {
+    runFullAnalysisMock.mockImplementationOnce(async () => {
+      const { EMBEDDING_DIMS, EMBEDDING_SCHEMA } = await import('../../src/core/lbug/schema.js');
+      expect(EMBEDDING_DIMS).toBe(2048);
+      expect(EMBEDDING_SCHEMA).toContain('embedding FLOAT[2048]');
+      return {
+        repoName: 'repo',
+        repoPath: '/repo',
+        stats: {},
+        alreadyUpToDate: true,
+      };
+    });
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, {
+      embeddings: true,
+      embeddingBaseUrl: 'https://api.voyageai.com/v1',
+      embeddingModel: 'voyage-code-3',
+      embeddingDims: '2048',
+    });
+
+    expect(runFullAnalysisMock).toHaveBeenCalledTimes(1);
+  });
 });

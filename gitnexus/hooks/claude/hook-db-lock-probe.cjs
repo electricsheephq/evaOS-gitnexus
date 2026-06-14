@@ -18,7 +18,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 function isGitNexusServerCommand(command) {
-  const hasServerMode = /(?:^|\s)(mcp|serve)(?:\s|$)/.test(command);
+  const hasServerMode = /(?:^|\s)(mcp|serve|eval-server)(?:\s|$)/.test(command);
   const hasGitNexus =
     /(?:^|[/\\\s])gitnexus(?:\.cmd)?(?:\s|$)/.test(command) ||
     /node_modules[/\\]gitnexus[/\\]/.test(command);

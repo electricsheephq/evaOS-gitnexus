@@ -185,6 +185,37 @@ const FTS_UNAVAILABLE_MESSAGE =
   'installed once with network access (GITNEXUS_LBUG_EXTENSION_INSTALL=auto) or ' +
   'pre-installed for offline use. Run `gitnexus doctor` for details.';
 
+const isGitWorkingTreeDirtyForAnalyze = (repoPath: string): boolean => {
+  try {
+    const out = execFileSync(
+      'git',
+      [
+        'status',
+        '--porcelain',
+        '--',
+        '.',
+        ':(exclude).gitnexus',
+        ':(exclude).gitnexus/**',
+        ':(exclude).claude',
+        ':(exclude).claude/**',
+        ':(exclude).cursor',
+        ':(exclude).cursor/**',
+        ':(exclude)AGENTS.md',
+        ':(exclude)CLAUDE.md',
+      ],
+      {
+        cwd: repoPath,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+        encoding: 'utf8',
+      },
+    );
+    return out.trim().length > 0;
+  } catch {
+    return true;
+  }
+};
+
 // Re-export the pure flag-derivation helper so external callers (and tests)
 // keep importing from this module's stable surface.
 export { deriveEmbeddingMode, DEFAULT_EMBEDDING_NODE_LIMIT } from './embedding-mode.js';
@@ -255,6 +286,7 @@ export async function runFullAnalysis(
   const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
   const existingMeta = await loadMeta(storagePath);
+  const workingTreeDirty = repoHasGit ? isGitWorkingTreeDirtyForAnalyze(repoPath) : true;
 
   // ── FTS-only repair path ────────────────────────────────────────────
   if (options.repairFts) {
@@ -295,6 +327,15 @@ export async function runFullAnalysis(
     try {
       await initLbug(lbugPath);
       progress('fts', 85, 'Repairing search indexes...');
+      const ftsAvailable = await loadFTSExtension(undefined, {
+        policy: resolveAnalyzeInstallPolicy(),
+      });
+      if (!ftsAvailable) {
+        throw new Error(
+          'FTS extension unavailable - cannot repair search indexes. ' +
+            'Run `gitnexus doctor` and ensure the LadybugDB FTS extension is installed and loadable on this machine.',
+        );
+      }
       await createSearchFTSIndexes({
         onIndexStart: options.verbose
           ? (table, indexName) => log(`FTS: creating ${table}.${indexName}`)
@@ -359,37 +400,7 @@ export async function runFullAnalysis(
       // Counting them as dirty would perpetually defeat the up-to-date
       // fast path because the previous analyze just wrote them
       // (regression vs PR #1233 behavior).
-      const dirty = (() => {
-        try {
-          const out = execFileSync(
-            'git',
-            [
-              'status',
-              '--porcelain',
-              '--',
-              '.',
-              ':(exclude).gitnexus',
-              ':(exclude).gitnexus/**',
-              ':(exclude).claude',
-              ':(exclude).claude/**',
-              ':(exclude).cursor',
-              ':(exclude).cursor/**',
-              ':(exclude)AGENTS.md',
-              ':(exclude)CLAUDE.md',
-            ],
-            {
-              cwd: repoPath,
-              stdio: ['ignore', 'pipe', 'ignore'],
-              windowsHide: true,
-              encoding: 'utf8',
-            },
-          );
-          return out.trim().length > 0;
-        } catch {
-          return true; // conservative on git failure
-        }
-      })();
-      if (!dirty) {
+      if (!workingTreeDirty && !existingMeta.fileHashesDirty) {
         await ensureGitNexusIgnored(repoPath);
         return {
           // `resolveRepoIdentityRoot` collapses worktree roots to the
@@ -403,6 +414,11 @@ export async function runFullAnalysis(
           stats: existingMeta.stats ?? {},
           alreadyUpToDate: true,
         };
+      }
+      if (!workingTreeDirty && existingMeta.fileHashesDirty) {
+        log(
+          'Previous index captured dirty working-tree contents; revalidating file hashes before fast path.',
+        );
       }
     }
   }
@@ -424,6 +440,7 @@ export async function runFullAnalysis(
   // silently dropped just because the caller omitted `--embeddings`.
   let cachedEmbeddingNodeIds = new Set<string>();
   let cachedEmbeddings: CachedEmbedding[] = [];
+  let cachedEmbeddingRestoreNodeIds: Set<string> | undefined;
 
   const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
   const {
@@ -544,6 +561,34 @@ export async function runFullAnalysis(
   const hashDiff = isIncremental
     ? diffFileHashes(newFileHashes, existingMeta!.fileHashes)
     : undefined;
+
+  if (
+    isIncremental &&
+    hashDiff &&
+    hashDiff.changed.length === 0 &&
+    hashDiff.added.length === 0 &&
+    hashDiff.deleted.length === 0
+  ) {
+    const newFileHashesRecord: Record<string, string> = {};
+    for (const [k, v] of newFileHashes) newFileHashesRecord[k] = v;
+    await saveMeta(storagePath, {
+      ...existingMeta!,
+      indexedAt: new Date().toISOString(),
+      fileHashes: newFileHashesRecord,
+      fileHashesDirty: workingTreeDirty,
+      incrementalInProgress: undefined,
+    });
+    await ensureGitNexusIgnored(repoPath);
+    return {
+      repoName:
+        options.registryName ??
+        getInferredRepoName(repoPath) ??
+        path.basename(resolveRepoIdentityRoot(repoPath)),
+      repoPath,
+      stats: existingMeta!.stats ?? {},
+      alreadyUpToDate: true,
+    };
+  }
 
   if (isIncremental && hashDiff) {
     log(
@@ -698,10 +743,17 @@ export async function runFullAnalysis(
       // would otherwise call deleteNodesForFile twice for the same file
       // (Bugbot LOW finding on PR #1479).
       const filesToDelete = [...new Set([...effectiveWriteSet, ...hashDiff.deleted])];
+      const filesEligibleForEmbeddingRestore = new Set(effectiveWriteSet);
+      cachedEmbeddingRestoreNodeIds = new Set<string>();
       for (let i = 0; i < filesToDelete.length; i++) {
         const f = filesToDelete[i];
         try {
-          await deleteNodesForFile(f);
+          const result = await deleteNodesForFile(f);
+          if (filesEligibleForEmbeddingRestore.has(f)) {
+            for (const nodeId of result?.deletedNodeIds ?? []) {
+              cachedEmbeddingRestoreNodeIds.add(nodeId);
+            }
+          }
         } catch {
           /* file may not have rows (e.g. an unparseable file) — fine */
         }
@@ -773,17 +825,11 @@ export async function runFullAnalysis(
     // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
     // Runs on BOTH the full-rebuild path and the incremental path:
     //   - Full rebuild: DB was wiped, every cached row needs to come back.
-    //   - Incremental:  changed-file rows were just deleted by
-    //                   deleteNodesForFile (which cascades to their
-    //                   embedding rows) — so their cached vectors need
-    //                   to come back too. Unchanged-file rows still
-    //                   exist; re-inserting their cached vectors would
-    //                   PK-conflict, but the per-batch try/catch below
-    //                   silently ignores those (matches the existing
-    //                   "some may fail if node was removed, that's
-    //                   fine" semantics). Bugbot review on PR #1479
-    //                   flagged that gating this on `!isIncremental`
-    //                   silently lost changed-file embeddings.
+    //   - Incremental:  only rows for nodes deleted by the writable-set
+    //                   rewrite are restored. Unchanged-file embedding rows
+    //                   remain in place, so replaying the full cache would
+    //                   duplicate primary keys and can drop unrelated rows
+    //                   if the batch aborts on the first duplicate.
     if (cachedEmbeddings.length > 0) {
       const cachedDims = cachedEmbeddings[0].embedding.length;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
@@ -795,12 +841,17 @@ export async function runFullAnalysis(
         cachedEmbeddings = [];
         cachedEmbeddingNodeIds = new Set();
       } else {
-        progress('embeddings', 88, `Restoring ${cachedEmbeddings.length} cached embeddings...`);
+        const embeddingsToRestore = cachedEmbeddingRestoreNodeIds
+          ? cachedEmbeddings.filter((embedding) =>
+              cachedEmbeddingRestoreNodeIds!.has(embedding.nodeId),
+            )
+          : cachedEmbeddings;
+        progress('embeddings', 88, `Restoring ${embeddingsToRestore.length} cached embeddings...`);
         const { batchInsertEmbeddings: batchInsert } =
           await import('./embeddings/embedding-pipeline.js');
         const EMBED_BATCH = 200;
-        for (let i = 0; i < cachedEmbeddings.length; i += EMBED_BATCH) {
-          const batch = cachedEmbeddings.slice(i, i + EMBED_BATCH);
+        for (let i = 0; i < embeddingsToRestore.length; i += EMBED_BATCH) {
+          const batch = embeddingsToRestore.slice(i, i + EMBED_BATCH);
 
           try {
             await batchInsert(executeWithReusedStatement, batch);
@@ -984,6 +1035,7 @@ export async function runFullAnalysis(
       // dirty flag (full and incremental success paths converge here).
       schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
       fileHashes: hasGitDir(repoPath) ? newFileHashesRecord : undefined,
+      fileHashesDirty: hasGitDir(repoPath) ? workingTreeDirty : undefined,
       incrementalInProgress: undefined as { startedAt: number; toWriteCount: number } | undefined,
     };
     await saveMeta(storagePath, meta);

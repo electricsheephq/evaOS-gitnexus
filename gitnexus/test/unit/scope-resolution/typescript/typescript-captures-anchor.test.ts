@@ -80,9 +80,11 @@ describe('captures.ts ancestor-walk rewrite (U8 / B5)', () => {
     // — so no @declaration.parameter-count is attached. Pre-rewrite, the
     // range-based lookup also returned null. This pins both: the capture
     // exists AND arity is not synthesized.
-    const matches = emitTsScopeCaptures('function App() { return <Foo />; }', 'test.tsx');
+    const source = 'function App() { return <Foo />; }';
+    expect(countMatchesTsx(source, (t) => t.includes('@reference.call.free'))).toBe(1);
+
+    const matches = emitTsScopeCaptures(source, 'test.tsx');
     const jsxCalls = matches.filter((m) => '@reference.call.free' in m);
-    expect(jsxCalls.length).toBe(1);
     // No spurious arity synthesis on the JSX-anchored capture. If a
     // future refactor "helpfully" walks JSX → call_expression, this
     // assertion fails and the implementer revisits the design.

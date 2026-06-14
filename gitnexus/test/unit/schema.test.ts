@@ -101,6 +101,11 @@ describe('LadybugDB Schema', () => {
         expect(REL_TYPES).toContain(t);
       }
     });
+
+    it('includes Vue component event edge types', () => {
+      expect(REL_TYPES).toContain('BINDS_EVENT_HANDLER');
+      expect(REL_TYPES).toContain('EMITS_EVENT');
+    });
   });
 
   describe('node schema DDL', () => {
@@ -190,6 +195,11 @@ describe('LadybugDB Schema', () => {
 
     it('connects BasicBlock to BasicBlock (taint/PDG substrate edges, #2080)', () => {
       expect(RELATION_SCHEMA).toContain('FROM BasicBlock TO BasicBlock');
+    });
+
+    it('connects handler symbols to component files for Vue event edges', () => {
+      expect(RELATION_SCHEMA).toContain('FROM Function TO File');
+      expect(RELATION_SCHEMA).toContain('FROM Method TO File');
     });
 
     it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {

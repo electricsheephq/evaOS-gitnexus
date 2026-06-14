@@ -7,7 +7,7 @@
  * These are pure unit tests that mock the LadybugDB layer to test
  * the dispatch and error handling logic in isolation.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -392,6 +392,95 @@ describe('LocalBackend.callTool', () => {
     );
     expect(result.definitions.map((definition: any) => definition.name)).toEqual(['Beta', 'Alpha']);
     expect(result.timing).toHaveProperty('rerank');
+  });
+
+  it('applies Voyage rerank scores to process ranking, not only standalone definitions', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      ftsAvailable: true,
+      results: [
+        { filePath: 'src/alpha.ts', nodeIds: ['node-alpha'], score: 10 },
+        { filePath: 'src/beta.ts', nodeIds: ['node-beta'], score: 9 },
+      ],
+    });
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
+    rerankMocks.resolveRerankConfig.mockReturnValue({
+      baseUrl: 'https://api.voyageai.com/v1',
+      model: 'rerank-2.5',
+      apiKey: 'test-key',
+      candidates: 2,
+      maxDocChars: 3000,
+    });
+    rerankMocks.rerankDocuments.mockResolvedValueOnce([
+      { index: 1, relevance_score: 0.99 },
+      { index: 0, relevance_score: 0.25 },
+    ]);
+
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 0 }];
+      return [];
+    });
+    (executeParameterized as any).mockImplementation(
+      async (_repoId: string, cypher: string, params?: { nodeIds?: string[] }) => {
+        if (cypher.includes('RETURN n.id AS id')) {
+          return (params?.nodeIds ?? []).map((id) =>
+            id === 'node-alpha'
+              ? {
+                  id,
+                  name: 'Alpha',
+                  type: 'Function',
+                  filePath: 'src/alpha.ts',
+                  startLine: 1,
+                  endLine: 10,
+                }
+              : {
+                  id,
+                  name: 'Beta',
+                  type: 'Function',
+                  filePath: 'src/beta.ts',
+                  startLine: 20,
+                  endLine: 30,
+                },
+          );
+        }
+        if (cypher.includes('STEP_IN_PROCESS')) {
+          return (params?.nodeIds ?? []).map((id) =>
+            id === 'node-alpha'
+              ? {
+                  nodeId: id,
+                  pid: 'proc-alpha',
+                  label: 'Alpha process',
+                  heuristicLabel: 'Alpha process',
+                  processType: 'execution_flow',
+                  stepCount: 1,
+                  step: 1,
+                }
+              : {
+                  nodeId: id,
+                  pid: 'proc-beta',
+                  label: 'Beta process',
+                  heuristicLabel: 'Beta process',
+                  processType: 'execution_flow',
+                  stepCount: 1,
+                  step: 1,
+                },
+          );
+        }
+        if (cypher.includes('RETURN n.id AS nodeId, c.cohesion AS cohesion')) return [];
+        if (cypher.includes('RETURN n.id AS nodeId, n.content AS content')) {
+          return (params?.nodeIds ?? []).map((id) => ({
+            nodeId: id,
+            content: id === 'node-alpha' ? 'alpha implementation' : 'beta implementation',
+          }));
+        }
+        return [];
+      },
+    );
+
+    const result = await backend.callTool('query', { query: 'auth', limit: 2, max_symbols: 2 });
+
+    expect(result.processes.map((process: any) => process.id)).toEqual(['proc-beta', 'proc-alpha']);
+    expect(result.process_symbols.map((symbol: any) => symbol.name)).toEqual(['Beta', 'Alpha']);
   });
 
   it('includes FTS-unavailable warning when ftsAvailable is false (#1403)', async () => {

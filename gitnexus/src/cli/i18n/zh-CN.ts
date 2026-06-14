@@ -150,6 +150,10 @@ export const zhCN = {
   'help.option.analyze.skills':
     '根据检测到的社区生成仓库专属 skill 文件（同时设置 --index-only 时无效）。',
   'help.option.analyze.skipAgentsMd': '跳过更新 AGENTS.md 和 CLAUDE.md 中的 gitnexus 区块',
+  'help.option.analyze.skipAiContext':
+    '跳过所有 AI 上下文副作用：AGENTS.md、CLAUDE.md 和内置 GitNexus skill',
+  'help.option.analyze.defaultBranch':
+    '生成 regression-compare 示例（base_ref）时使用的默认分支。依次回退到 .gitnexusrc、自动检测的 origin/HEAD、再到 "main"。',
   'help.option.analyze.noStats': '从 AGENTS.md 和 CLAUDE.md 中省略易变的文件/符号计数',
   'help.option.analyze.skipSkills':
     '跳过安装 .claude/skills/gitnexus/ 下的标准 GitNexus skill 文件。不抑制 --skills 生成的社区 skill（位于 .claude/skills/generated/）。使用 --index-only 可跳过所有 AI 上下文文件注入。',
@@ -171,6 +175,10 @@ export const zhCN = {
   'help.option.analyze.embeddingBatchSize': '每个嵌入批次的节点数',
   'help.option.analyze.embeddingSubBatchSize': '每次嵌入模型调用的分块数',
   'help.option.analyze.embeddingDevice': '嵌入设备：auto、cpu、dml、cuda 或 wasm',
+  'help.option.analyze.embeddingBaseUrl': 'HTTP 嵌入 API base URL',
+  'help.option.analyze.embeddingModel': 'HTTP 嵌入模型名称',
+  'help.option.analyze.embeddingAuthToken': 'HTTP 嵌入 bearer token',
+  'help.option.analyze.embeddingDims': 'HTTP 嵌入输出维度',
   'help.option.index.force': '即使缺少 meta.json 也注册（统计为空）',
   'help.option.index.allowNonGit': '允许注册非 Git 仓库文件夹',
   'help.option.port': '端口号',
@@ -202,6 +210,7 @@ export const zhCN = {
   'help.option.query.goal': '你想查找的目标',
   'help.option.query.limit': '最多返回的流程数（默认：5）',
   'help.option.content': '包含完整符号源码',
+  'help.option.maxTokens': '将输出截断到约 N 个 token',
   'help.option.repo.target': '目标仓库',
   'help.option.context.uid': '直接符号 UID（零歧义查找）',
   'help.option.context.file': '用于消除常见名称歧义的文件路径',

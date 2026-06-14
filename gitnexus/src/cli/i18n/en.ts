@@ -158,6 +158,10 @@ export const en = {
     'Generate repo-specific skill files from detected communities (no-op when --index-only is also set).',
   'help.option.analyze.skipAgentsMd':
     'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md',
+  'help.option.analyze.skipAiContext':
+    'Skip all AI context side effects: AGENTS.md, CLAUDE.md, and bundled GitNexus skills',
+  'help.option.analyze.defaultBranch':
+    'Default branch used in the generated regression-compare example (base_ref). Falls back to .gitnexusrc, then auto-detected origin/HEAD, then "main".',
   'help.option.analyze.noStats': 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md',
   'help.option.analyze.skipSkills':
     'Skip installing standard GitNexus skill files under .claude/skills/gitnexus/. Does not suppress community skills from --skills (those use .claude/skills/generated/). Use --index-only to skip all AI-context file injection.',
@@ -182,6 +186,10 @@ export const en = {
   'help.option.analyze.embeddingBatchSize': 'Number of nodes per embedding batch',
   'help.option.analyze.embeddingSubBatchSize': 'Number of chunks per embedding model call',
   'help.option.analyze.embeddingDevice': 'Embedding device: auto, cpu, dml, cuda, or wasm',
+  'help.option.analyze.embeddingBaseUrl': 'HTTP embedding API base URL',
+  'help.option.analyze.embeddingModel': 'HTTP embedding model name',
+  'help.option.analyze.embeddingAuthToken': 'HTTP embedding bearer token',
+  'help.option.analyze.embeddingDims': 'HTTP embedding output dimensions',
   'help.option.index.force': 'Register even if meta.json is missing (stats will be empty)',
   'help.option.index.allowNonGit': 'Allow registering folders that are not Git repositories',
   'help.option.port': 'Port number',
@@ -216,6 +224,7 @@ export const en = {
   'help.option.query.goal': 'What you want to find',
   'help.option.query.limit': 'Max processes to return (default: 5)',
   'help.option.content': 'Include full symbol source code',
+  'help.option.maxTokens': 'Truncate output to N estimated tokens',
   'help.option.repo.target': 'Target repository',
   'help.option.context.uid': 'Direct symbol UID (zero-ambiguity lookup)',
   'help.option.context.file': 'File path to disambiguate common names',

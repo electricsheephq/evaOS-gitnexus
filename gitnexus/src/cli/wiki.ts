@@ -321,14 +321,13 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
 
       let baseUrl: string;
       let defaultModel: string;
-      let provider: LLMProvider = 'openai';
+      let provider: LLMProvider;
       let key = '';
 
       const selectedLocal = localChoices.find((item) => item.choice === choice);
       if (selectedLocal) {
         // Local CLI selected - model defaults to the CLI's configured default.
         provider = selectedLocal.provider;
-        baseUrl = '';
 
         const modelInput = await prompt('  Model (leave empty for CLI default): ');
         const model = modelInput || '';

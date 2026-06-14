@@ -45,6 +45,16 @@ describe('Voyage reranker config', () => {
     });
   });
 
+  it('matches the premium repo allowlist case-insensitively', async () => {
+    process.env.GITNEXUS_RERANK_ENABLED = '1';
+    process.env.GITNEXUS_RERANK_API_KEY = 'test-rerank-key';
+    process.env.GITNEXUS_PREMIUM_REPO_ALLOWLIST = ' Lossless-Claw, GitNexus ';
+
+    const { resolveRerankConfig } = await import('../../src/core/rerank/voyage-reranker.js');
+    expect(resolveRerankConfig('gitnexus')).not.toBeNull();
+    expect(resolveRerankConfig('LOSSLESS-CLAW')).not.toBeNull();
+  });
+
   it('requires a key only after rerank is enabled for an allowlisted repo', async () => {
     process.env.GITNEXUS_RERANK_ENABLED = '1';
     process.env.GITNEXUS_PREMIUM_REPO_ALLOWLIST = 'gitnexus';

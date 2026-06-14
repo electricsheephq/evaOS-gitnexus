@@ -309,6 +309,10 @@ export const knowledgeGraphToGraphology = (
     EXTENDS: { color: '#c2410c', sizeMultiplier: 1.0 }, // Orange - extension
     IMPLEMENTS: { color: '#be185d', sizeMultiplier: 0.9 }, // Pink - interface implementation
 
+    // FRAMEWORK EVENTS - Teal/Cyan (component event flow)
+    BINDS_EVENT_HANDLER: { color: EDGE_INFO.BINDS_EVENT_HANDLER.color, sizeMultiplier: 0.65 },
+    EMITS_EVENT: { color: EDGE_INFO.EMITS_EVENT.color, sizeMultiplier: 0.65 },
+
     // KOTLIN/JAVA HIERARCHY — same hues as their logical equivalents so force
     // mode renders these consistently with tree/circles view.
     HAS_METHOD: { color: EDGE_INFO.DEFINES.color, sizeMultiplier: 0.4 }, // Class→Method (≈ DEFINES)
@@ -394,6 +398,8 @@ export const knowledgeGraphToTreeGraphology = (
     CALLS: { color: EDGE_INFO.CALLS.color, sizeMultiplier: 0.8 },
     EXTENDS: { color: EDGE_INFO.EXTENDS.color, sizeMultiplier: 1.0 },
     IMPLEMENTS: { color: EDGE_INFO.IMPLEMENTS.color, sizeMultiplier: 0.9 },
+    BINDS_EVENT_HANDLER: { color: EDGE_INFO.BINDS_EVENT_HANDLER.color, sizeMultiplier: 0.65 },
+    EMITS_EVENT: { color: EDGE_INFO.EMITS_EVENT.color, sizeMultiplier: 0.65 },
   };
 
   // Two-pass insertion: hierarchy edges first (rendered behind), cross-edges on top.
@@ -476,6 +482,8 @@ export const knowledgeGraphToCirclesGraphology = (
     CALLS: { color: EDGE_INFO.CALLS.color, sizeMultiplier: 0.8 },
     EXTENDS: { color: EDGE_INFO.EXTENDS.color, sizeMultiplier: 1.0 },
     IMPLEMENTS: { color: EDGE_INFO.IMPLEMENTS.color, sizeMultiplier: 0.9 },
+    BINDS_EVENT_HANDLER: { color: EDGE_INFO.BINDS_EVENT_HANDLER.color, sizeMultiplier: 0.65 },
+    EMITS_EVENT: { color: EDGE_INFO.EMITS_EVENT.color, sizeMultiplier: 0.65 },
   };
 
   // Two-pass insertion: hierarchy edges first (rendered behind), cross-edges on top.

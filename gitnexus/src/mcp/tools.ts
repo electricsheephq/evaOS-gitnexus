@@ -7,25 +7,26 @@
 
 import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 
+interface ToolInputSchemaProperty {
+  type?: string | string[];
+  description?: string;
+  default?: unknown;
+  items?: ToolInputSchemaProperty;
+  enum?: string[];
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  anyOf?: ToolInputSchemaProperty[];
+  additionalProperties?: ToolInputSchemaProperty | boolean;
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
   annotations: ToolAnnotations;
   inputSchema: {
     type: 'object';
-    properties: Record<
-      string,
-      {
-        type: string;
-        description?: string;
-        default?: unknown;
-        items?: { type: string };
-        enum?: string[];
-        minimum?: number;
-        maximum?: number;
-        minLength?: number;
-      }
-    >;
+    properties: Record<string, ToolInputSchemaProperty>;
     required: string[];
   };
 }
@@ -144,6 +145,11 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
           minimum: 1,
           maximum: 200,
         },
+        maxTokens: {
+          type: 'integer',
+          description: 'Truncate output to N estimated tokens',
+          minimum: 1,
+        },
         include_content: {
           type: 'boolean',
           description: 'Include full symbol source code (default: false)',
@@ -218,7 +224,26 @@ TIPS:
         params: {
           type: 'object',
           description:
-            'Optional query parameters for placeholders (e.g. $name) to execute via prepared statement binding.',
+            'Optional query parameters for placeholders (e.g. $name, $ids) to execute via prepared statement binding. Values may be scalar bind values or arrays of scalar bind values for IN filters.',
+          additionalProperties: {
+            anyOf: [
+              { type: 'string' },
+              { type: 'number' },
+              { type: 'boolean' },
+              { type: 'null' },
+              {
+                type: 'array',
+                items: {
+                  anyOf: [
+                    { type: 'string' },
+                    { type: 'number' },
+                    { type: 'boolean' },
+                    { type: 'null' },
+                  ],
+                },
+              },
+            ],
+          },
         },
         repo: {
           type: 'string',
@@ -262,6 +287,11 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           type: 'boolean',
           description: 'Include full symbol source code (default: false)',
           default: false,
+        },
+        maxTokens: {
+          type: 'integer',
+          description: 'Truncate output to N estimated tokens',
+          minimum: 1,
         },
         repo: {
           type: 'string',
@@ -472,6 +502,11 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           description:
             'When true, returns target, summary, risk, byDepthCounts, affected_processes, and affected_modules — omits byDepth. Single-repo only; ignored in group mode (@groupName). Use for hub symbols to get actionable signal without output explosion.',
           default: false,
+        },
+        maxTokens: {
+          type: 'integer',
+          description: 'Truncate output to N estimated tokens',
+          minimum: 1,
         },
         timeoutMs: {
           type: 'number',

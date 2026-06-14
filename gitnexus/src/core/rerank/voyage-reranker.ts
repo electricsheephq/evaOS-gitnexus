@@ -22,13 +22,15 @@ export interface RerankResult {
   relevance_score: number;
 }
 
+function normalizePremiumRepoName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
 export function premiumRepoAllowed(repoName: string): boolean {
   const raw = process.env.GITNEXUS_PREMIUM_REPO_ALLOWLIST ?? '';
-  const names = raw
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  return names.includes(repoName);
+  const normalizedRepoName = normalizePremiumRepoName(repoName);
+  const names = raw.split(',').map(normalizePremiumRepoName).filter(Boolean);
+  return names.includes(normalizedRepoName);
 }
 
 function positiveIntegerEnv(name: string, fallback: number): number {

@@ -369,7 +369,10 @@ interface ImpactParams {
   summaryOnly?: boolean;
 }
 
-type MergedQueryCandidate = [string, { score: number; data: any }];
+type MergedQueryCandidate = [
+  string,
+  { score: number; data: any; originalScore?: number; rerankScore?: number; rerankRank?: number },
+];
 
 /**
  * One repository entry as returned by {@link LocalBackend.listRepos} and in each
@@ -1637,12 +1640,29 @@ export class LocalBackend {
 
     const used = new Set<number>();
     const reordered: MergedQueryCandidate[] = [];
-    for (const item of ranked) {
+    for (let rank = 0; rank < ranked.length; rank++) {
+      const item = ranked[rank]!;
       if (used.has(item.index)) continue;
       const candidate = candidates[item.index];
       if (!candidate) continue;
       used.add(item.index);
-      reordered.push(candidate);
+      const relevanceScore =
+        Number.isFinite(item.relevance_score) && item.relevance_score > 0
+          ? item.relevance_score
+          : 0;
+      reordered.push([
+        candidate[0],
+        {
+          ...candidate[1],
+          originalScore: candidate[1].originalScore ?? candidate[1].score,
+          rerankScore: relevanceScore,
+          rerankRank: rank,
+          // Keep reranked candidates in a score band above BM25/vector RRF
+          // scores so downstream process aggregation honors the same order
+          // agents see in standalone definition results.
+          score: 1 + relevanceScore + (candidateCount - rank) / (candidateCount * 1000),
+        },
+      ]);
     }
     for (let i = 0; i < candidates.length; i++) {
       if (!used.has(i)) reordered.push(candidates[i]!);
@@ -1898,7 +1918,8 @@ export class LocalBackend {
     }
     if (request.params !== undefined && !isValidQueryParams(request.params)) {
       return {
-        error: '"params" must be a plain object with scalar values (string/number/boolean/null).',
+        error:
+          '"params" must be a plain object with scalar or scalar-array values (string/number/boolean/null).',
       };
     }
 

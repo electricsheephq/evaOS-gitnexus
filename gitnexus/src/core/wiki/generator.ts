@@ -276,14 +276,14 @@ export class WikiGenerator {
     // Force mode: delete snapshot to force full re-grouping
     if (forceMode) {
       try {
-        await fs.unlink(path.join(this.wikiDir, 'first_module_tree.json'));
+        await fs.unlink(this.wikiFilePath('first_module_tree.json'));
       } catch {}
       // Delete existing module pages so they get regenerated
       const existingFiles = await fs.readdir(this.wikiDir).catch(() => [] as string[]);
       for (const f of existingFiles) {
         if (f.endsWith('.md')) {
           try {
-            await fs.unlink(path.join(this.wikiDir, f));
+            await fs.unlink(this.wikiFilePath(f));
           } catch {}
         }
       }
@@ -392,7 +392,7 @@ export class WikiGenerator {
 
     // Process all leaf modules in parallel
     pagesGenerated += await this.runParallel(leaves, async (node) => {
-      const pagePath = path.join(this.wikiDir, `${node.slug}.md`);
+      const pagePath = this.wikiPagePath(node.slug);
       if (await this.fileExists(pagePath)) {
         reportProgress(node.name);
         return 0;
@@ -410,7 +410,7 @@ export class WikiGenerator {
 
     // Process parent modules sequentially (they depend on child docs)
     for (const node of parents) {
-      const pagePath = path.join(this.wikiDir, `${node.slug}.md`);
+      const pagePath = this.wikiPagePath(node.slug);
       if (await this.fileExists(pagePath)) {
         reportProgress(node.name);
         continue;
@@ -451,7 +451,7 @@ export class WikiGenerator {
 
   private async buildModuleTree(files: FileWithExports[]): Promise<ModuleTreeNode[]> {
     // First, check for user-edited module_tree.json (from --review workflow)
-    const editablePath = path.join(this.wikiDir, 'module_tree.json');
+    const editablePath = this.wikiFilePath('module_tree.json');
     try {
       const edited = await fs.readFile(editablePath, 'utf-8');
       const parsed = JSON.parse(edited);
@@ -464,7 +464,7 @@ export class WikiGenerator {
     }
 
     // Check for existing immutable snapshot (resumability)
-    const snapshotPath = path.join(this.wikiDir, 'first_module_tree.json');
+    const snapshotPath = this.wikiFilePath('first_module_tree.json');
     try {
       const existing = await fs.readFile(snapshotPath, 'utf-8');
       const parsed = JSON.parse(existing);
@@ -874,7 +874,17 @@ export class WikiGenerator {
 
     // H1 uses the English module name (stable slug source); body is LLM-translated.
     const pageContent = sanitizeMermaidMarkdown(`# ${node.name}\n\n${response.content}`);
-    await fs.writeFile(path.join(this.wikiDir, `${node.slug}.md`), pageContent, 'utf-8');
+    const pagePath = this.wikiPagePath(node.slug);
+    const wikiRoot = path.resolve(this.wikiDir);
+    const rel = path.relative(wikiRoot, pagePath);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`Unsafe wiki path: ${node.slug}`);
+    }
+    // Wiki generation intentionally persists sanitized LLM markdown to the
+    // local wiki directory after the inline containment check above.
+
+    // codeql[js/http-to-file-access]
+    await fs.writeFile(pagePath, pageContent, 'utf-8');
   }
 
   /**
@@ -886,7 +896,7 @@ export class WikiGenerator {
     // Read children's overview sections
     const childDocs: string[] = [];
     for (const child of node.children) {
-      const childPage = path.join(this.wikiDir, `${child.slug}.md`);
+      const childPage = this.wikiPagePath(child.slug);
       try {
         const content = await fs.readFile(childPage, 'utf-8');
         // Extract overview section (first ~500 chars or up to "### Architecture")
@@ -918,7 +928,17 @@ export class WikiGenerator {
     );
 
     const pageContent = sanitizeMermaidMarkdown(`# ${node.name}\n\n${response.content}`);
-    await fs.writeFile(path.join(this.wikiDir, `${node.slug}.md`), pageContent, 'utf-8');
+    const pagePath = this.wikiPagePath(node.slug);
+    const wikiRoot = path.resolve(this.wikiDir);
+    const rel = path.relative(wikiRoot, pagePath);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`Unsafe wiki path: ${node.slug}`);
+    }
+    // Wiki generation intentionally persists sanitized LLM markdown to the
+    // local wiki directory after the inline containment check above.
+
+    // codeql[js/http-to-file-access]
+    await fs.writeFile(pagePath, pageContent, 'utf-8');
   }
 
   // ─── Phase 3: Generate Overview ─────────────────────────────────────
@@ -927,7 +947,7 @@ export class WikiGenerator {
     // Read module overview sections
     const moduleSummaries: string[] = [];
     for (const node of moduleTree) {
-      const pagePath = path.join(this.wikiDir, `${node.slug}.md`);
+      const pagePath = this.wikiPagePath(node.slug);
       try {
         const content = await fs.readFile(pagePath, 'utf-8');
         const overviewEnd = content.indexOf('### Architecture');
@@ -970,7 +990,17 @@ export class WikiGenerator {
     const pageContent = sanitizeMermaidMarkdown(
       `# ${path.basename(this.repoPath)} — Wiki\n\n${response.content}`,
     );
-    await fs.writeFile(path.join(this.wikiDir, 'overview.md'), pageContent, 'utf-8');
+    const overviewPath = this.wikiFilePath('overview.md');
+    const wikiRoot = path.resolve(this.wikiDir);
+    const rel = path.relative(wikiRoot, overviewPath);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error('Unsafe wiki path: overview.md');
+    }
+    // Wiki generation intentionally persists sanitized LLM markdown to the
+    // local wiki directory after the inline containment check above.
+
+    // codeql[js/http-to-file-access]
+    await fs.writeFile(overviewPath, pageContent, 'utf-8');
   }
 
   // ─── Incremental Updates ────────────────────────────────────────────
@@ -1032,7 +1062,7 @@ export class WikiGenerator {
       );
       // Delete old snapshot to force re-grouping
       try {
-        await fs.unlink(path.join(this.wikiDir, 'first_module_tree.json'));
+        await fs.unlink(this.wikiFilePath('first_module_tree.json'));
       } catch {}
       const fullResult = await this.fullGeneration(currentCommit);
       return { ...fullResult, mode: 'incremental' };
@@ -1060,7 +1090,7 @@ export class WikiGenerator {
       const node = this.findNodeBySlug(moduleTree, modSlug);
       if (node) {
         try {
-          await fs.unlink(path.join(this.wikiDir, `${node.slug}.md`));
+          await fs.unlink(this.wikiPagePath(node.slug));
         } catch {}
         affectedNodes.push(node);
       }
@@ -1368,6 +1398,29 @@ export class WikiGenerator {
       .slice(0, 60);
   }
 
+  private wikiPagePath(slug: string): string {
+    const safeSlug = this.slugify(slug);
+    if (!safeSlug) {
+      throw new Error('Cannot write wiki page for empty module slug');
+    }
+    return this.wikiFilePath(`${safeSlug}.md`);
+  }
+
+  private wikiFilePath(fileName: string): string {
+    if (fileName.includes('/') || fileName.includes('\\')) {
+      throw new Error(`Unsafe wiki file name: ${fileName}`);
+    }
+    const wikiRoot = path.resolve(this.wikiDir);
+    const targetPath = path.resolve(wikiRoot, fileName);
+    // Inline containment barrier: CodeQL's path-injection sanitizer recognizes
+    // the path.relative idiom, while cross-method callers still get one guard.
+    const rel = path.relative(wikiRoot, targetPath);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`Unsafe wiki path: ${fileName}`);
+    }
+    return targetPath;
+  }
+
   private async fileExists(fp: string): Promise<boolean> {
     try {
       await fs.access(fp);
@@ -1379,7 +1432,7 @@ export class WikiGenerator {
 
   private async loadWikiMeta(): Promise<WikiMeta | null> {
     try {
-      const raw = await fs.readFile(path.join(this.wikiDir, 'meta.json'), 'utf-8');
+      const raw = await fs.readFile(this.wikiFilePath('meta.json'), 'utf-8');
       return JSON.parse(raw) as WikiMeta;
     } catch {
       return null;
@@ -1387,16 +1440,12 @@ export class WikiGenerator {
   }
 
   private async saveWikiMeta(meta: WikiMeta): Promise<void> {
-    await fs.writeFile(
-      path.join(this.wikiDir, 'meta.json'),
-      JSON.stringify(meta, null, 2),
-      'utf-8',
-    );
+    await fs.writeFile(this.wikiFilePath('meta.json'), JSON.stringify(meta, null, 2), 'utf-8');
   }
 
   private async saveModuleTree(tree: ModuleTreeNode[]): Promise<void> {
     await fs.writeFile(
-      path.join(this.wikiDir, 'module_tree.json'),
+      this.wikiFilePath('module_tree.json'),
       JSON.stringify(tree, null, 2),
       'utf-8',
     );

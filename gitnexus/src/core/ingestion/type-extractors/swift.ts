@@ -213,7 +213,7 @@ function extractIfGuardBinding(
       varName = child.text;
       continue;
     }
-    if (varName && !valueNode) {
+    if (varName) {
       // Skip type annotations and binding operators
       if (child.type === 'type_annotation') continue;
       valueNode = child;
@@ -398,7 +398,7 @@ const extractForLoopBinding: ForLoopExtractor = (
       }
     }
     // After we found the loop var, the next expression-like node is the iterable
-    if (loopVarName && !iterableNode) {
+    if (loopVarName) {
       if (
         child.type === 'simple_identifier' ||
         child.type === 'call_expression' ||

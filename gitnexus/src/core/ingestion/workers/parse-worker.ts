@@ -1943,7 +1943,6 @@ const processFileGroup = (
             language,
           });
           if (info) {
-            enrichedByMethodExtractor = true;
             arityForId = arityForIdFromInfo(info);
             methodProps = buildMethodProps(info);
           }

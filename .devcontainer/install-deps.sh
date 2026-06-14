@@ -34,6 +34,7 @@ for d in /workspace/node_modules \
          /workspace/gitnexus-web/node_modules \
          /workspace/gitnexus-shared/node_modules \
          /home/node/.npm; do
+    [ -e "$d" ] || continue
     sudo find "$d" -xdev -exec chown -h node:node {} +
 done
 

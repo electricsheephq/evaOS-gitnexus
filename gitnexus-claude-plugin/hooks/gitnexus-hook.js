@@ -344,7 +344,7 @@ function handlePostToolUse(input) {
   }
 
   // If HEAD matches last indexed commit, no reindex needed
-  if (currentHead && currentHead === lastCommit) return;
+  if (currentHead === lastCommit) return;
 
   const analyzeCmd = formatAnalyzeCommand({ embeddings: hadEmbeddings });
   sendHookResponse(

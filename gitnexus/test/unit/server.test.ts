@@ -12,7 +12,7 @@
  * NOTE: We test the server handler logic by calling the request handlers
  * directly through the MCP Server's handler dispatch.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -23,6 +23,10 @@ import {
   SHUTDOWN_EXIT_CODES,
 } from '../../src/mcp/server.js';
 import { GITNEXUS_TOOLS } from '../../src/mcp/tools.js';
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 // ─── Mock backend ──────────────────────────────────────────────────
 
@@ -83,6 +87,112 @@ describe('createMCPServer', () => {
       await server.close();
     }
   });
+
+  it('tools/list exposes maxTokens schemas on bounded read tools', async () => {
+    const backend = createMockBackend();
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const response = await client.listTools();
+      for (const name of ['query', 'context', 'impact']) {
+        const tool = response.tools.find((candidate) => candidate.name === name)!;
+        const maxTokens = (tool.inputSchema as any).properties.maxTokens;
+        expect(maxTokens).toEqual({
+          type: 'integer',
+          description: 'Truncate output to N estimated tokens',
+          minimum: 1,
+        });
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('scrubs rejected group routes from the read-only MCP tool surface', async () => {
+    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
+    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'test');
+    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', 'test');
+    const backend = createMockBackend();
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const response = await client.listTools();
+      for (const name of ['query', 'context', 'impact']) {
+        const tool = response.tools.find((candidate) => candidate.name === name)!;
+        expect(tool.description).not.toContain('GROUP MODE');
+        expect(tool.description).not.toContain('@<groupName>');
+        expect(tool.description).toContain('Group mode is unavailable in read-only MCP mode.');
+        const properties = (tool.inputSchema as any).properties;
+        expect(properties.repo.description).toContain('unavailable in read-only MCP mode');
+        expect(properties.repo.description).not.toContain('@<groupName>');
+        expect(properties.maxTokens).toEqual({
+          type: 'integer',
+          description: 'Truncate output to N estimated tokens',
+          minimum: 1,
+        });
+        expect(properties.service).toBeUndefined();
+        expect(properties.subgroup).toBeUndefined();
+        expect(properties.crossDepth).toBeUndefined();
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('filters group resource templates from read-only MCP listings', async () => {
+    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
+    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'test');
+    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', 'test');
+    const backend = createMockBackend();
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const response = await client.listResourceTemplates();
+      expect(response.resourceTemplates.map((template) => template.uriTemplate)).not.toContain(
+        'gitnexus://group/{name}/contracts',
+      );
+      expect(response.resourceTemplates.map((template) => template.uriTemplate)).not.toContain(
+        'gitnexus://group/{name}/status',
+      );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('rejects a read-only default repo outside the configured allowlist', () => {
+    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
+    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'gitnexus');
+    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', 'stale-openclaw');
+    const backend = createMockBackend();
+
+    expect(() => createMCPServer(backend)).toThrow(
+      'GitNexus MCP default repo "stale-openclaw" is not in the read-only allow-list.',
+    );
+  });
+
+  it('allows an absolute default repo path through the read-only startup guard', () => {
+    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
+    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'gitnexus');
+    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', '/Volumes/LEXAR/repos/GitNexus');
+    const backend = createMockBackend();
+
+    expect(() => createMCPServer(backend)).not.toThrow();
+  });
 });
 
 // ─── getNextStepHint (tested indirectly via server tool handler) ──────
@@ -97,6 +207,7 @@ describe('getNextStepHint (via tool call response)', () => {
       callTool: vi.fn().mockResolvedValue({ processes: [], definitions: [] }),
     });
     const server = createMCPServer(backend);
+    expect(server).toBeTruthy();
 
     // We can't easily call handlers directly on the MCP Server,
     // so we verify the handler was registered by creating the server without error.

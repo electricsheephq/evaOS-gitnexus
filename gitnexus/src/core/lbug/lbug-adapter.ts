@@ -1685,7 +1685,7 @@ export const isLbugReady = (): boolean => conn !== null && db !== null;
 export const deleteNodesForFile = async (
   filePath: string,
   dbPath?: string,
-): Promise<{ deletedNodes: number }> => {
+): Promise<{ deletedNodes: number; deletedNodeIds: string[] }> => {
   const usePerQuery = !!dbPath;
 
   // Set up connection (either use existing or create per-query)
@@ -1703,6 +1703,7 @@ export const deleteNodesForFile = async (
 
   try {
     let deletedNodes = 0;
+    const deletedNodeIds: string[] = [];
     const escapedPath = filePath.replace(/'/g, "''");
 
     // Delete nodes from each table that has filePath
@@ -1714,13 +1715,15 @@ export const deleteNodesForFile = async (
       try {
         // First count how many we'll delete
         const tn = escapeTableName(tableName);
-        const countResult = await targetConn!.query(
-          `MATCH (n:${tn}) WHERE n.filePath = '${escapedPath}' RETURN count(n) AS cnt`,
+        const idResult = await targetConn!.query(
+          `MATCH (n:${tn}) WHERE n.filePath = '${escapedPath}' RETURN n.id AS id`,
         );
-        const rows = await readQueryRows(countResult);
-        const count = Number(rows[0]?.cnt ?? rows[0]?.[0] ?? 0);
+        const rows = await readQueryRows(idResult);
+        const ids = rows.map((row) => String(row.id ?? row[0] ?? '')).filter((id) => id.length > 0);
+        const count = ids.length;
 
         if (count > 0) {
+          deletedNodeIds.push(...ids);
           // Delete nodes (and implicitly their relationships via DETACH)
           await queryAndDrain(
             targetConn!,
@@ -1733,17 +1736,27 @@ export const deleteNodesForFile = async (
       }
     }
 
-    // Also delete any embeddings for nodes in this file
+    // Also delete embeddings for the exact node ids removed above. Node ids
+    // are label-prefixed and do not consistently start with filePath, so a
+    // file-path prefix match leaves stale vectors behind.
     try {
-      await queryAndDrain(
-        targetConn!,
-        `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.nodeId STARTS WITH '${escapedPath}' DELETE e`,
-      );
+      const BATCH = 100;
+      for (let i = 0; i < deletedNodeIds.length; i += BATCH) {
+        const ids = deletedNodeIds
+          .slice(i, i + BATCH)
+          .map((id) => `'${id.replace(/'/g, "''")}'`)
+          .join(', ');
+        if (!ids) continue;
+        await queryAndDrain(
+          targetConn!,
+          `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.nodeId IN [${ids}] DELETE e`,
+        );
+      }
     } catch {
-      // Embedding table may not exist or nodeId format may differ
+      // Embedding table may not exist
     }
 
-    return { deletedNodes };
+    return { deletedNodes, deletedNodeIds };
   } finally {
     // Close per-query connection if used
     if (tempHandle) await closeLbugConnection(tempHandle);

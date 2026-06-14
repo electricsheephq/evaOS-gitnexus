@@ -87,6 +87,13 @@ export interface RepoMeta {
    */
   fileHashes?: Record<string, string>;
   /**
+   * True when `fileHashes` were captured from uncommitted working-tree
+   * contents. If that dirty content is later reverted without a commit, HEAD
+   * still matches `lastCommit`; analyze must hash-diff once instead of taking
+   * the clean fast path.
+   */
+  fileHashesDirty?: boolean;
+  /**
    * Crash-recovery dirty flag. Written to meta.json BEFORE any
    * destructive DB mutation in an incremental run; cleared on success
    * by overwriting meta.json. If a run crashes between, the next run

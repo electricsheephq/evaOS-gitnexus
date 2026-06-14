@@ -28,7 +28,7 @@ import { installGlobalStdoutSentinel } from './stdio-context.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 import { parseMaxTokens, truncateToTokenBudget } from '../cli/token-budget.js';
-import { defaultRepo, mcpReadOnlyMode, repoAllowed } from './config.js';
+import { defaultRepo, mcpReadOnlyMode, repoAllowed, validateMcpConfig } from './config.js';
 
 const MCP_READ_ONLY_TOOLS = new Set([
   'list_repos',
@@ -72,6 +72,10 @@ function normalizeArgsForMcp(toolName: string, args: any): any {
   return normalized;
 }
 
+function readOnlyResourceTemplateAllowed(uriTemplate: string): boolean {
+  return !mcpReadOnlyMode() || !uriTemplate.startsWith('gitnexus://group/');
+}
+
 function assertMcpReadOnlyResource(uri: string): void {
   if (!mcpReadOnlyMode()) return;
   const match = /^gitnexus:\/\/repo\/([^/]+)/u.exec(uri);
@@ -85,6 +89,27 @@ function assertMcpReadOnlyResource(uri: string): void {
   }
 }
 
+function scrubReadOnlyDescription(description: string): string {
+  return description
+    .replace(/\nGROUP MODE:[\s\S]*?(?=\n\n[A-Z][A-Z ]*:|$)/gu, '')
+    .replace(/\nSERVICE:[\s\S]*?(?=\n\n[A-Z][A-Z ]*:|$)/gu, '');
+}
+
+function scrubReadOnlyInputSchema<T>(inputSchema: T): T {
+  if (!inputSchema || typeof inputSchema !== 'object') return inputSchema;
+  const cloned = JSON.parse(JSON.stringify(inputSchema)) as any;
+  const properties = cloned.properties;
+  if (!properties || typeof properties !== 'object') return cloned;
+  if (properties.repo && typeof properties.repo.description === 'string') {
+    properties.repo.description =
+      'Indexed repository name or path. Group-mode repo values beginning with @ are unavailable in read-only MCP mode.';
+  }
+  delete properties.service;
+  delete properties.subgroup;
+  delete properties.crossDepth;
+  return cloned;
+}
+
 function toolForMcp(tool: (typeof GITNEXUS_TOOLS)[number]): (typeof GITNEXUS_TOOLS)[number] {
   if (!mcpReadOnlyMode()) return tool;
   if (!['query', 'context', 'impact', 'detect_changes', 'cypher'].includes(tool.name)) return tool;
@@ -93,7 +118,8 @@ function toolForMcp(tool: (typeof GITNEXUS_TOOLS)[number]): (typeof GITNEXUS_TOO
     : 'This read-only MCP requires an explicit repo parameter when more than one repo is allowed.';
   return {
     ...tool,
-    description: `${tool.description}\n\nGITNEXUS MCP: ${repoText} Use maxTokens on query/context/impact for bounded retrieval slices.`,
+    description: `${scrubReadOnlyDescription(tool.description)}\n\nGITNEXUS MCP: ${repoText} Group mode is unavailable in read-only MCP mode. Use maxTokens on query/context/impact for bounded retrieval slices.`,
+    inputSchema: scrubReadOnlyInputSchema(tool.inputSchema),
   };
 }
 
@@ -158,6 +184,7 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
  * Transport-agnostic — caller connects the desired transport.
  */
 export function createMCPServer(backend: LocalBackend): Server {
+  validateMcpConfig();
   const require = createRequire(import.meta.url);
   const pkgVersion: string = require('../../package.json').version;
   const server = new Server(
@@ -189,7 +216,9 @@ export function createMCPServer(backend: LocalBackend): Server {
 
   // Handle list resource templates request (for dynamic resources)
   server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-    const templates = getResourceTemplates();
+    const templates = getResourceTemplates().filter((template) =>
+      readOnlyResourceTemplateAllowed(template.uriTemplate),
+    );
     return {
       resourceTemplates: templates.map((t) => ({
         uriTemplate: t.uriTemplate,

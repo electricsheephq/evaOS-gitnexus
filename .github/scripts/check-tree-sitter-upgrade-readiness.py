@@ -266,6 +266,15 @@ def is_vendored_pin(spec: str | None) -> bool:
     return bool(spec) and spec.startswith(("file:", "git", "http"))
 
 
+def vendored_parser_path(name: str, parser_path: str) -> pathlib.Path:
+    """Return the local parser.c path for a vendored grammar without network access."""
+    vendor_dir = GITNEXUS_DIR / "vendor" / name
+    vendored_parser = vendor_dir / parser_path
+    if not vendored_parser.is_file():
+        vendored_parser = vendor_dir / "src" / "parser.c"
+    return vendored_parser
+
+
 def vendored_drift_summary(
     name: str, upstream_repo: str, upstream_branch: str, parser_path: str
 ) -> dict:
@@ -287,9 +296,7 @@ def vendored_drift_summary(
         except json.JSONDecodeError:
             pass
 
-    vendored_parser = vendor_dir / parser_path
-    if not vendored_parser.is_file():
-        vendored_parser = vendor_dir / "src" / "parser.c"
+    vendored_parser = vendored_parser_path(name, parser_path)
     vendored_abi = extract_language_version(vendored_parser)
 
     upstream_url = (
@@ -348,7 +355,7 @@ def assert_current() -> int:
 
     Coverage, reusing the existing helpers:
       - npm-installed grammars: ABI from node_modules/<name>/<parser.c>.
-      - vendored grammars (dart/proto/swift): ABI via ``vendored_drift_summary``.
+      - vendored grammars (dart/proto/swift): ABI from checked-in vendor files.
       - Swift is prebuilt-only (no parser.c) → not introspectable here;
         treated as "covered by the runtime load-smoke", not asserted.
       - INTENTIONAL_PINS are honored: a pinned grammar is expected to sit at
@@ -383,8 +390,7 @@ def assert_current() -> int:
         pin_note = f" [intentional pin: {pinned_spec}]" if name in INTENTIONAL_PINS else ""
 
         if is_vendored_pin(pinned_spec):
-            v = vendored_drift_summary(name, upstream_repo, upstream_branch, parser_path)
-            abi = v["vendored_abi"]
+            abi = extract_language_version(vendored_parser_path(name, parser_path))
             if abi is None:
                 # Prebuilt-only vendor (e.g. tree-sitter-swift): no parser.c to
                 # introspect. The runtime load-smoke covers it instead.

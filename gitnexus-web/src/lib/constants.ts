@@ -140,7 +140,15 @@ export const FILTERABLE_LABELS: NodeLabel[] = [
 ];
 
 // Edge/Relation types
-export type EdgeType = 'CONTAINS' | 'DEFINES' | 'IMPORTS' | 'CALLS' | 'EXTENDS' | 'IMPLEMENTS';
+export type EdgeType =
+  | 'CONTAINS'
+  | 'DEFINES'
+  | 'IMPORTS'
+  | 'CALLS'
+  | 'EXTENDS'
+  | 'IMPLEMENTS'
+  | 'BINDS_EVENT_HANDLER'
+  | 'EMITS_EVENT';
 
 export const ALL_EDGE_TYPES: EdgeType[] = [
   'CONTAINS',
@@ -149,6 +157,8 @@ export const ALL_EDGE_TYPES: EdgeType[] = [
   'CALLS',
   'EXTENDS',
   'IMPLEMENTS',
+  'BINDS_EVENT_HANDLER',
+  'EMITS_EVENT',
 ];
 
 // Default visible edges (CALLS hidden by default to reduce clutter)
@@ -159,6 +169,8 @@ export const DEFAULT_VISIBLE_EDGES: EdgeType[] = [
   'EXTENDS',
   'IMPLEMENTS',
   'CALLS',
+  'BINDS_EVENT_HANDLER',
+  'EMITS_EVENT',
 ];
 
 // Edge display info for UI
@@ -169,4 +181,6 @@ export const EDGE_INFO: Record<EdgeType, { color: string; label: string }> = {
   CALLS: { color: '#7c3aed', label: 'Calls' },
   EXTENDS: { color: '#c2410c', label: 'Extends' },
   IMPLEMENTS: { color: '#be185d', label: 'Implements' },
+  BINDS_EVENT_HANDLER: { color: '#0891b2', label: 'Binds event handler' },
+  EMITS_EVENT: { color: '#0f766e', label: 'Emits event' },
 };

@@ -106,6 +106,7 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
 
   it('fails repair mode when FTS verify still reports missing indexes', async () => {
     const closeLbugMock = vi.fn(async () => undefined);
+    const loadFTSExtensionMock = vi.fn(async () => true);
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       initLbug: vi.fn(async () => undefined),
       loadGraphToLbug: vi.fn(async () => undefined),
@@ -117,6 +118,7 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
       deleteNodesForFile: vi.fn(async () => undefined),
       deleteAllCommunitiesAndProcesses: vi.fn(async () => undefined),
       queryImporters: vi.fn(async () => []),
+      loadFTSExtension: loadFTSExtensionMock,
     }));
     vi.doMock('../../src/core/search/fts-indexes.js', () => ({
       createSearchFTSIndexes: vi.fn(async () => undefined),
@@ -146,6 +148,7 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
           },
         ),
       ).rejects.toThrow(/FTS repair failed - missing indexes after rebuild/i);
+      expect(loadFTSExtensionMock).toHaveBeenCalledWith(undefined, { policy: 'auto' });
       expect(closeLbugMock).toHaveBeenCalled();
     } finally {
       await tmpRepo.cleanup();
@@ -153,6 +156,7 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
   });
 
   it('surfaces extension-unavailable errors from FTS index creation in repair mode', async () => {
+    const createSearchFTSIndexes = vi.fn(async () => undefined);
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       initLbug: vi.fn(async () => undefined),
       loadGraphToLbug: vi.fn(async () => undefined),
@@ -164,11 +168,10 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
       deleteNodesForFile: vi.fn(async () => undefined),
       deleteAllCommunitiesAndProcesses: vi.fn(async () => undefined),
       queryImporters: vi.fn(async () => []),
+      loadFTSExtension: vi.fn(async () => false),
     }));
     vi.doMock('../../src/core/search/fts-indexes.js', () => ({
-      createSearchFTSIndexes: vi.fn(async () => {
-        throw new Error('FTS extension unavailable');
-      }),
+      createSearchFTSIndexes,
       verifySearchFTSIndexes: vi.fn(async () => []),
     }));
 
@@ -195,6 +198,7 @@ describe('runFullAnalysis FTS repair and verification failure paths', () => {
           },
         ),
       ).rejects.toThrow(/FTS extension unavailable/i);
+      expect(createSearchFTSIndexes).not.toHaveBeenCalled();
     } finally {
       await tmpRepo.cleanup();
     }

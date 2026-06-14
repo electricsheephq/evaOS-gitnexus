@@ -8,7 +8,7 @@
  *  3. Copy gitnexus-shared/dist → dist/_shared
  *  4. Rewrite bare 'gitnexus-shared' specifiers → relative paths
  */
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -35,6 +35,18 @@ function getBuildTimeoutMs() {
 
 const BUILD_TIMEOUT_MS = getBuildTimeoutMs();
 
+function resolveTypeScriptCli(candidateRoots) {
+  for (const root of candidateRoots) {
+    const candidate = path.join(root, 'node_modules', 'typescript', 'bin', 'tsc');
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  console.error(
+    '[build] TypeScript CLI not found in local node_modules. Run `npm install` from the repo root first.',
+  );
+  process.exit(1);
+}
+
 // Published-package guard: when installed from the npm registry the
 // monorepo sibling `gitnexus-shared` does not exist and `dist/` is
 // already pre-built. Skip the build to avoid a misleading ENOENT
@@ -53,15 +65,21 @@ if (!fs.existsSync(SHARED_ROOT)) {
 
 // ── 1. Build gitnexus-shared ───────────────────────────────────────
 console.log('[build] compiling gitnexus-shared…');
-const tscCmd =
-  process.platform === 'win32'
-    ? path.join('node_modules', '.bin', 'tsc.cmd')
-    : path.join('node_modules', '.bin', 'tsc');
-execSync(tscCmd, { cwd: SHARED_ROOT, stdio: 'inherit', timeout: BUILD_TIMEOUT_MS });
+const sharedTscScript = resolveTypeScriptCli([SHARED_ROOT, ROOT]);
+const rootTscScript = resolveTypeScriptCli([ROOT, SHARED_ROOT]);
+execFileSync(process.execPath, [sharedTscScript], {
+  cwd: SHARED_ROOT,
+  stdio: 'inherit',
+  timeout: BUILD_TIMEOUT_MS,
+});
 
 // ── 2. Build gitnexus ──────────────────────────────────────────────
 console.log('[build] compiling gitnexus…');
-execSync(tscCmd, { cwd: ROOT, stdio: 'inherit', timeout: BUILD_TIMEOUT_MS });
+execFileSync(process.execPath, [rootTscScript], {
+  cwd: ROOT,
+  stdio: 'inherit',
+  timeout: BUILD_TIMEOUT_MS,
+});
 
 // ── 3. Copy shared dist ────────────────────────────────────────────
 console.log('[build] copying shared module into dist/_shared…');

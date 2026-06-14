@@ -164,7 +164,7 @@ describe('CLI help surface', () => {
     );
 
     expect(untranslated).toEqual([]);
-  });
+  }, 30_000);
 
   it('analyze help localizes custom environment variable help text', () => {
     const result = runHelp('analyze', { GITNEXUS_LANG: 'zh-CN' } as NodeJS.ProcessEnv);

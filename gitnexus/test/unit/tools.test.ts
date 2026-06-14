@@ -110,6 +110,8 @@ describe('GITNEXUS_TOOLS', () => {
     expect(cypherTool.inputSchema.properties.params).toBeDefined();
     expect(cypherTool.inputSchema.properties.params.type).toBe('object');
     expect(cypherTool.inputSchema.properties.params.description).toContain('prepared statement');
+    expect(cypherTool.inputSchema.properties.params.description).toContain('arrays of scalar');
+    expect(cypherTool.inputSchema.properties.params.additionalProperties).toBeDefined();
   });
 
   it('context tool has no required parameters', () => {

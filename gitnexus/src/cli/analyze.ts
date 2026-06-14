@@ -13,7 +13,6 @@ import os from 'os';
 import { spawn } from 'child_process';
 import v8 from 'v8';
 import cliProgress from 'cli-progress';
-import { closeLbug } from '../core/lbug/lbug-adapter.js';
 import {
   isLbugCheckpointIoError,
   isWalCorruptionError,
@@ -35,7 +34,6 @@ import {
   validateBranchName,
   GitNexusRcError,
 } from './analyze-config.js';
-import { runFullAnalysis } from '../core/run-analyze.js';
 import { getMaxFileSizeBannerMessage } from '../core/ingestion/utils/max-file-size.js';
 import { warnMissingOptionalGrammars, getOptionalGrammarExtensions } from './optional-grammars.js';
 import { glob } from 'glob';
@@ -101,17 +99,14 @@ const installFatalHandlers = (): void => {
   });
 };
 
-/** Historical floor for the re-exec heap cap — the auto-sizer never goes below
- *  this, so small boxes / CI never regress. */
-const DEFAULT_HEAP_MB = 16384;
-
 /**
  * RAM-aware re-exec heap cap (MB): `0.75 × effective RAM`, clamped to
- * `>= DEFAULT_HEAP_MB`. Kept BELOW physical RAM on purpose — a cap `>=` RAM makes
- * V8 collect lazily and inflate the heap into swap-thrash (observed analyzing the
+ * at least 1MB. Kept BELOW physical RAM on purpose — a cap `>=` RAM makes V8
+ * collect lazily and inflate the heap into swap-thrash (observed analyzing the
  * Linux kernel at a 30GB cap on a 31GB box). `constrainedBytes` is the cgroup
- * limit or `null`; it is honored only as a real, smaller-than-physical cap, because
- * `process.constrainedMemory()` returns a huge sentinel when UNCONSTRAINED.
+ * limit or `null`; it is honored only as a real, smaller-than-physical cap,
+ * because `process.constrainedMemory()` returns a huge sentinel when
+ * UNCONSTRAINED.
  */
 export function computeHeapCapMb(totalBytes: number, constrainedBytes: number | null): number {
   const effectiveBytes =
@@ -119,7 +114,8 @@ export function computeHeapCapMb(totalBytes: number, constrainedBytes: number | 
       ? constrainedBytes
       : totalBytes;
   const effectiveMb = Math.floor(effectiveBytes / (1024 * 1024));
-  return Math.max(DEFAULT_HEAP_MB, Math.floor(0.75 * effectiveMb));
+  const effectiveCapMb = Math.floor(0.75 * effectiveMb);
+  return Math.max(1, effectiveCapMb);
 }
 
 function readConstrainedBytes(): number | null {
@@ -1038,7 +1034,8 @@ const analyzeCommandImpl = async (
     aborted = true;
     bar.stop();
     console.log('\n  Interrupted — cleaning up...');
-    closeLbug()
+    import('../core/lbug/lbug-adapter.js')
+      .then(({ closeLbug }) => closeLbug())
       .catch(() => {})
       .finally(async () => {
         const { flushLoggerSync } = await import('../core/logger.js');
@@ -1100,6 +1097,7 @@ const analyzeCommandImpl = async (
     const skipAll = options.indexOnly || options.skipAiContext;
     const skipAgentsMd = skipAll || options.skipAgentsMd;
     const skipSkills = skipAll || options.skipSkills;
+    const { runFullAnalysis } = await import('../core/run-analyze.js');
     const result = await runFullAnalysis(
       repoPath,
       {
