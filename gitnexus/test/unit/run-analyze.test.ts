@@ -59,6 +59,39 @@ describe('run-analyze module', () => {
       await tmpRepo.cleanup();
     }
   });
+
+  it('skips AGENTS.md, CLAUDE.md, and bundled skills when skipAiContext is enabled', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-no-ai-context-');
+    try {
+      await fs.writeFile(
+        path.join(tmpRepo.dbPath, 'index.ts'),
+        'export function hello() { return 1; }\n',
+      );
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git add index.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      const result = await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAiContext: true },
+        {
+          onProgress: () => {},
+        },
+      );
+
+      expect(result.alreadyUpToDate).not.toBe(true);
+      await expect(fs.stat(path.join(tmpRepo.dbPath, '.gitnexus'))).resolves.toBeDefined();
+      await expect(fs.stat(path.join(tmpRepo.dbPath, 'AGENTS.md'))).rejects.toThrow();
+      await expect(fs.stat(path.join(tmpRepo.dbPath, 'CLAUDE.md'))).rejects.toThrow();
+      await expect(fs.stat(path.join(tmpRepo.dbPath, '.claude'))).rejects.toThrow();
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
 });
 
 describe('deriveEmbeddingMode', () => {
