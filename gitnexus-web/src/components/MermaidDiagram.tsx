@@ -139,8 +139,10 @@ export const MermaidDiagram = ({ code }: MermaidDiagramProps) => {
               {t('graph:diagram.label')}
             </span>
             <button
+              type="button"
               onClick={() => setShowModal(true)}
               className="rounded p-1 text-text-muted transition-colors hover:bg-hover hover:text-text-primary"
+              aria-label={t('graph:diagram.expandTitle')}
               title={t('graph:diagram.expandTitle')}
             >
               <Maximize2 className="h-3.5 w-3.5" />
