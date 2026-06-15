@@ -394,6 +394,64 @@ describe('LocalBackend.callTool', () => {
     expect(result.timing).toHaveProperty('rerank');
   });
 
+  it('filters malformed query candidates before rerank and output', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      ftsAvailable: true,
+      results: [
+        {
+          filePath: 'src/client.ts',
+          nodeIds: ['node-good', 'node-corrupt'],
+          score: 10,
+        },
+      ],
+    });
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
+    rerankMocks.resolveRerankConfig.mockReturnValue({
+      baseUrl: 'https://api.voyageai.com/v1',
+      model: 'rerank-2.5',
+      apiKey: 'test-key',
+      candidates: 2,
+      maxDocChars: 3000,
+    });
+
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 0 }];
+      return [];
+    });
+    (executeParameterized as any).mockImplementation(
+      async (_repoId: string, cypher: string, params?: { nodeIds?: string[] }) => {
+        if (cypher.includes('RETURN n.id AS id')) {
+          return (params?.nodeIds ?? []).map((id) =>
+            id === 'node-good'
+              ? {
+                  id,
+                  name: 'GoodClient',
+                  type: 'Function',
+                  filePath: 'src/client.ts',
+                  startLine: 1,
+                  endLine: 10,
+                }
+              : {
+                  id,
+                  name: 'Bad\u0000Client',
+                  type: 'Function',
+                  filePath: 'src/client.ts',
+                  startLine: 20,
+                  endLine: 30,
+                },
+          );
+        }
+        return [];
+      },
+    );
+
+    const result = await backend.callTool('query', { query: 'client', limit: 1, max_symbols: 2 });
+
+    expect(rerankMocks.rerankDocuments).not.toHaveBeenCalled();
+    expect(result.definitions.map((definition: any) => definition.name)).toEqual(['GoodClient']);
+  });
+
   it('applies Voyage rerank scores to process ranking, not only standalone definitions', async () => {
     const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
     vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({

@@ -9,6 +9,7 @@ const ENV_KEYS = [
   'GITNEXUS_EMBEDDING_MAX_ATTEMPTS',
   'GITNEXUS_EMBEDDING_RETRY_CAP_MS',
   'GITNEXUS_EMBEDDING_MIN_INTERVAL_MS',
+  'GITNEXUS_EMBEDDING_TIMEOUT_MS',
 ] as const;
 
 /** 384d mock vector matching the default schema dimensions. */
@@ -532,9 +533,38 @@ describe('HTTP embedding backend', () => {
   });
 
   describe('timeout and network error handling', () => {
-    it('does not retry on timeout', async () => {
+    it('retries per-attempt timeouts with fresh timeout signals', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_MAX_ATTEMPTS = '2';
+      process.env.GITNEXUS_EMBEDDING_RETRY_CAP_MS = '1';
+      process.env.GITNEXUS_EMBEDDING_TIMEOUT_MS = '45000';
+
+      const timeoutErr = new DOMException(
+        'The operation was aborted due to timeout',
+        'TimeoutError',
+      );
+      const ok = { ok: true, json: async () => ({ data: [{ embedding: mockVec }] }) };
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValueOnce(timeoutErr).mockResolvedValueOnce(ok));
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      const result = await embedText('test');
+
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(result).toBeInstanceOf(Float32Array);
+      expect((fetch as any).mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+      expect((fetch as any).mock.calls[1][1].signal).toBeInstanceOf(AbortSignal);
+      expect((fetch as any).mock.calls[0][1].signal).not.toBe(
+        (fetch as any).mock.calls[1][1].signal,
+      );
+    });
+
+    it('reports configured timeout after retry exhaustion', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_MAX_ATTEMPTS = '2';
+      process.env.GITNEXUS_EMBEDDING_RETRY_CAP_MS = '1';
+      process.env.GITNEXUS_EMBEDDING_TIMEOUT_MS = '45000';
 
       const timeoutErr = new DOMException(
         'The operation was aborted due to timeout',
@@ -543,8 +573,8 @@ describe('HTTP embedding backend', () => {
       vi.stubGlobal('fetch', vi.fn().mockRejectedValue(timeoutErr));
 
       const { embedText } = await import('../../src/core/embeddings/embedder.js');
-      await expect(embedText('test')).rejects.toThrow('timed out');
-      expect(fetch).toHaveBeenCalledTimes(1);
+      await expect(embedText('test')).rejects.toThrow('timed out after 45000ms');
+      expect(fetch).toHaveBeenCalledTimes(2);
     });
 
     it('retries on network error then succeeds', async () => {

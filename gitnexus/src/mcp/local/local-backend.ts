@@ -374,6 +374,28 @@ type MergedQueryCandidate = [
   { score: number; data: any; originalScore?: number; rerankScore?: number; rerankRank?: number },
 ];
 
+const UNSAFE_QUERY_RESULT_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+const isSafeQueryResultString = (value: unknown, { allowEmpty = false } = {}): value is string =>
+  typeof value === 'string' &&
+  (allowEmpty || value.trim().length > 0) &&
+  !UNSAFE_QUERY_RESULT_CHARS.test(value);
+
+const isRenderableQueryCandidateData = (data: any): boolean => {
+  if (!data || typeof data !== 'object') return false;
+
+  const nodeId = data.nodeId;
+  const name = data.name;
+  const type = data.type;
+  const filePath = data.filePath;
+
+  if (nodeId !== undefined && !isSafeQueryResultString(nodeId)) return false;
+  if (!isSafeQueryResultString(name)) return false;
+  if (type !== undefined && !isSafeQueryResultString(type)) return false;
+  if (!isSafeQueryResultString(filePath)) return false;
+  return Boolean(nodeId || filePath);
+};
+
 /**
  * One repository entry as returned by {@link LocalBackend.listRepos} and in each
  * `list_repos` page. Named so the `listRepos`/`listReposPage` return types read
@@ -1291,7 +1313,8 @@ export class LocalBackend {
 
     let merged = Array.from(scoreMap.entries())
       .sort((a, b) => b[1].score - a[1].score)
-      .slice(0, searchLimit) as MergedQueryCandidate[];
+      .slice(0, searchLimit)
+      .filter(([, item]) => isRenderableQueryCandidateData(item.data)) as MergedQueryCandidate[];
     timer.stop(); // merge
 
     let rerankWarning: string | undefined;
@@ -1734,15 +1757,18 @@ export class LocalBackend {
 
         if (symbols.length > 0) {
           for (const sym of symbols) {
-            results.push({
-              nodeId: sym.id || sym[0],
-              name: sym.name || sym[1],
-              type: sym.type || sym[2],
-              filePath: sym.filePath || sym[3],
-              startLine: sym.startLine || sym[4],
-              endLine: sym.endLine || sym[5],
+            const candidate = {
+              nodeId: sym.id ?? sym[0],
+              name: sym.name ?? sym[1],
+              type: sym.type ?? sym[2],
+              filePath: sym.filePath ?? sym[3],
+              startLine: sym.startLine ?? sym[4],
+              endLine: sym.endLine ?? sym[5],
               bm25Score: bm25Result.score,
-            });
+            };
+            if (isRenderableQueryCandidateData(candidate)) {
+              results.push(candidate);
+            }
           }
         } else {
           const fileName = fullPath.split('/').pop() || fullPath;
@@ -1878,7 +1904,7 @@ export class LocalBackend {
           const nodeRows = await executeParameterized(repo.lbugPath, nodeQuery, { nodeId });
           if (nodeRows.length > 0) {
             const nodeRow = nodeRows[0];
-            results.push({
+            const candidate = {
               nodeId,
               name: nodeRow.name ?? nodeRow[0] ?? '',
               type: label,
@@ -1886,7 +1912,10 @@ export class LocalBackend {
               distance: chunk.distance,
               startLine: chunk.startLine,
               endLine: chunk.endLine,
-            });
+            };
+            if (isRenderableQueryCandidateData(candidate)) {
+              results.push(candidate);
+            }
           }
         } catch {}
       }
