@@ -6,6 +6,9 @@ const ENV_KEYS = [
   'GITNEXUS_EMBEDDING_MODEL',
   'GITNEXUS_EMBEDDING_API_KEY',
   'GITNEXUS_EMBEDDING_DIMS',
+  'GITNEXUS_EMBEDDING_MAX_ATTEMPTS',
+  'GITNEXUS_EMBEDDING_RETRY_CAP_MS',
+  'GITNEXUS_EMBEDDING_MIN_INTERVAL_MS',
 ] as const;
 
 /** 384d mock vector matching the default schema dimensions. */
@@ -16,6 +19,7 @@ describe('HTTP embedding backend', () => {
   const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.resetModules();
     // Restore env vars to pre-test state so a mid-test throw can't leak
@@ -215,6 +219,124 @@ describe('HTTP embedding backend', () => {
       const { embedText } = await import('../../src/core/embeddings/embedder.js');
       await embedText('test');
       expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('honors operator retry caps above the default for Voyage rate limits', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      process.env.GITNEXUS_EMBEDDING_URL = 'https://api.voyageai.com/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'voyage-code-3';
+      process.env.GITNEXUS_EMBEDDING_RETRY_CAP_MS = '60000';
+
+      const ok = { ok: true, json: async () => ({ data: [{ embedding: mockVec }] }) };
+      vi.stubGlobal(
+        'fetch',
+        vi
+          .fn()
+          .mockResolvedValueOnce(
+            new Response('{}', {
+              status: 429,
+              headers: { 'Retry-After': '60' },
+            }),
+          )
+          .mockResolvedValueOnce(ok),
+      );
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      const promise = embedText('test');
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await promise;
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('paces retry attempts as HTTP embedding requests', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_MIN_INTERVAL_MS = '20000';
+
+      const ok = { ok: true, json: async () => ({ data: [{ embedding: mockVec }] }) };
+      vi.stubGlobal(
+        'fetch',
+        vi
+          .fn()
+          .mockResolvedValueOnce(
+            new Response('{}', {
+              status: 429,
+              headers: { 'Retry-After': '1' },
+            }),
+          )
+          .mockResolvedValueOnce(ok),
+      );
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      const promise = embedText('test');
+      await vi.advanceTimersByTimeAsync(19_999);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await promise;
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('allows operators to pace successful HTTP embedding batches', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_MIN_INTERVAL_MS = '20000';
+
+      const makeResp = (n: number) => ({
+        ok: true,
+        json: async () => ({ data: Array.from({ length: n }, () => ({ embedding: mockVec })) }),
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValueOnce(makeResp(64)).mockResolvedValueOnce(makeResp(6)),
+      );
+
+      const { embedBatch } = await import('../../src/core/embeddings/embedder.js');
+      const promise = embedBatch(Array.from({ length: 70 }, (_, i) => `text ${i}`));
+      await vi.advanceTimersByTimeAsync(19_999);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const results = await promise;
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(results).toHaveLength(70);
+    });
+
+    it('surfaces sanitized rate-limit diagnostics without leaking bearer tokens', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'https://api.voyageai.com/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'voyage-code-3';
+      process.env.GITNEXUS_EMBEDDING_API_KEY = 'test-api-key-redaction-check';
+      process.env.GITNEXUS_EMBEDDING_MAX_ATTEMPTS = '1';
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue(
+          new Response('{"detail":"reduced rate limits of 3 RPM and 10K TPM"}', {
+            status: 429,
+            headers: {
+              'Retry-After': '30',
+              'x-request-id': 'req_123',
+            },
+          }),
+        ),
+      );
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      try {
+        await embedText('test');
+        throw new Error('expected embedText to fail');
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        expect(message).toMatch(
+          /Embedding endpoint returned 429 .*Retry-After: 30.*request id: req_123.*3 RPM/u,
+        );
+        expect(message).not.toContain('test-api-key-redaction-check');
+      }
     });
 
     it('throws when all retries are exhausted', async () => {

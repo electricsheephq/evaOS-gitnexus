@@ -16,16 +16,58 @@ import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from '
 const HTTP_TIMEOUT_MS = 30_000;
 const HTTP_MAX_RETRIES = 2;
 const HTTP_RETRY_BACKOFF_MS = 1_000;
+const HTTP_RETRY_CAP_MS = 5_000;
+const VOYAGE_HTTP_RETRY_CAP_MS = 30_000;
 const HTTP_BATCH_SIZE = 64;
 const DEFAULT_DIMS = 384;
 const HTTP_BREAKER_KEY = 'embeddings-http';
+const HTTP_RESPONSE_BODY_SNIPPET_CHARS = 500;
 
 interface HttpConfig {
   baseUrl: string;
   model: string;
   apiKey: string;
   dimensions?: number;
+  maxAttempts: number;
+  minIntervalMs: number;
 }
+
+let lastHttpRequestStartedAt: number | undefined;
+let httpPaceQueue: Promise<void> = Promise.resolve();
+
+const parsePositiveIntegerEnv = (
+  name: string,
+  fallback: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a positive integer, got "${raw}"`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > max) {
+    throw new Error(`${name} must be a positive integer <= ${max}, got "${raw}"`);
+  }
+  return parsed;
+};
+
+const parseNonNegativeIntegerEnv = (
+  name: string,
+  fallback: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a non-negative integer, got "${raw}"`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > max) {
+    throw new Error(`${name} must be a non-negative integer <= ${max}, got "${raw}"`);
+  }
+  return parsed;
+};
 
 /**
  * Build config from the current process.env snapshot.
@@ -55,6 +97,12 @@ const readConfig = (): HttpConfig | null => {
     model,
     apiKey: process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused',
     dimensions,
+    maxAttempts: parsePositiveIntegerEnv(
+      'GITNEXUS_EMBEDDING_MAX_ATTEMPTS',
+      HTTP_MAX_RETRIES + 1,
+      20,
+    ),
+    minIntervalMs: parseNonNegativeIntegerEnv('GITNEXUS_EMBEDDING_MIN_INTERVAL_MS', 0, 300_000),
   };
 };
 
@@ -93,6 +141,68 @@ const safeUrl = (url: string): string => {
   }
 };
 
+const isVoyageUrl = (url: string): boolean => {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'voyageai.com' || host.endsWith('.voyageai.com');
+  } catch {
+    return false;
+  }
+};
+
+const retryCapMsForUrl = (url: string): number =>
+  parsePositiveIntegerEnv(
+    'GITNEXUS_EMBEDDING_RETRY_CAP_MS',
+    isVoyageUrl(url) ? VOYAGE_HTTP_RETRY_CAP_MS : HTTP_RETRY_CAP_MS,
+    300_000,
+  );
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const paceHttpRequest = async (minIntervalMs: number): Promise<void> => {
+  if (minIntervalMs <= 0) return;
+
+  const waitTurn = httpPaceQueue.then(async () => {
+    const now = Date.now();
+    const waitMs =
+      lastHttpRequestStartedAt === undefined
+        ? 0
+        : Math.max(0, lastHttpRequestStartedAt + minIntervalMs - now);
+    if (waitMs > 0) await sleep(waitMs);
+    lastHttpRequestStartedAt = Date.now();
+  });
+  httpPaceQueue = waitTurn.catch(() => undefined);
+  await waitTurn;
+};
+
+const safeResponseSnippet = async (resp: Response): Promise<string | undefined> => {
+  try {
+    const clone = typeof resp.clone === 'function' ? resp.clone() : resp;
+    if (typeof clone.text !== 'function') return undefined;
+    const text = await clone.text();
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (!normalized) return undefined;
+    return normalized.slice(0, HTTP_RESPONSE_BODY_SNIPPET_CHARS);
+  } catch {
+    return undefined;
+  }
+};
+
+const responseDiagnostics = async (resp: Response): Promise<string> => {
+  const parts: string[] = [];
+  const retryAfter =
+    typeof resp.headers?.get === 'function' ? resp.headers.get('Retry-After') : null;
+  if (retryAfter) parts.push(`Retry-After: ${retryAfter}`);
+  const requestId =
+    typeof resp.headers?.get === 'function'
+      ? (resp.headers.get('x-request-id') ?? resp.headers.get('x-requestid'))
+      : null;
+  if (requestId) parts.push(`request id: ${requestId}`);
+  const snippet = await safeResponseSnippet(resp);
+  if (snippet) parts.push(`body: ${snippet}`);
+  return parts.length ? `; ${parts.join('; ')}` : '';
+};
+
 interface EmbeddingItem {
   embedding: number[];
 }
@@ -119,6 +229,8 @@ const httpEmbedBatch = async (
   apiKey: string,
   batchIndex = 0,
   dimensions?: number,
+  maxAttempts = HTTP_MAX_RETRIES + 1,
+  minIntervalMs = 0,
 ): Promise<EmbeddingItem[]> => {
   const requestBody: {
     input: string[];
@@ -130,14 +242,7 @@ const httpEmbedBatch = async (
     model,
   };
   if (dimensions !== undefined) {
-    let host = '';
-    try {
-      host = new URL(url).hostname.toLowerCase();
-    } catch {
-      /* malformed URL will fail in fetch below */
-    }
-    const isVoyageHost = host === 'voyageai.com' || host.endsWith('.voyageai.com');
-    if (isVoyageHost) {
+    if (isVoyageUrl(url)) {
       requestBody.output_dimension = dimensions;
     } else {
       requestBody.dimensions = dimensions;
@@ -146,6 +251,7 @@ const httpEmbedBatch = async (
 
   let resp: Response;
   try {
+    const retryCapMs = retryCapMsForUrl(url);
     resp = await resilientFetch(
       url,
       {
@@ -158,8 +264,17 @@ const httpEmbedBatch = async (
         body: JSON.stringify(requestBody),
       },
       {
+        fetchImpl: async (input, init) => {
+          await paceHttpRequest(minIntervalMs);
+          return globalThis.fetch(input, init);
+        },
         breakerKey: HTTP_BREAKER_KEY,
-        retry: { maxAttempts: HTTP_MAX_RETRIES + 1, baseDelayMs: HTTP_RETRY_BACKOFF_MS },
+        retry: {
+          maxAttempts,
+          baseDelayMs: HTTP_RETRY_BACKOFF_MS,
+          capDelayMs: retryCapMs,
+          retryAfterCapMs: retryCapMs,
+        },
       },
     );
   } catch (err) {
@@ -175,7 +290,8 @@ const httpEmbedBatch = async (
     }
     if (err instanceof ResilientFetchExhaustedError) {
       throw new Error(
-        `Embedding endpoint returned ${err.response.status} (${safeUrl(url)}, batch ${batchIndex})`,
+        `Embedding endpoint returned ${err.response.status} ` +
+          `(${safeUrl(url)}, batch ${batchIndex})${await responseDiagnostics(err.response)}`,
       );
     }
     const reason = err instanceof Error ? err.message : String(err);
@@ -186,7 +302,8 @@ const httpEmbedBatch = async (
     // resilientFetch already retried 5xx/429; any non-OK response here is
     // a terminal client error (4xx other than 429).
     throw new Error(
-      `Embedding endpoint returned ${resp.status} (${safeUrl(url)}, batch ${batchIndex})`,
+      `Embedding endpoint returned ${resp.status} ` +
+        `(${safeUrl(url)}, batch ${batchIndex})${await responseDiagnostics(resp)}`,
     );
   }
 
@@ -220,6 +337,8 @@ export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
       config.apiKey,
       batchIndex,
       config.dimensions,
+      config.maxAttempts,
+      config.minIntervalMs,
     );
 
     if (items.length !== batch.length) {
@@ -270,6 +389,8 @@ export const httpEmbedQuery = async (text: string): Promise<number[]> => {
     config.apiKey,
     0,
     config.dimensions,
+    config.maxAttempts,
+    config.minIntervalMs,
   );
   if (!items.length) {
     throw new Error(`Embedding endpoint returned empty response (${safeUrl(url)})`);
