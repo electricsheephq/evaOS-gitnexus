@@ -1,13 +1,18 @@
 import { execSync } from 'child_process';
 import fs from 'fs/promises';
 import path from 'path';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   deriveEmbeddingMode,
   deriveEmbeddingCap,
   DEFAULT_EMBEDDING_NODE_LIMIT,
 } from '../../src/core/embedding-mode.js';
-import { getStoragePaths, saveMeta, type RepoMeta } from '../../src/storage/repo-manager.js';
+import {
+  getStoragePaths,
+  loadMeta,
+  saveMeta,
+  type RepoMeta,
+} from '../../src/storage/repo-manager.js';
 import { createTempDir } from '../helpers/test-db.js';
 
 describe('run-analyze module', () => {
@@ -99,6 +104,107 @@ describe('run-analyze module', () => {
       } else {
         process.env.GITNEXUS_HOME = previousHome;
       }
+      await tmpRepo.cleanup();
+    }
+  });
+
+  it('does not treat embedding checkpoint metadata as already up to date', async () => {
+    const tmpRepo = await createTempDir('gitnexus-test-run-analyze-checkpoint-');
+    const previousHome = process.env.GITNEXUS_HOME;
+    const previousEmbeddingUrl = process.env.GITNEXUS_EMBEDDING_URL;
+    const previousEmbeddingModel = process.env.GITNEXUS_EMBEDDING_MODEL;
+    const previousEmbeddingKey = process.env.GITNEXUS_EMBEDDING_API_KEY;
+    try {
+      const gitnexusHome = path.join(tmpRepo.dbPath, '.gitnexus-home');
+      await fs.mkdir(gitnexusHome, { recursive: true });
+      process.env.GITNEXUS_HOME = gitnexusHome;
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_API_KEY = 'test-key';
+      const mockVec = Array.from({ length: 384 }, (_, i) => i / 384);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockImplementation(async (_input, init?: RequestInit) => {
+          const body = JSON.parse(String(init?.body ?? '{}')) as { input?: unknown[] };
+          const count = Array.isArray(body.input) ? body.input.length : 1;
+          return {
+            ok: true,
+            json: async () => ({
+              data: Array.from({ length: count }, () => ({ embedding: mockVec })),
+            }),
+          };
+        }),
+      );
+
+      await fs.writeFile(
+        path.join(tmpRepo.dbPath, 'index.ts'),
+        'export function checkpointResume() { return "ready"; }\n',
+      );
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git add index.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAiContext: true },
+        {
+          onProgress: () => {},
+        },
+      );
+
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const completedMeta = await loadMeta(storagePath);
+      expect(completedMeta).not.toBeNull();
+      if (!completedMeta) {
+        throw new Error('expected completed meta before checkpoint simulation');
+      }
+      await saveMeta(storagePath, {
+        ...completedMeta,
+        stats: { ...completedMeta.stats, embeddings: 1 },
+        checkpoint: true,
+      });
+
+      const logs: string[] = [];
+      const result = await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAiContext: true },
+        {
+          onProgress: () => {},
+          onLog: (msg) => logs.push(msg),
+        },
+      );
+
+      expect(result.alreadyUpToDate).not.toBe(true);
+      expect(fetch).toHaveBeenCalled();
+      expect(logs.some((msg) => msg.includes('embedding checkpoint'))).toBe(true);
+      const finalMeta = await loadMeta(storagePath);
+      expect(finalMeta?.checkpoint).toBeUndefined();
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.GITNEXUS_HOME;
+      } else {
+        process.env.GITNEXUS_HOME = previousHome;
+      }
+      if (previousEmbeddingUrl === undefined) {
+        delete process.env.GITNEXUS_EMBEDDING_URL;
+      } else {
+        process.env.GITNEXUS_EMBEDDING_URL = previousEmbeddingUrl;
+      }
+      if (previousEmbeddingModel === undefined) {
+        delete process.env.GITNEXUS_EMBEDDING_MODEL;
+      } else {
+        process.env.GITNEXUS_EMBEDDING_MODEL = previousEmbeddingModel;
+      }
+      if (previousEmbeddingKey === undefined) {
+        delete process.env.GITNEXUS_EMBEDDING_API_KEY;
+      } else {
+        process.env.GITNEXUS_EMBEDDING_API_KEY = previousEmbeddingKey;
+      }
+      vi.unstubAllGlobals();
       await tmpRepo.cleanup();
     }
   });

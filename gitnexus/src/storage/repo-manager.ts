@@ -94,6 +94,13 @@ export interface RepoMeta {
    */
   fileHashesDirty?: boolean;
   /**
+   * True when meta.json was written as a mid-embedding checkpoint. Checkpoint
+   * metadata has a valid graph and partial embeddings, but it is not a completed
+   * analyze result; the next analyze must fall through and finish embeddings
+   * instead of taking an up-to-date fast path.
+   */
+  checkpoint?: boolean;
+  /**
    * Crash-recovery dirty flag. Written to meta.json BEFORE any
    * destructive DB mutation in an incremental run; cleared on success
    * by overwriting meta.json. If a run crashes between, the next run

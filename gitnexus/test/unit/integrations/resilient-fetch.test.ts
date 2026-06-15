@@ -168,6 +168,22 @@ describe('resilientFetch', () => {
     expect(sleep).toHaveBeenCalledWith(RETRY_AFTER_CAP_MS);
   });
 
+  it('429 Retry-After can use a per-call cap above the shared default', async () => {
+    let n = 0;
+    const fetchImpl = vi.fn(async () => {
+      n += 1;
+      return n === 1 ? jsonResp(429, { 'Retry-After': '60' }) : jsonResp(204);
+    });
+    const sleep = vi.fn(async () => {});
+    const { breaker } = makeBreaker();
+    await resilientFetch(URL_STR, undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      breaker,
+      retry: { sleep, capDelayMs: 120_000, retryAfterCapMs: 120_000 },
+    });
+    expect(sleep).toHaveBeenCalledWith(60_000);
+  });
+
   it('429 without Retry-After falls back to exponential-backoff delay', async () => {
     let n = 0;
     const fetchImpl = vi.fn(async () => {

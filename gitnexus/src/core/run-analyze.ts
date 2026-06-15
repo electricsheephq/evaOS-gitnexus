@@ -41,6 +41,7 @@ import {
   registerRepo,
   cleanupOldKuzuFiles,
   INCREMENTAL_SCHEMA_VERSION,
+  type RepoMeta,
 } from '../storage/repo-manager.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import {
@@ -384,8 +385,22 @@ export async function runFullAnalysis(
     // rebuild path executes.
   }
 
+  if (existingMeta?.checkpoint && !options.force) {
+    log(
+      'Previous analyze ended after an embedding checkpoint; skipping fast paths so embeddings can resume.',
+    );
+  }
+
   // ── Early-return: already up to date ──────────────────────────────
-  if (existingMeta && !options.force && existingMeta.lastCommit === currentCommit) {
+  // Skip checkpoint metas (mid-embedding writes). They can match HEAD and
+  // file hashes while still representing a partial embedding run; falling
+  // through lets cache restoration plus --embeddings resume the missing tail.
+  if (
+    existingMeta &&
+    !existingMeta.checkpoint &&
+    !options.force &&
+    existingMeta.lastCommit === currentCommit
+  ) {
     // Non-git folders have currentCommit = '' — always rebuild since we can't detect changes
     if (currentCommit !== '') {
       // For git repos, even if HEAD matches lastCommit, the working tree
@@ -446,9 +461,12 @@ export async function runFullAnalysis(
   const {
     forceRegenerateEmbeddings,
     preserveExistingEmbeddings,
-    shouldGenerateEmbeddings,
-    shouldLoadCache,
+    shouldGenerateEmbeddings: derivedShouldGenerateEmbeddings,
+    shouldLoadCache: derivedShouldLoadCache,
   } = _deriveEmbeddingMode(options, existingEmbeddingCount);
+  const resumeEmbeddingCheckpoint = !!existingMeta?.checkpoint && !options.dropEmbeddings;
+  const shouldGenerateEmbeddings = derivedShouldGenerateEmbeddings || resumeEmbeddingCheckpoint;
+  const shouldLoadCache = derivedShouldLoadCache || resumeEmbeddingCheckpoint;
 
   if (options.dropEmbeddings && existingEmbeddingCount > 0) {
     log(
@@ -552,6 +570,7 @@ export async function runFullAnalysis(
   const isIncremental =
     !options.force &&
     !!existingMeta &&
+    !existingMeta.checkpoint &&
     existingMeta.schemaVersion === INCREMENTAL_SCHEMA_VERSION &&
     !!existingMeta.fileHashes &&
     Object.keys(existingMeta.fileHashes).length > 0 &&
@@ -564,6 +583,7 @@ export async function runFullAnalysis(
 
   if (
     isIncremental &&
+    !existingMeta.checkpoint &&
     hashDiff &&
     hashDiff.changed.length === 0 &&
     hashDiff.added.length === 0 &&
@@ -870,7 +890,7 @@ export async function runFullAnalysis(
     if (shouldGenerateEmbeddings) {
       const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
         stats.nodes,
-        options.embeddingsNodeLimit,
+        resumeEmbeddingCheckpoint ? 0 : options.embeddingsNodeLimit,
       );
       if (!skipForCap) {
         embeddingSkipped = false;
@@ -910,6 +930,12 @@ export async function runFullAnalysis(
             `Voyage embeddings skipped for "${projectName}": repo is not listed in ` +
               'GITNEXUS_PREMIUM_REPO_ALLOWLIST.',
           );
+          if (resumeEmbeddingCheckpoint) {
+            throw new Error(
+              `Cannot resume embedding checkpoint for "${projectName}": repo is not listed in ` +
+                'GITNEXUS_PREMIUM_REPO_ALLOWLIST.',
+            );
+          }
         }
       }
       if (!embeddingSkipped) {
@@ -930,24 +956,72 @@ export async function runFullAnalysis(
 
         const { readServerMapping } = await import('./embeddings/server-mapping.js');
         const serverName = await readServerMapping(projectName);
-        const embeddingResult = await runEmbeddingPipeline(
-          executeQuery,
-          executeWithReusedStatement,
-          (p) => {
-            const scaled = 90 + Math.round((p.percent / 100) * 8);
-            const label =
-              p.phase === 'loading-model'
-                ? httpMode
-                  ? 'Connecting to embedding endpoint...'
-                  : 'Loading embedding model...'
-                : `Embedding ${p.nodesProcessed || 0}/${p.totalNodes || '?'}`;
-            progress('embeddings', scaled, label);
-          },
-          {},
-          cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
-          { repoName: projectName, serverName },
-          existingEmbeddings,
-        );
+        const CHECKPOINT_EVERY = 5_000;
+        let lastCheckpointAt = 0;
+        let pendingCheckpoint: Promise<void> = Promise.resolve();
+        const fileHashesForCheckpoint: Record<string, string> = {};
+        for (const [k, v] of newFileHashes) fileHashesForCheckpoint[k] = v;
+
+        const writeEmbeddingCheckpoint = (nodesProcessed: number): void => {
+          const checkpointMeta: RepoMeta = {
+            repoPath,
+            lastCommit: currentCommit,
+            indexedAt: new Date().toISOString(),
+            remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+            stats: {
+              files: pipelineResult.totalFileCount,
+              nodes: stats.nodes,
+              edges: stats.edges,
+              communities: pipelineResult.communityResult?.stats.totalCommunities,
+              processes: pipelineResult.processResult?.stats.totalProcesses,
+              embeddings: nodesProcessed,
+            },
+            schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
+            fileHashes: hasGitDir(repoPath) ? fileHashesForCheckpoint : undefined,
+            fileHashesDirty: hasGitDir(repoPath) ? workingTreeDirty : undefined,
+            incrementalInProgress: undefined,
+            checkpoint: true,
+          };
+
+          pendingCheckpoint = pendingCheckpoint
+            .catch(() => undefined)
+            .then(() => saveMeta(storagePath, checkpointMeta))
+            .catch(() => undefined);
+        };
+
+        const embeddingResult = await (async () => {
+          try {
+            return await runEmbeddingPipeline(
+              executeQuery,
+              executeWithReusedStatement,
+              (p) => {
+                const scaled = 90 + Math.round((p.percent / 100) * 8);
+                const label =
+                  p.phase === 'loading-model'
+                    ? httpMode
+                      ? 'Connecting to embedding endpoint...'
+                      : 'Loading embedding model...'
+                    : `Embedding ${p.nodesProcessed || 0}/${p.totalNodes || '?'}`;
+                progress('embeddings', scaled, label);
+
+                if (
+                  p.phase !== 'loading-model' &&
+                  typeof p.nodesProcessed === 'number' &&
+                  p.nodesProcessed - lastCheckpointAt >= CHECKPOINT_EVERY
+                ) {
+                  lastCheckpointAt = p.nodesProcessed;
+                  writeEmbeddingCheckpoint(p.nodesProcessed);
+                }
+              },
+              {},
+              cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
+              { repoName: projectName, serverName },
+              existingEmbeddings,
+            );
+          } finally {
+            await pendingCheckpoint.catch(() => undefined);
+          }
+        })();
         if (embeddingResult.semanticMode === 'exact-scan') {
           semanticMode = 'exact-scan';
           log(
