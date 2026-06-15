@@ -8,6 +8,9 @@ import {
   getCurrentCommit,
   getGitRoot,
   findGitRootByDotGit,
+  parseRepoNameFromUrl,
+  sanitizeRepoName,
+  getDefaultBranch,
 } from '../../src/storage/git.js';
 
 // Mock child_process.execSync
@@ -29,6 +32,7 @@ describe('git utilities', () => {
       expect(mockExecSync).toHaveBeenCalledWith('git rev-parse --is-inside-work-tree', {
         cwd: '/project',
         stdio: 'ignore',
+        windowsHide: true,
       });
     });
 
@@ -65,6 +69,34 @@ describe('git utilities', () => {
     it('trims whitespace from output', () => {
       mockExecSync.mockReturnValueOnce(Buffer.from('  sha256hash  \n'));
       expect(getCurrentCommit('/project')).toBe('sha256hash');
+    });
+  });
+
+  describe('getDefaultBranch (#243)', () => {
+    it('strips the origin/ prefix from the symbolic ref', () => {
+      mockExecSync.mockReturnValueOnce(Buffer.from('origin/develop\n'));
+      expect(getDefaultBranch('/project')).toBe('develop');
+      expect(mockExecSync).toHaveBeenCalledWith(
+        'git symbolic-ref --short refs/remotes/origin/HEAD',
+        expect.objectContaining({ cwd: '/project', windowsHide: true }),
+      );
+    });
+
+    it('handles a branch name that itself contains a slash', () => {
+      mockExecSync.mockReturnValueOnce(Buffer.from('origin/release/1.2\n'));
+      expect(getDefaultBranch('/project')).toBe('release/1.2');
+    });
+
+    it('returns null when origin/HEAD is not set (git throws)', () => {
+      mockExecSync.mockImplementationOnce(() => {
+        throw new Error('fatal: ref refs/remotes/origin/HEAD is not a symbolic ref');
+      });
+      expect(getDefaultBranch('/no-origin-head')).toBeNull();
+    });
+
+    it('returns null on empty output', () => {
+      mockExecSync.mockReturnValueOnce(Buffer.from('\n'));
+      expect(getDefaultBranch('/project')).toBeNull();
     });
   });
 
@@ -162,6 +194,63 @@ describe('git utilities', () => {
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('sanitizeRepoName', () => {
+    it('strips leading dashes', () => {
+      expect(sanitizeRepoName('--repo')).toBe('repo');
+    });
+
+    it('replaces unsafe characters with underscores', () => {
+      expect(sanitizeRepoName('repo<tag>')).toBe('repo_tag_');
+      expect(sanitizeRepoName('repo:name')).toBe('repo_name');
+      expect(sanitizeRepoName('repo"quoted"')).toBe('repo_quoted_');
+    });
+
+    it('blocks path traversal segments', () => {
+      expect(sanitizeRepoName('.')).toBe('unknown');
+      expect(sanitizeRepoName('..')).toBe('unknown');
+    });
+
+    it('blocks Windows reserved names', () => {
+      expect(sanitizeRepoName('CON')).toBe('unknown');
+      expect(sanitizeRepoName('prn')).toBe('unknown');
+      expect(sanitizeRepoName('AUX')).toBe('unknown');
+      expect(sanitizeRepoName('NUL')).toBe('unknown');
+      expect(sanitizeRepoName('COM1')).toBe('unknown');
+      expect(sanitizeRepoName('LPT9')).toBe('unknown');
+
+      // Reserved names with extensions
+      expect(sanitizeRepoName('CON.txt')).toBe('unknown');
+      expect(sanitizeRepoName('NUL.tar.gz')).toBe('unknown');
+      expect(sanitizeRepoName('AUX.local')).toBe('unknown');
+    });
+
+    it('returns unknown for empty or invalid input', () => {
+      expect(sanitizeRepoName('')).toBe('unknown');
+      expect(sanitizeRepoName('---')).toBe('unknown');
+    });
+  });
+
+  describe('parseRepoNameFromUrl', () => {
+    it('extracts and sanitizes name from HTTPS URL', () => {
+      expect(parseRepoNameFromUrl('https://github.com/user/my-repo.git')).toBe('my-repo');
+      expect(parseRepoNameFromUrl('https://github.com/user/--payload.git')).toBe('payload');
+    });
+
+    it('extracts and sanitizes name from SSH URL', () => {
+      expect(parseRepoNameFromUrl('git@github.com:user/my-repo.git')).toBe('my-repo');
+      expect(parseRepoNameFromUrl('git@github.com:--payload.git')).toBe('payload');
+    });
+
+    it('returns null for all-dash inputs (prevents registry collision)', () => {
+      expect(parseRepoNameFromUrl('https://github.com/user/---.git')).toBeNull();
+    });
+
+    it('returns null for empty URL', () => {
+      expect(parseRepoNameFromUrl('')).toBeNull();
+      expect(parseRepoNameFromUrl(null)).toBeNull();
     });
   });
 });

@@ -28,7 +28,7 @@ import { installGlobalStdoutSentinel } from './stdio-context.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 import { parseMaxTokens, truncateToTokenBudget } from '../cli/token-budget.js';
-import { defaultRepo, mcpReadOnlyMode, repoAllowed } from './config.js';
+import { defaultRepo, mcpReadOnlyMode, repoAllowed, validateMcpConfig } from './config.js';
 
 const MCP_READ_ONLY_TOOLS = new Set([
   'list_repos',
@@ -43,6 +43,13 @@ const MCP_QUERY_LIMIT_MAX = 20;
 const MCP_QUERY_SYMBOLS_MAX = 50;
 const MCP_IMPACT_DEPTH_MAX = 8;
 const MCP_IMPACT_TIMEOUT_MAX = 60_000;
+
+function clampPositiveInteger(raw: unknown, max: number): number | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) return undefined;
+  return Math.min(value, max);
+}
 
 function normalizeArgsForMcp(toolName: string, args: any): any {
   const normalized = { ...(args || {}) };
@@ -65,6 +72,10 @@ function normalizeArgsForMcp(toolName: string, args: any): any {
   return normalized;
 }
 
+function readOnlyResourceTemplateAllowed(uriTemplate: string): boolean {
+  return !mcpReadOnlyMode() || !uriTemplate.startsWith('gitnexus://group/');
+}
+
 function assertMcpReadOnlyResource(uri: string): void {
   if (!mcpReadOnlyMode()) return;
   const match = /^gitnexus:\/\/repo\/([^/]+)/u.exec(uri);
@@ -78,11 +89,25 @@ function assertMcpReadOnlyResource(uri: string): void {
   }
 }
 
-function clampPositiveInteger(raw: unknown, max: number): number | undefined {
-  if (raw === undefined || raw === null || raw === '') return undefined;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value <= 0) return undefined;
-  return Math.min(value, max);
+function scrubReadOnlyDescription(description: string): string {
+  return description
+    .replace(/\nGROUP MODE:[\s\S]*?(?=\n\n[A-Z][A-Z ]*:|$)/gu, '')
+    .replace(/\nSERVICE:[\s\S]*?(?=\n\n[A-Z][A-Z ]*:|$)/gu, '');
+}
+
+function scrubReadOnlyInputSchema<T>(inputSchema: T): T {
+  if (!inputSchema || typeof inputSchema !== 'object') return inputSchema;
+  const cloned = JSON.parse(JSON.stringify(inputSchema)) as any;
+  const properties = cloned.properties;
+  if (!properties || typeof properties !== 'object') return cloned;
+  if (properties.repo && typeof properties.repo.description === 'string') {
+    properties.repo.description =
+      'Indexed repository name or path. Group-mode repo values beginning with @ are unavailable in read-only MCP mode.';
+  }
+  delete properties.service;
+  delete properties.subgroup;
+  delete properties.crossDepth;
+  return cloned;
 }
 
 function toolForMcp(tool: (typeof GITNEXUS_TOOLS)[number]): (typeof GITNEXUS_TOOLS)[number] {
@@ -93,7 +118,8 @@ function toolForMcp(tool: (typeof GITNEXUS_TOOLS)[number]): (typeof GITNEXUS_TOO
     : 'This read-only MCP requires an explicit repo parameter when more than one repo is allowed.';
   return {
     ...tool,
-    description: `${tool.description}\n\nGITNEXUS MCP: ${repoText} Use maxTokens on query/context/impact for bounded retrieval slices.`,
+    description: `${scrubReadOnlyDescription(tool.description)}\n\nGITNEXUS MCP: ${repoText} Group mode is unavailable in read-only MCP mode. Use maxTokens on query/context/impact for bounded retrieval slices.`,
+    inputSchema: scrubReadOnlyInputSchema(tool.inputSchema),
   };
 }
 
@@ -120,7 +146,7 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
 
   switch (toolName) {
     case 'list_repos':
-      return `\n\n---\n**Next:** READ gitnexus://repo/{name}/context for any repo above to get its overview and check staleness.`;
+      return `\n\n---\n**Next:** READ gitnexus://repo/{name}/context for any repo above to get its overview and check staleness. If pagination.hasMore is true, call list_repos again with offset set to pagination.nextOffset to fetch the rest.`;
 
     case 'query':
       return `\n\n---\n**Next:** To understand a specific symbol in depth, use context({name: "<symbol_name>"${repoParam}}) to see categorized refs and process participation.`;
@@ -158,6 +184,7 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
  * Transport-agnostic — caller connects the desired transport.
  */
 export function createMCPServer(backend: LocalBackend): Server {
+  validateMcpConfig();
   const require = createRequire(import.meta.url);
   const pkgVersion: string = require('../../package.json').version;
   const server = new Server(
@@ -189,7 +216,9 @@ export function createMCPServer(backend: LocalBackend): Server {
 
   // Handle list resource templates request (for dynamic resources)
   server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-    const templates = getResourceTemplates();
+    const templates = getResourceTemplates().filter((template) =>
+      readOnlyResourceTemplateAllowed(template.uriTemplate),
+    );
     return {
       resourceTemplates: templates.map((t) => ({
         uriTemplate: t.uriTemplate,
@@ -365,6 +394,37 @@ Follow these steps:
 /**
  * Start the MCP server on stdio transport (for CLI use).
  */
+/** Force-exit fallback budget if graceful shutdown cleanup hangs. */
+const SHUTDOWN_FORCE_EXIT_MS = 5_000;
+
+/** Conventional 128 + signal-number exit codes for graceful termination. */
+export const SHUTDOWN_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 } as const;
+
+type SignalRegistrar = (
+  event: 'SIGINT' | 'SIGTERM',
+  listener: (...args: unknown[]) => void,
+) => void;
+
+/**
+ * Wire SIGINT/SIGTERM to a graceful shutdown using NUMERIC exit codes.
+ *
+ * Node invokes signal listeners with the signal NAME string as the first
+ * argument, so registering an `(exitCode = 0) => process.exit(exitCode)`
+ * shutdown directly passes `'SIGTERM'` into `process.exit()` and crashes with
+ * `ERR_INVALID_ARG_TYPE` (#1132). These wrappers discard the signal argument
+ * and pass the conventional 128+signal code instead. `on` is injectable so the
+ * mapping can be unit-tested without touching the real process.
+ */
+export function installSignalShutdown(
+  shutdown: (exitCode?: number) => unknown,
+  on: SignalRegistrar = (event, listener) => {
+    process.on(event, listener);
+  },
+): void {
+  on('SIGINT', () => void shutdown(SHUTDOWN_EXIT_CODES.SIGINT));
+  on('SIGTERM', () => void shutdown(SHUTDOWN_EXIT_CODES.SIGTERM));
+}
+
 export async function startMCPServer(backend: LocalBackend): Promise<void> {
   const server = createMCPServer(backend);
 
@@ -387,20 +447,17 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
     },
   });
   const transport = new CompatibleStdioServerTransport(process.stdin, safeStdout);
-  await server.connect(transport);
 
   // Orphan guard: if the client process that launched this stdio server dies,
-  // self-terminate. Independent of stdin-EOF / SIGTERM delivery (both proved
-  // unreliable when the parent is SIGKILLed, leaving the server spinning at
-  // ~18% CPU as a `ppid=1` orphan and OOMing the host). The interval is unref'd
-  // so it never keeps an otherwise-idle process alive; the MCP DB is opened
-  // read-only, so the hard exit below cannot corrupt anything.
+  // self-terminate. This is independent of stdin EOF / SIGTERM delivery, which
+  // can be missed when the parent is killed hard. The interval is unref'd so it
+  // never keeps an otherwise-idle MCP process alive.
   const launchedByPid = process.ppid;
   const orphanGuard = setInterval(() => {
     try {
-      process.kill(launchedByPid, 0); // signal 0 = liveness probe, delivers nothing
+      process.kill(launchedByPid, 0); // signal 0 = liveness probe, no signal delivered
     } catch {
-      process.exit(0); // ESRCH: launching client is gone -> exit now
+      process.exit(0);
     }
   }, 3000);
   orphanGuard.unref();
@@ -418,11 +475,11 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   const shutdown = async (exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    // Force-exit watchdog: never let a hung backend.disconnect()/server.close()
-    // keep the process alive (the original orphan-spin bug — SIGTERM appeared
-    // "ignored" because its handler awaited these). unref'd so it doesn't itself
-    // hold the event loop open.
-    setTimeout(() => process.exit(exitCode), 3000).unref();
+    // Safety net: if backend.disconnect()/server.close() hangs, still exit so a
+    // SIGINT/SIGTERM reliably terminates the process. Unref'd so the timer alone
+    // never keeps the event loop alive.
+    const forceExit = setTimeout(() => process.exit(exitCode), SHUTDOWN_FORCE_EXIT_MS);
+    forceExit.unref();
     try {
       await backend.disconnect();
     } catch {}
@@ -431,12 +488,16 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
     } catch {}
     const { flushLoggerSync } = await import('../core/logger.js');
     flushLoggerSync();
+    clearTimeout(forceExit);
     process.exit(exitCode);
   };
 
-  // Handle graceful shutdown
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  // Handle graceful shutdown. Node invokes signal listeners with the signal
+  // NAME (e.g. 'SIGTERM') as the first argument; registering `shutdown`
+  // directly passed that string to process.exit() and crashed with
+  // ERR_INVALID_ARG_TYPE (#1132). Map each signal to its conventional
+  // 128+signal exit code instead.
+  installSignalShutdown(shutdown);
 
   // Log crashes to stderr so they aren't silently lost.
   // uncaughtException is fatal — shut down.
@@ -444,14 +505,27 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   // killing the server for one missed catch would be worse than logging it.
   process.on('uncaughtException', (err) => {
     process.stderr.write(`GitNexus MCP uncaughtException: ${err?.stack || err}\n`);
-    shutdown(1);
+    void shutdown(1);
   });
   process.on('unhandledRejection', (reason: any) => {
     process.stderr.write(`GitNexus MCP unhandledRejection: ${reason?.stack || reason}\n`);
   });
 
-  // Handle stdio errors — stdin close means the parent process is gone
-  process.stdin.on('end', shutdown);
-  process.stdin.on('error', () => shutdown());
-  process.stdout.on('error', () => shutdown());
+  // Handle stdio errors — stdin close means the parent process is gone.
+  // Defense-in-depth: the transport also listens for stdin end/close and
+  // handles transport-level cleanup. These listeners handle process-level
+  // shutdown. Both paths are idempotent and safe to fire together.
+  // Wrap so the event payload (e.g. an Error for 'error') can never reach
+  // process.exit() as a non-numeric exit code, and void the returned promise.
+  process.stdin.on('end', () => void shutdown(0));
+  process.stdin.on('close', () => void shutdown(0));
+  process.stdin.on('error', () => void shutdown(0));
+  process.stdout.on('error', () => void shutdown(0));
+
+  if (process.stdin.readableEnded || process.stdin.destroyed) {
+    await shutdown(0);
+    return;
+  }
+
+  await server.connect(transport);
 }

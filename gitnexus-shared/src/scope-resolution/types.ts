@@ -267,8 +267,11 @@ export interface ScopeLookup {
 
 /** Call-site description passed to `arityCompatibility`. */
 export interface Callsite {
-  /** Number of arguments at the call site. */
-  readonly arity: number;
+  /** Number of arguments at the call site, if available. */
+  readonly arity?: number;
+  /** Inferred argument types at the call site, one per argument.
+   *  An empty string entry means the type was not inferred. */
+  readonly argumentTypes?: readonly string[];
 }
 
 // ─── §2.4 ImportEdge ────────────────────────────────────────────────────────
@@ -436,7 +439,7 @@ export interface Reference {
   readonly toDef: DefId;
   /** Location of the reference in source. */
   readonly atRange: Range;
-  readonly kind: 'call' | 'read' | 'write' | 'type-reference' | 'inherits' | 'import-use';
+  readonly kind: 'call' | 'read' | 'write' | 'type-reference' | 'inherits' | 'import-use' | 'macro';
   readonly confidence: number;
   readonly evidence: readonly ResolutionEvidence[];
 }

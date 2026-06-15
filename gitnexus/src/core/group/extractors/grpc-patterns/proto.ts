@@ -18,7 +18,8 @@ import type { GrpcDetection, GrpcLanguagePlugin } from './types.js';
  *
  * The grammar is vendored in `vendor/tree-sitter-proto/` with
  * parser.c regenerated against tree-sitter-cli 0.24 (ABI version 14)
- * so it is compatible with the project's tree-sitter 0.25 runtime.
+ * so it is compatible with the project's tree-sitter 0.21.1 runtime
+ * (which loads ABI 13–14).
  */
 
 const _require = createRequire(import.meta.url);
@@ -83,8 +84,7 @@ if (ProtoGrammar) {
 }
 
 function buildPlugin(): GrpcLanguagePlugin | null {
-  if (!ProtoGrammar || !PACKAGE_PATTERNS || !SERVICE_PATTERNS) return null;
-  const pkgPatterns = PACKAGE_PATTERNS;
+  if (!ProtoGrammar || !SERVICE_PATTERNS) return null;
   const svcPatterns = SERVICE_PATTERNS;
 
   return {
@@ -92,16 +92,6 @@ function buildPlugin(): GrpcLanguagePlugin | null {
     language: ProtoGrammar,
     scan(tree) {
       const out: GrpcDetection[] = [];
-
-      // Extract `package` declaration (first match wins).
-      let pkg = '';
-      for (const match of runCompiledPatterns(pkgPatterns, tree)) {
-        const pkgNode = match.captures.pkg;
-        if (pkgNode) {
-          pkg = pkgNode.text;
-          break;
-        }
-      }
 
       // Extract `service → rpc` pairs. The query returns one match per
       // (service, rpc) combination thanks to the nested structure.

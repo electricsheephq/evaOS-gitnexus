@@ -12,6 +12,7 @@
  * - shell injection: verifies no shell: true in spawnSync calls
  * - dispatch map: correct handler routing
  * - cross-platform: Windows .cmd extension handling
+ * - cross-platform: DB lock probe (Linux /proc, Unix lsof, Windows RM)
  *
  * Since the hooks are CJS scripts that call main() on load, we test them
  * by spawning them as child processes with controlled stdin JSON.
@@ -26,6 +27,24 @@ import { runHook, parseHookOutput } from '../utils/hook-test-helpers.js';
 // ─── Paths to both hook variants ────────────────────────────────────
 
 const CJS_HOOK = path.resolve(__dirname, '..', '..', 'hooks', 'claude', 'gitnexus-hook.cjs');
+const CJS_HOOK_LOCK = path.resolve(__dirname, '..', '..', 'hooks', 'claude', 'hook-lock.cjs');
+const RESOLVE_CJS = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  'hooks',
+  'claude',
+  'resolve-analyze-cmd.cjs',
+);
+const RESOLVE_PLUGIN_CJS = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  'gitnexus-claude-plugin',
+  'hooks',
+  'resolve-analyze-cmd.cjs',
+);
 const PLUGIN_HOOK = path.resolve(
   __dirname,
   '..',
@@ -34,6 +53,32 @@ const PLUGIN_HOOK = path.resolve(
   'gitnexus-claude-plugin',
   'hooks',
   'gitnexus-hook.js',
+);
+const PLUGIN_HOOK_LOCK = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  'gitnexus-claude-plugin',
+  'hooks',
+  'hook-lock.js',
+);
+const CJS_HOOK_DB_PROBE = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  'hooks',
+  'claude',
+  'hook-db-lock-probe.cjs',
+);
+const PLUGIN_HOOK_DB_PROBE = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  'gitnexus-claude-plugin',
+  'hooks',
+  'hook-db-lock-probe.cjs',
 );
 
 // ─── Test fixtures: temporary .gitnexus directory ───────────────────
@@ -66,6 +111,7 @@ function runGit(dir: string, args: string[]) {
     cwd: dir,
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
   });
   if (result.status !== 0) {
     const message = result.stderr || result.stdout || result.error?.message || 'unknown error';
@@ -99,6 +145,64 @@ function createGlobalRegistry(homeDir: string, marker: 'both' | 'registry' | 're
   }
 }
 
+function writeExecutable(filePath: string, content: string) {
+  fs.writeFileSync(filePath, content, { mode: 0o755 });
+}
+
+function createHookToolDir(options: {
+  gitnexusStderr?: string;
+  gitnexusMarkerPath?: string;
+  gitnexusSleepMs?: number;
+  lsofOutput?: string;
+  lsofOutputLines?: string[];
+  psOutput?: string;
+  psOutputByPid?: Record<string, string>;
+  lsofSleepMs?: number;
+}) {
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-hook-bin-'));
+  const gitnexusStderr = JSON.stringify(options.gitnexusStderr ?? '');
+  const markerPath = JSON.stringify(options.gitnexusMarkerPath ?? '');
+  const gitnexusSleepMs = Number(options.gitnexusSleepMs ?? 0);
+
+  const fakeGitNexus = `#!/usr/bin/env node\nconst fs = require('fs');\nconst marker = ${markerPath};\nif (marker) fs.appendFileSync(marker, 'called\\n');\nprocess.stderr.write(${gitnexusStderr});\nconst sleepMs = ${gitnexusSleepMs};\nif (sleepMs > 0) setTimeout(() => {}, sleepMs);\n`;
+  writeExecutable(path.join(binDir, 'gitnexus'), fakeGitNexus);
+  writeExecutable(path.join(binDir, 'gitnexus-cli.js'), fakeGitNexus);
+
+  const lsofOutput =
+    options.lsofOutputLines != null
+      ? options.lsofOutputLines.join('\n') + (options.lsofOutputLines.length ? '\n' : '')
+      : (options.lsofOutput ?? '');
+  const lsofBody =
+    options.lsofSleepMs != null
+      ? `#!/usr/bin/env node\nsetTimeout(() => {}, ${Number(options.lsofSleepMs)});\n`
+      : `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(lsofOutput)});\nprocess.exit(0);\n`;
+  writeExecutable(path.join(binDir, 'lsof'), lsofBody);
+
+  const psBody =
+    options.psOutputByPid != null
+      ? `#!/usr/bin/env node
+const byPid = ${JSON.stringify(options.psOutputByPid)};
+const args = process.argv;
+const p = args[args.indexOf('-p') + 1];
+process.stdout.write(byPid[p] ?? '');
+process.exit(0);
+`
+      : `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(options.psOutput ?? '')});\nprocess.exit(0);\n`;
+  writeExecutable(path.join(binDir, 'ps'), psBody);
+
+  return binDir;
+}
+
+function hookEnv(binDir: string) {
+  return {
+    ...process.env,
+    PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
+    GITNEXUS_HOOK_CLI_PATH: path.join(binDir, 'gitnexus-cli.js'),
+    GITNEXUS_HOOK_LSOF_PATH: path.join(binDir, 'lsof'),
+    GITNEXUS_HOOK_PS_PATH: path.join(binDir, 'ps'),
+  };
+}
+
 // ─── Both hook files should exist ───────────────────────────────────
 
 describe('Hook files exist', () => {
@@ -117,6 +221,8 @@ describe('Shell injection regression', () => {
   for (const [label, hookPath] of [
     ['CJS', CJS_HOOK],
     ['Plugin', PLUGIN_HOOK],
+    ['Resolve CJS', RESOLVE_CJS],
+    ['Resolve Plugin', RESOLVE_PLUGIN_CJS],
   ] as const) {
     it(`${label} hook has no shell: true in spawnSync calls`, () => {
       const source = fs.readFileSync(hookPath, 'utf-8');
@@ -132,6 +238,182 @@ describe('Shell injection regression', () => {
           throw new Error(`${label} hook line ${i + 1} has shell injection risk: ${line.trim()}`);
         }
       }
+    });
+  }
+});
+
+// ─── Source code regression: windowsHide:true on every spawn-family call ───
+
+/**
+ * Every ``spawn`` / ``spawnSync`` / ``execFile`` / ``execFileSync`` /
+ * ``execFileAsync`` / ``execSync`` call in the hook layer **and the
+ * core/CLI/MCP/server source tree** must pass ``windowsHide: true``
+ * in its options object. Without it, Node's ``child_process`` module
+ * asks ``CreateProcess`` to use ``STARTF_USESHOWWINDOW`` with
+ * ``SW_SHOWDEFAULT`` and a black console window flashes onto the
+ * user's desktop for each call. Under active Claude Code / MCP /
+ * gitnexus-serve use that's a near-continuous stream of pop-ups —
+ * unusable in practice on Windows.
+ *
+ * ``windowsHide`` is a no-op on POSIX (silently dropped), so the
+ * flag is safe to require unconditionally. ``stdio: 'inherit'``
+ * callers (interactive editors etc.) are unaffected — windowsHide
+ * only suppresses NEW console allocation; an inherited parent
+ * console isn't touched.
+ *
+ * The check is source-level rather than behavioural because:
+ *   - the flag's effect is observable only on Windows;
+ *   - GitHub Actions runs vitest on Linux for these tests;
+ *   - regressing this is easy (every new spawn site has to remember
+ *     the flag), and a runtime check on a Windows-only CI leg would
+ *     still let a PR land on the main branch first.
+ *
+ * The pre-existing fix at ``src/core/lbug/extension-loader.ts:96``
+ * established the convention. This test enforces it everywhere.
+ */
+describe('windowsHide regression', () => {
+  // Hook-layer files. Adding a new hook file MUST be reflected here.
+  const HOOK_FILES: Array<readonly [string, string]> = [
+    ['gitnexus/hooks/claude/gitnexus-hook.cjs', CJS_HOOK],
+    ['gitnexus/hooks/claude/resolve-analyze-cmd.cjs', RESOLVE_CJS],
+    ['gitnexus-claude-plugin/hooks/resolve-analyze-cmd.cjs', RESOLVE_PLUGIN_CJS],
+    [
+      'gitnexus/hooks/antigravity/gitnexus-antigravity-hook.cjs',
+      path.resolve(__dirname, '..', '..', 'hooks', 'antigravity', 'gitnexus-antigravity-hook.cjs'),
+    ],
+    [
+      'gitnexus/hooks/claude/hook-db-lock-probe.cjs',
+      path.resolve(__dirname, '..', '..', 'hooks', 'claude', 'hook-db-lock-probe.cjs'),
+    ],
+    ['gitnexus-claude-plugin/hooks/gitnexus-hook.js', PLUGIN_HOOK],
+    [
+      'gitnexus-claude-plugin/hooks/hook-db-lock-probe.cjs',
+      path.resolve(
+        __dirname,
+        '..',
+        '..',
+        '..',
+        'gitnexus-claude-plugin',
+        'hooks',
+        'hook-db-lock-probe.cjs',
+      ),
+    ],
+    [
+      'gitnexus-cursor-integration/hooks/gitnexus-hook.cjs',
+      path.resolve(
+        __dirname,
+        '..',
+        '..',
+        '..',
+        'gitnexus-cursor-integration',
+        'hooks',
+        'gitnexus-hook.cjs',
+      ),
+    ],
+  ];
+
+  // Source-tree files. Every file that imports a spawn-family
+  // function from ``child_process`` belongs here. Discovered via
+  //   grep -rn "from 'child_process'" -- gitnexus/src/
+  // plus the explicit ``await import('child_process')`` callers in
+  // local-backend.ts.
+  const SRC_FILES: Array<readonly [string, string]> = [
+    [
+      'gitnexus/src/cli/analyze.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'cli', 'analyze.ts'),
+    ],
+    ['gitnexus/src/cli/setup.ts', path.resolve(__dirname, '..', '..', 'src', 'cli', 'setup.ts')],
+    ['gitnexus/src/cli/wiki.ts', path.resolve(__dirname, '..', '..', 'src', 'cli', 'wiki.ts')],
+    [
+      'gitnexus/src/core/embeddings/embedder.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'core', 'embeddings', 'embedder.ts'),
+    ],
+    [
+      'gitnexus/src/core/git-staleness.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'core', 'git-staleness.ts'),
+    ],
+    [
+      'gitnexus/src/core/lbug/extension-loader.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'core', 'lbug', 'extension-loader.ts'),
+    ],
+    [
+      'gitnexus/src/core/run-analyze.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'core', 'run-analyze.ts'),
+    ],
+    [
+      'gitnexus/src/core/wiki/cursor-client.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'core', 'wiki', 'cursor-client.ts'),
+    ],
+    [
+      'gitnexus/src/core/wiki/generator.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'core', 'wiki', 'generator.ts'),
+    ],
+    [
+      'gitnexus/src/mcp/local/local-backend.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'mcp', 'local', 'local-backend.ts'),
+    ],
+    [
+      'gitnexus/src/server/git-clone.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'server', 'git-clone.ts'),
+    ],
+    // New post-upstream-merge (May 2026 sync):
+    [
+      'gitnexus/src/storage/git.ts',
+      path.resolve(__dirname, '..', '..', 'src', 'storage', 'git.ts'),
+    ],
+  ];
+
+  /**
+   * Strip pure-comment lines so prose mentions of ``spawn`` /
+   * ``exec`` don't inflate the call count.
+   */
+  function stripComments(source: string): string {
+    return source
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim();
+        return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*');
+      })
+      .join('\n');
+  }
+
+  /**
+   * Count spawn-family invocations. The regex matches ``spawn(``,
+   * ``spawnSync(``, ``execFile(``, ``execFileSync(``,
+   * ``execFileAsync(``, ``execSync(`` as function calls — not
+   * destructures (``const { spawn } = ...``), not method calls
+   * (``.exec(``), not bare ``exec()`` (which collides with regex
+   * ``.exec()``; we explicitly drop it).
+   */
+  function countSpawnCalls(codeSource: string): number {
+    const re =
+      /(^|[^a-zA-Z0-9_$.])(spawn|spawnSync|execFile|execFileSync|execFileAsync|execSync)\s*\(/gm;
+    let count = 0;
+    while (re.exec(codeSource) !== null) {
+      count++;
+    }
+    return count;
+  }
+
+  for (const [label, file] of [...HOOK_FILES, ...SRC_FILES]) {
+    it(`${label}: every spawn-family options object contains windowsHide: true`, () => {
+      // The file must exist — silent-skip would mask a deletion.
+      expect(fs.existsSync(file)).toBe(true);
+      const source = fs.readFileSync(file, 'utf-8');
+      const codeSource = stripComments(source);
+
+      const spawnCount = countSpawnCalls(codeSource);
+      const hideCount = (codeSource.match(/windowsHide\s*:\s*true/g) ?? []).length;
+
+      // Sanity: catch a refactor that accidentally deletes every
+      // spawn call (which would otherwise make the equality below
+      // trivially true at 0 == 0).
+      expect(spawnCount).toBeGreaterThan(0);
+      // One windowsHide per spawn-family call. We don't try to
+      // match brace structure — a same-count proxy is sufficient
+      // because every spawn site in these files passes an options
+      // object literal (no helper indirection).
+      expect(hideCount).toBe(spawnCount);
     });
   }
 });
@@ -260,8 +542,6 @@ describe('extractPattern coverage', () => {
 // ─── PostToolUse: git mutation regex coverage ───────────────────────
 
 describe('Git mutation regex', () => {
-  const GIT_REGEX = /\\bgit\\s\+\(commit\|merge\|rebase\|cherry-pick\|pull\)/;
-
   for (const [label, hookPath] of [
     ['CJS', CJS_HOOK],
     ['Plugin', PLUGIN_HOOK],
@@ -293,6 +573,723 @@ describe('Git mutation regex', () => {
     });
   }
 });
+
+// ─── Source code regression: PreToolUse concurrency guard (#1486) ──
+
+describe('PreToolUse concurrency guard', () => {
+  for (const [label, hookPath, lockPath] of [
+    ['CJS', CJS_HOOK, CJS_HOOK_LOCK],
+    ['Plugin', PLUGIN_HOOK, PLUGIN_HOOK_LOCK],
+  ] as const) {
+    it(`${label} hook loads acquireHookSlot helper`, () => {
+      const source = fs.readFileSync(hookPath, 'utf-8');
+      expect(source).toContain('acquireHookSlot');
+      expect(source).toContain('hook-lock');
+    });
+
+    it(`${label} helper defines acquireHookSlot`, () => {
+      const source = fs.readFileSync(lockPath, 'utf-8');
+      expect(source).toContain('function acquireHookSlot');
+      expect(source).toContain('HOOK_LOCK_MAX_INFLIGHT');
+    });
+
+    it(`${label} hook calls acquireHookSlot in handlePreToolUse`, () => {
+      const source = fs.readFileSync(hookPath, 'utf-8');
+      const preBody = source.slice(
+        source.indexOf('function handlePreToolUse'),
+        source.indexOf('function handlePostToolUse'),
+      );
+      expect(preBody).toContain('acquireHookSlot(');
+      expect(preBody).toMatch(/release\(\)/);
+    });
+
+    it(`${label} hook uses atomic fixed-name slot files (hard cap)`, () => {
+      // Regression for the TOCTOU soft-cap: an earlier revision counted
+      // entries then wrote a per-pid lock, which let simultaneous bursts
+      // exceed MAX_INFLIGHT. The hard-cap version writes to fixed-name
+      // slot-N.lock paths so O_CREAT|O_EXCL is atomic across processes.
+      const source = fs.readFileSync(lockPath, 'utf-8');
+      expect(source).toMatch(/slot-\$\{slot\}\.lock|`slot-/);
+      // And no longer reads the lock dir to count active hooks.
+      const slotFn = source.slice(
+        source.indexOf('function acquireHookSlot'),
+        source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
+      );
+      expect(slotFn).not.toContain('readdirSync');
+    });
+
+    it(`${label} hook fails closed when lock dir cannot be created`, () => {
+      // Regression: an earlier revision returned `() => {}` (truthy no-op) on
+      // mkdirSync failure, which left callers — `if (!release) return;` — to
+      // proceed unguarded and reintroduce the #1486 fan-out on read-only or
+      // cross-user `.gitnexus/` setups. The guard must fail closed (null).
+      const source = fs.readFileSync(lockPath, 'utf-8');
+      const slotFn = source.slice(
+        source.indexOf('function acquireHookSlot'),
+        source.indexOf('function', source.indexOf('function acquireHookSlot') + 1),
+      );
+      const mkdirCatch = slotFn.slice(
+        slotFn.indexOf('fs.mkdirSync(lockDir'),
+        slotFn.indexOf('const myPidStr'),
+      );
+      expect(mkdirCatch).toContain('return null');
+      expect(mkdirCatch).not.toMatch(/return\s*\(\s*\)\s*=>\s*\{\s*\}/);
+    });
+  }
+});
+
+// ─── Integration: concurrency guard skips when slots are full ──────
+
+describe('PreToolUse concurrency guard (integration)', () => {
+  for (const [label, hookPath] of [
+    ['CJS', CJS_HOOK],
+    ['Plugin', PLUGIN_HOOK],
+  ] as const) {
+    it(`${label}: hook exits silently when all MAX_INFLIGHT slots hold live pids`, async () => {
+      const { spawn } = await import('child_process');
+      const lockDir = path.join(gitNexusDir, '.hook-locks');
+      fs.mkdirSync(lockDir, { recursive: true });
+
+      // Spawn 3 long-sleeping node child processes to use as live PIDs.
+      const sleepers = [0, 1, 2].map(() =>
+        spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], {
+          stdio: 'ignore',
+          detached: false,
+        }),
+      );
+      const writtenLocks: string[] = [];
+      try {
+        for (let i = 0; i < sleepers.length; i++) {
+          // Slot files are named slot-N.lock; content is the owning PID.
+          const p = path.join(lockDir, `slot-${i}.lock`);
+          fs.writeFileSync(p, String(sleepers[i].pid));
+          writtenLocks.push(p);
+        }
+
+        const result = runHook(hookPath, {
+          hook_event_name: 'PreToolUse',
+          tool_name: 'Grep',
+          tool_input: { pattern: 'validateUser' },
+          cwd: tmpDir,
+        });
+
+        expect(result.stdout.trim()).toBe('');
+        // Sentinel slot files survive; the hook bailed before claiming any of them.
+        for (let i = 0; i < sleepers.length; i++) {
+          const p = path.join(lockDir, `slot-${i}.lock`);
+          expect(fs.existsSync(p)).toBe(true);
+          // Owner unchanged.
+          expect(fs.readFileSync(p, 'utf-8').trim()).toBe(String(sleepers[i].pid));
+        }
+      } finally {
+        for (const child of sleepers) {
+          try {
+            child.kill();
+          } catch {
+            /* ignore */
+          }
+        }
+        for (const p of writtenLocks) {
+          try {
+            fs.unlinkSync(p);
+          } catch {
+            /* ignore */
+          }
+        }
+        try {
+          fs.rmdirSync(lockDir);
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+
+    it(`${label}: hook reclaims a slot held by a dead pid`, () => {
+      const lockDir = path.join(gitNexusDir, '.hook-locks');
+      fs.mkdirSync(lockDir, { recursive: true });
+      // PID 1 exists on every POSIX system (init); on Windows process.kill(1,0)
+      // throws. Use a definitely-dead PID instead: a very large number unlikely
+      // to be assigned.
+      const deadPid = 2_147_483_640;
+      const stalePath = path.join(lockDir, 'slot-0.lock');
+      try {
+        fs.writeFileSync(stalePath, String(deadPid));
+        expect(fs.readFileSync(stalePath, 'utf-8').trim()).toBe(String(deadPid));
+
+        runHook(hookPath, {
+          hook_event_name: 'PreToolUse',
+          tool_name: 'Grep',
+          tool_input: { pattern: 'validateUser' },
+          cwd: tmpDir,
+        });
+
+        // The hook reclaimed and then released slot-0 — either the file is
+        // gone (released) or its content is something other than the dead PID.
+        if (fs.existsSync(stalePath)) {
+          expect(fs.readFileSync(stalePath, 'utf-8').trim()).not.toBe(String(deadPid));
+        }
+      } finally {
+        try {
+          fs.unlinkSync(stalePath);
+        } catch {
+          /* already pruned */
+        }
+        try {
+          fs.rmdirSync(lockDir);
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+
+    it(`${label}: hook does not exceed MAX_INFLIGHT under simultaneous bursts (hard cap)`, async () => {
+      // Spawn many real hook processes concurrently and assert that at most
+      // MAX_INFLIGHT (3) slot files end up populated by live pids while the
+      // slow fake gitnexus CLI keeps winning hooks alive.
+      const { spawn } = await import('child_process');
+      const lockDir = path.join(gitNexusDir, '.hook-locks');
+      fs.rmSync(lockDir, { recursive: true, force: true });
+
+      const N = 10;
+      const markerPath = path.join(os.tmpdir(), `gitnexus-hook-cap-${process.pid}-${label}`);
+      fs.rmSync(markerPath, { force: true });
+      const binDir = createHookToolDir({ gitnexusMarkerPath: markerPath, gitnexusSleepMs: 250 });
+      const hookInput = JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Grep',
+        tool_input: { pattern: 'validateUser' },
+        cwd: tmpDir,
+      });
+      const claimers = Array.from({ length: N }, () =>
+        // Test-only: CodeQL treats the temp marker/lock interaction as a
+        // file-race sink, but this process is deliberately exercising the
+        // hook's concurrent lock cap against an isolated mkdtemp fixture.
+        // codeql[js/file-system-race]
+        spawn(process.execPath, [hookPath], {
+          cwd: tmpDir,
+          env: hookEnv(binDir),
+          stdio: ['pipe', 'pipe', 'pipe'],
+          detached: false,
+        }),
+      );
+      try {
+        for (const c of claimers) {
+          c.stdin.end(hookInput);
+        }
+
+        await Promise.all(
+          claimers.map(
+            (c) =>
+              new Promise<void>((resolve) => {
+                if (c.exitCode !== null || c.signalCode !== null) {
+                  resolve();
+                  return;
+                }
+                const done = () => {
+                  clearTimeout(timeout);
+                  resolve();
+                };
+                const timeout = setTimeout(resolve, 3000);
+                c.once('exit', done);
+              }),
+          ),
+        );
+
+        // HARD CAP: never more than 3 hooks reach the augment CLI, regardless
+        // of how many burst concurrently.
+        const calls = fs.existsSync(markerPath)
+          ? fs.readFileSync(markerPath, 'utf-8').trim().split('\n').filter(Boolean)
+          : [];
+        expect(calls.length).toBeGreaterThan(0);
+        expect(calls.length).toBeLessThanOrEqual(3);
+      } finally {
+        for (const c of claimers) {
+          try {
+            c.kill();
+          } catch {
+            /* ignore */
+          }
+        }
+        await Promise.all(
+          claimers.map(
+            (c) =>
+              new Promise<void>((resolve) => {
+                if (c.exitCode !== null || c.signalCode !== null) {
+                  resolve();
+                  return;
+                }
+                const done = () => {
+                  clearTimeout(timeout);
+                  resolve();
+                };
+                const timeout = setTimeout(resolve, 500);
+                c.once('exit', done);
+              }),
+          ),
+        );
+        fs.rmSync(markerPath, { force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+// ─── Source: cross-platform DB lock probe module (#1493) ─────────────
+
+describe('Cross-platform DB lock probe (source)', () => {
+  for (const [label, hookPath, probePath] of [
+    ['CJS', CJS_HOOK, CJS_HOOK_DB_PROBE],
+    ['Plugin', PLUGIN_HOOK, PLUGIN_HOOK_DB_PROBE],
+  ] as const) {
+    it(`${label} probe file exists`, () => {
+      expect(fs.existsSync(probePath)).toBe(true);
+    });
+
+    it(`${label} hook requires hook-db-lock-probe.cjs`, () => {
+      const source = fs.readFileSync(hookPath, 'utf-8');
+      expect(source).toContain("require('./hook-db-lock-probe.cjs')");
+    });
+
+    it(`${label} probe covers Linux /proc, Unix lsof, and Windows Restart Manager`, () => {
+      const p = fs.readFileSync(probePath, 'utf-8');
+      expect(p).toContain('win-rm-list-json.ps1');
+      expect(p).toContain('/proc/');
+      expect(p).toContain('linuxProcScanFindGitNexusServer');
+      expect(p).toContain('unixLsofPsFindGitNexusServer');
+      expect(p).toContain('hasGitNexusServerOwnerWindows');
+      expect(p).toContain('GITNEXUS_HOOK_LSOF_PATH');
+      expect(p).toContain('GITNEXUS_HOOK_POWERSHELL_PATH');
+      expect(p).toContain('GITNEXUS_HOOK_LINUX_PROC_BUDGET_MS');
+    });
+  }
+});
+
+// ─── Integration: PreToolUse augmentation filtering (#1492) ─────────
+
+describe('PreToolUse augmentation filtering (integration)', () => {
+  for (const [label, hookPath] of [
+    ['CJS', CJS_HOOK],
+    ['Plugin', PLUGIN_HOOK],
+  ] as const) {
+    it(`${label}: emits valid GitNexus augmentation context`, () => {
+      const binDir = createHookToolDir({
+        gitnexusStderr: '[GitNexus] 1 related symbol found:\n\nvalidateUser (src/auth.ts)\n',
+      });
+      try {
+        const result = runHook(
+          hookPath,
+          {
+            hook_event_name: 'PreToolUse',
+            tool_name: 'Grep',
+            tool_input: { pattern: 'validateUser' },
+            cwd: tmpDir,
+          },
+          undefined,
+          { env: hookEnv(binDir) },
+        );
+
+        const output = parseHookOutput(result.stdout);
+        expect(output).not.toBeNull();
+        expect(output!.hookEventName).toBe('PreToolUse');
+        expect(output!.additionalContext).toContain('[GitNexus] 1 related symbol found');
+      } finally {
+        fs.rmSync(binDir, { recursive: true, force: true });
+      }
+    });
+
+    it(`${label}: suppresses LadybugDB lock warnings from augment stderr`, () => {
+      const markerPath = path.join(os.tmpdir(), 'gn-hook-lockwarn-' + process.pid + '-' + label);
+      fs.rmSync(markerPath, { force: true });
+      const binDir = createHookToolDir({
+        gitnexusMarkerPath: markerPath,
+        gitnexusStderr:
+          'GitNexus: FTS extension load failed: IO exception: Could not set lock on file : /tmp/repo/.gitnexus/lbug\n',
+      });
+      try {
+        const result = runHook(
+          hookPath,
+          {
+            hook_event_name: 'PreToolUse',
+            tool_name: 'Grep',
+            tool_input: { pattern: 'validateUser' },
+            cwd: tmpDir,
+          },
+          undefined,
+          { env: hookEnv(binDir) },
+        );
+
+        expect(result.stdout.trim()).toBe('');
+        expect(fs.existsSync(markerPath)).toBe(true);
+
+        // Finding #18: when GITNEXUS_DEBUG=1 is set, the discarded prefix is
+        // recoverable on the hook's stderr (not silently dropped).
+        const debugResult = runHook(
+          hookPath,
+          {
+            hook_event_name: 'PreToolUse',
+            tool_name: 'Grep',
+            tool_input: { pattern: 'validateUser' },
+            cwd: tmpDir,
+          },
+          undefined,
+          { env: { ...hookEnv(binDir), GITNEXUS_DEBUG: '1' } },
+        );
+        expect(debugResult.stderr).toContain('augment stderr discarded prefix');
+        expect(debugResult.stderr).toContain('Could not set lock on file');
+      } finally {
+        fs.rmSync(markerPath, { force: true });
+        fs.rmSync(binDir, { recursive: true, force: true });
+      }
+    });
+
+    it.skipIf(process.platform === 'win32')(
+      `${label}: skips augment when a GitNexus MCP process owns the repo DB`,
+      () => {
+        const markerPath = path.join(os.tmpdir(), `gitnexus-hook-called-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          lsofOutput: '12345\n',
+          psOutput: 'node /tmp/node_modules/.bin/gitnexus mcp\n',
+        });
+        try {
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env: hookEnv(binDir) },
+          );
+
+          expect(result.stdout.trim()).toBe('');
+          expect(result.status).toBe(0);
+          expect(result.stderr).toContain('[GitNexus] augment skipped');
+          expect(fs.existsSync(markerPath)).toBe(false);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      },
+    );
+  }
+});
+
+describe.skipIf(process.platform === 'win32')(
+  'Ladybug DB owner guard — production-shaped ps + failure modes (#1493)',
+  () => {
+    for (const [label, hookPath] of [
+      ['CJS', CJS_HOOK],
+      ['Plugin', PLUGIN_HOOK],
+    ] as const) {
+      it(`${label}: skips augment for real node_modules/gitnexus ps line (npx child)`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-prodps-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          lsofOutput: '99901\n',
+          psOutput: 'node /tmp/node_modules/gitnexus/dist/cli/index.js mcp\n',
+        });
+        try {
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env: hookEnv(binDir) },
+          );
+          expect(result.stdout.trim()).toBe('');
+          expect(result.status).toBe(0);
+          expect(result.stderr).toContain('[GitNexus] augment skipped');
+          expect(fs.existsSync(markerPath)).toBe(false);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+
+      it(`${label}: npx parent command line is NOT treated as GitNexus server owner`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-npx-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          gitnexusStderr: '[GitNexus] 1 related symbol found:\n\nvalidateUser (src/auth.ts)\n',
+          lsofOutput: '99902\n',
+          psOutput: 'npx -y gitnexus@latest mcp\n',
+        });
+        try {
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env: hookEnv(binDir) },
+          );
+          const output = parseHookOutput(result.stdout);
+          expect(output).not.toBeNull();
+          expect(fs.existsSync(markerPath)).toBe(true);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+
+      it(`${label}: skips augment for gitnexus serve child`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-serve-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          lsofOutput: '99903\n',
+          psOutput: 'node /repo/node_modules/gitnexus/dist/cli/index.js serve\n',
+        });
+        try {
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env: hookEnv(binDir) },
+          );
+          expect(result.stdout.trim()).toBe('');
+          expect(result.status).toBe(0);
+          expect(result.stderr).toContain('[GitNexus] augment skipped');
+          expect(fs.existsSync(markerPath)).toBe(false);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+
+      it(`${label}: skips augment for gitnexus eval-server child`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-eval-server-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          lsofOutput: '99904\n',
+          psOutput: 'node /repo/node_modules/gitnexus/dist/cli/index.js eval-server\n',
+        });
+        try {
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env: hookEnv(binDir) },
+          );
+          expect(result.stdout.trim()).toBe('');
+          expect(result.status).toBe(0);
+          expect(result.stderr).toContain('[GitNexus] augment skipped');
+          expect(fs.existsSync(markerPath)).toBe(false);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+
+      it(`${label}: ENOENT lsof → augment still runs (fail-open)`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-enoent-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          gitnexusStderr: '[GitNexus] 1 related symbol found:\n\nvalidateUser (src/auth.ts)\n',
+          lsofOutput: '',
+          psOutput: '',
+        });
+        try {
+          const env = {
+            ...hookEnv(binDir),
+            GITNEXUS_HOOK_LSOF_PATH: path.join(binDir, '__missing_lsof__'),
+          };
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env },
+          );
+          const output = parseHookOutput(result.stdout);
+          expect(output).not.toBeNull();
+          expect(fs.existsSync(markerPath)).toBe(true);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+
+      it(`${label}: ETIMEDOUT lsof → augment skipped (fail-closed)`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-etime-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          lsofSleepMs: 5000,
+          psOutput: '',
+        });
+        try {
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env: hookEnv(binDir) },
+          );
+          expect(result.stdout.trim()).toBe('');
+          expect(result.status).toBe(0);
+          expect(result.stderr).toContain('[GitNexus] augment skipped');
+          expect(fs.existsSync(markerPath)).toBe(false);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+
+      it(`${label}: non-GitNexus ps line → augment runs`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-other-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          gitnexusStderr: '[GitNexus] 1 related symbol found:\n\nvalidateUser (src/auth.ts)\n',
+          lsofOutput: '99904\n',
+          psOutput: '/usr/bin/bash -l\n',
+        });
+        try {
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env: hookEnv(binDir) },
+          );
+          const output = parseHookOutput(result.stdout);
+          expect(output).not.toBeNull();
+          expect(fs.existsSync(markerPath)).toBe(true);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+
+      it(`${label}: multiple PIDs — skip if any ps line is GitNexus MCP`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-multi-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          gitnexusStderr: '[GitNexus] 1 related symbol found:\n\nvalidateUser (src/auth.ts)\n',
+          lsofOutputLines: ['111', '222'],
+          psOutputByPid: {
+            '111': 'vim /tmp/x\n',
+            '222': 'node /x/node_modules/gitnexus/dist/cli/index.js mcp\n',
+          },
+        });
+        try {
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env: hookEnv(binDir) },
+          );
+          expect(result.stdout.trim()).toBe('');
+          expect(result.status).toBe(0);
+          expect(result.stderr).toContain('[GitNexus] augment skipped');
+          expect(fs.existsSync(markerPath)).toBe(false);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+
+      it(`${label}: ps ENOENT → augment runs (ignore that PID)`, () => {
+        const markerPath = path.join(os.tmpdir(), `gn-hook-pseno-${process.pid}-${label}`);
+        const lbugPath = path.join(gitNexusDir, 'lbug');
+        fs.writeFileSync(lbugPath, '');
+        fs.rmSync(markerPath, { force: true });
+        const binDir = createHookToolDir({
+          gitnexusMarkerPath: markerPath,
+          gitnexusStderr: '[GitNexus] 1 related symbol found:\n\nvalidateUser (src/auth.ts)\n',
+          lsofOutput: '99905\n',
+          psOutput: '',
+        });
+        try {
+          const env = {
+            ...hookEnv(binDir),
+            GITNEXUS_HOOK_PS_PATH: path.join(binDir, '__missing_ps__'),
+          };
+          const result = runHook(
+            hookPath,
+            {
+              hook_event_name: 'PreToolUse',
+              tool_name: 'Grep',
+              tool_input: { pattern: 'validateUser' },
+              cwd: tmpDir,
+            },
+            undefined,
+            { env },
+          );
+          const output = parseHookOutput(result.stdout);
+          expect(output).not.toBeNull();
+          expect(fs.existsSync(markerPath)).toBe(true);
+        } finally {
+          fs.rmSync(markerPath, { force: true });
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+    }
+  },
+);
 
 // ─── Integration: PostToolUse staleness detection ───────────────────
 
@@ -747,8 +1744,18 @@ describe('PostToolUse with missing/corrupt meta.json', () => {
   ] as const) {
     it(`${label}: emits stale when meta.json does not exist`, () => {
       const metaPath = path.join(gitNexusDir, 'meta.json');
-      const hadMeta = fs.existsSync(metaPath);
-      if (hadMeta) fs.unlinkSync(metaPath);
+      let originalMeta: string | null = null;
+      try {
+        originalMeta = fs.readFileSync(metaPath, 'utf-8');
+      } catch {
+        originalMeta = null;
+      }
+
+      try {
+        fs.unlinkSync(metaPath);
+      } catch {
+        // Missing is the intended test state.
+      }
 
       try {
         const result = runHook(hookPath, {
@@ -763,8 +1770,9 @@ describe('PostToolUse with missing/corrupt meta.json', () => {
         expect(output).not.toBeNull();
         expect(output!.additionalContext).toContain('never');
       } finally {
-        // Restore meta.json for subsequent tests
-        fs.writeFileSync(metaPath, JSON.stringify({ lastCommit: 'old', stats: {} }));
+        if (originalMeta !== null) {
+          fs.writeFileSync(metaPath, originalMeta);
+        }
       }
     });
 

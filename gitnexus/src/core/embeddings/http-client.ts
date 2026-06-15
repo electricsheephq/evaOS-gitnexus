@@ -40,8 +40,11 @@ const readConfig = (): HttpConfig | null => {
   const rawDims = process.env.GITNEXUS_EMBEDDING_DIMS;
   let dimensions: number | undefined;
   if (rawDims !== undefined) {
+    if (!/^\d+$/.test(rawDims)) {
+      throw new Error(`GITNEXUS_EMBEDDING_DIMS must be a positive integer, got "${rawDims}"`);
+    }
     const parsed = parseInt(rawDims, 10);
-    if (Number.isNaN(parsed) || parsed <= 0) {
+    if (parsed <= 0) {
       throw new Error(`GITNEXUS_EMBEDDING_DIMS must be a positive integer, got "${rawDims}"`);
     }
     dimensions = parsed;
@@ -59,6 +62,17 @@ const readConfig = (): HttpConfig | null => {
  * Check whether HTTP embedding mode is active (env vars are set).
  */
 export const isHttpMode = (): boolean => readConfig() !== null;
+
+export const isVoyageHttpMode = (): boolean => {
+  const config = readConfig();
+  if (!config) return false;
+  try {
+    const host = new URL(config.baseUrl).hostname.toLowerCase();
+    return host === 'voyageai.com' || host.endsWith('.voyageai.com');
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Return the configured embedding dimensions for HTTP mode, or undefined
@@ -90,22 +104,28 @@ interface EmbeddingItem {
  * @param batch - Texts to embed
  * @param model - Model name for the request body
  * @param apiKey - Bearer token (only used in Authorization header)
+ * @param batchIndex - Logical batch number (for error context)
  * @param dimensions - Optional output-vector size. When provided, sent as
  *   the appropriate Matryoshka field for the host:
- *     - `dimensions` for OpenAI text-embedding-3-* / Cohere embed-v3 /
- *       OpenAI-compatible endpoints
+ *     - `dimensions` for OpenAI-compatible endpoints
  *     - `output_dimension` for Voyage (voyageai.com)
- * @param batchIndex - Logical batch number (for error context)
+ *   Leave `GITNEXUS_EMBEDDING_DIMS` unset for strict backends that reject
+ *   unknown fields.
  */
 const httpEmbedBatch = async (
   url: string,
   batch: string[],
   model: string,
   apiKey: string,
-  dimensions: number | undefined,
   batchIndex = 0,
+  dimensions?: number,
 ): Promise<EmbeddingItem[]> => {
-  const body: { input: string[]; model: string; dimensions?: number; output_dimension?: number } = {
+  const requestBody: {
+    input: string[];
+    model: string;
+    dimensions?: number;
+    output_dimension?: number;
+  } = {
     input: batch,
     model,
   };
@@ -118,9 +138,9 @@ const httpEmbedBatch = async (
     }
     const isVoyageHost = host === 'voyageai.com' || host.endsWith('.voyageai.com');
     if (isVoyageHost) {
-      body.output_dimension = dimensions;
+      requestBody.output_dimension = dimensions;
     } else {
-      body.dimensions = dimensions;
+      requestBody.dimensions = dimensions;
     }
   }
 
@@ -135,7 +155,7 @@ const httpEmbedBatch = async (
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify(requestBody),
       },
       {
         breakerKey: HTTP_BREAKER_KEY,
@@ -198,8 +218,8 @@ export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
       batch,
       config.model,
       config.apiKey,
-      config.dimensions,
       batchIndex,
+      config.dimensions,
     );
 
     if (items.length !== batch.length) {
@@ -243,7 +263,14 @@ export const httpEmbedQuery = async (text: string): Promise<number[]> => {
   if (!config) throw new Error('HTTP embedding not configured');
 
   const url = `${config.baseUrl}/embeddings`;
-  const items = await httpEmbedBatch(url, [text], config.model, config.apiKey, config.dimensions);
+  const items = await httpEmbedBatch(
+    url,
+    [text],
+    config.model,
+    config.apiKey,
+    0,
+    config.dimensions,
+  );
   if (!items.length) {
     throw new Error(`Embedding endpoint returned empty response (${safeUrl(url)})`);
   }

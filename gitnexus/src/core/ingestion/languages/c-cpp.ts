@@ -44,8 +44,28 @@ import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { cVariableConfig, cppVariableConfig } from '../variable-extractors/configs/c-cpp.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { cCallConfig, cppCallConfig } from '../call-extractors/configs/c-cpp.js';
-import { createHeritageExtractor } from '../heritage-extractors/generic.js';
 import { stripUeMacros } from '../cpp-ue-preprocessor.js';
+import {
+  emitCScopeCaptures,
+  interpretCImport,
+  interpretCTypeBinding,
+  cArityCompatibility,
+  cBindingScopeFor,
+  cImportOwningScope,
+  cReceiverBinding,
+  collectCStaticLinkageSideChannel,
+} from './c/index.js';
+import {
+  emitCppScopeCaptures,
+  interpretCppImport,
+  interpretCppTypeBinding,
+  cppArityCompatibility,
+  cppBindingScopeFor,
+  cppImportOwningScope,
+  cppReceiverBinding,
+  collectCppCaptureSideChannel,
+} from './cpp/index.js';
+import { extractCppTemplateConstraints } from './cpp/constraint-extractor.js';
 
 const C_BUILT_INS: ReadonlySet<string> = new Set([
   'printf',
@@ -212,6 +232,7 @@ const cCppExtractFunctionName = (
           c?.type === 'qualified_identifier' ||
           c?.type === 'identifier' ||
           c?.type === 'field_identifier' ||
+          c?.type === 'operator_name' ||
           c?.type === 'parenthesized_declarator'
         ) {
           innerDeclarator = c;
@@ -225,7 +246,7 @@ const cCppExtractFunctionName = (
       if (!nameNode) {
         for (let i = 0; i < innerDeclarator.childCount; i++) {
           const c = innerDeclarator.child(i);
-          if (c?.type === 'identifier') {
+          if (c?.type === 'identifier' || c?.type === 'operator_name') {
             nameNode = c;
             break;
           }
@@ -237,7 +258,8 @@ const cCppExtractFunctionName = (
       }
     } else if (
       innerDeclarator?.type === 'identifier' ||
-      innerDeclarator?.type === 'field_identifier'
+      innerDeclarator?.type === 'field_identifier' ||
+      innerDeclarator?.type === 'operator_name'
     ) {
       // field_identifier is used for method names inside C++ class bodies
       funcName = innerDeclarator.text;
@@ -256,7 +278,7 @@ const cCppExtractFunctionName = (
         if (!nameNode) {
           for (let i = 0; i < nestedId.childCount; i++) {
             const c = nestedId.child(i);
-            if (c?.type === 'identifier') {
+            if (c?.type === 'identifier' || c?.type === 'operator_name') {
               nameNode = c;
               break;
             }
@@ -294,12 +316,19 @@ const cCppExtractFunctionName = (
   return { funcName, label };
 };
 
-/** Check if a C/C++ function_definition is inside a class or struct body.
+/** Check if a C/C++ function_definition is inside a class or struct body
+ *  (and NOT a friend declaration).
  *  Used by cppLabelOverride to skip duplicate function captures
- *  that are already covered by definition.method queries. */
+ *  that are already covered by definition.method queries.
+ *  Friend functions are free functions defined inside class bodies —
+ *  they must NOT be skipped (ISO C++ hidden-friend idiom). */
 function isCppInsideClassOrStruct(functionNode: SyntaxNode): boolean {
   let ancestor: SyntaxNode | null = functionNode?.parent ?? null;
   while (ancestor) {
+    // Friend declarations: the function_definition is wrapped in
+    // `friend_declaration` → `field_declaration_list` → class_specifier.
+    // These are free functions, not methods — don't skip them.
+    if (ancestor.type === 'friend_declaration') return false;
     if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') return true;
     ancestor = ancestor.parent;
   }
@@ -355,7 +384,6 @@ export const cProvider = defineLanguage({
   typeConfig: cCppConfig,
   exportChecker: cCppExportChecker,
   importResolver: createImportResolver(cImportConfig),
-  importSemantics: 'wildcard-transitive',
   callExtractor: createCallExtractor(cCallConfig),
   fieldExtractor: createFieldExtractor(cFieldConfig),
   methodExtractor: createMethodExtractor({
@@ -364,9 +392,27 @@ export const cProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(cVariableConfig),
   classExtractor: cClassExtractor,
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.C),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
+
+  // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
+  emitScopeCaptures: emitCScopeCaptures,
+  // Worker-side: snapshot the module-level `static`-linkage marks
+  // `emitCScopeCaptures` just populated for this file (`markStaticName` →
+  // `staticNames`) into plain data on `ParsedFile.captureSideChannel`, so the
+  // main thread can restore them via `applyCaptureSideChannel` WITHOUT a
+  // re-parse (#1983 — the worker is the sole parse path). Without this, C
+  // `static` functions look non-file-local on the main thread and leak into
+  // cross-file global free-call resolution / wildcard imports. See
+  // `c/capture-side-channel.ts`.
+  collectCaptureSideChannel: collectCStaticLinkageSideChannel,
+  interpretImport: interpretCImport,
+  interpretTypeBinding: interpretCTypeBinding,
+  bindingScopeFor: cBindingScopeFor,
+  importOwningScope: cImportOwningScope,
+  receiverBinding: cReceiverBinding,
+  arityCompatibility: cArityCompatibility,
+  // mergeBindings + resolveImportTarget live on ScopeResolver (see c/scope-resolver.ts).
 });
 
 export const cppProvider = defineLanguage({
@@ -415,7 +461,6 @@ export const cppProvider = defineLanguage({
   typeConfig: cCppConfig,
   exportChecker: cCppExportChecker,
   importResolver: createImportResolver(cppImportConfig),
-  importSemantics: 'wildcard-transitive',
   mroStrategy: 'leftmost-base',
   callExtractor: createCallExtractor(cppCallConfig),
   fieldExtractor: createFieldExtractor(cppFieldConfig),
@@ -425,7 +470,65 @@ export const cppProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(cppVariableConfig),
   classExtractor: cppClassExtractor,
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.CPlusPlus),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
+  extractTemplateConstraints: extractCppTemplateConstraintsForProvider,
+
+  // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
+  emitScopeCaptures: emitCppScopeCaptures,
+  // Worker-side: snapshot the module-level capture marks `emitCppScopeCaptures`
+  // just populated for this file into plain data on `ParsedFile.captureSideChannel`,
+  // so the main thread can restore them via `applyCaptureSideChannel` WITHOUT a
+  // re-parse (#1983). See `cpp/capture-side-channel.ts`.
+  collectCaptureSideChannel: collectCppCaptureSideChannel,
+  interpretImport: interpretCppImport,
+  interpretTypeBinding: interpretCppTypeBinding,
+  bindingScopeFor: cppBindingScopeFor,
+  importOwningScope: cppImportOwningScope,
+  receiverBinding: cppReceiverBinding,
+  arityCompatibility: cppArityCompatibility,
+  // mergeBindings + resolveImportTarget live on ScopeResolver (see cpp/scope-resolver.ts).
 });
+
+/**
+ * LanguageProvider hook: walk from a function definition node up to its
+ * enclosing `template_declaration` and extract the SFINAE / `requires`-
+ * clause constraint payload. Used by `parsing-processor` to fingerprint
+ * the graph node ID so two SFINAE overloads with identical
+ * `parameterTypes` get distinct nodes (issue #1579).
+ *
+ * Returns `undefined` for non-templated functions and for templated
+ * functions whose constraints the extractor can't model — both cases
+ * result in no constraint suffix on the node ID.
+ */
+function extractCppTemplateConstraintsForProvider(definitionNode: SyntaxNode): unknown {
+  // Walk up to the enclosing template_declaration. Bound the walk so we
+  // can't accidentally land on a far-ancestor template_declaration that
+  // wraps an unrelated function.
+  let cur: SyntaxNode | null = definitionNode.parent;
+  let hops = 8;
+  let templateDecl: SyntaxNode | null = null;
+  while (cur !== null && hops-- > 0) {
+    if (cur.type === 'template_declaration') {
+      templateDecl = cur;
+      break;
+    }
+    if (cur.type === 'translation_unit') break;
+    cur = cur.parent;
+  }
+  if (templateDecl === null) return undefined;
+
+  // Find the function_declarator inside the function definition so the
+  // extractor can map template params to function-argument indices.
+  let declarator: SyntaxNode | null = definitionNode.childForFieldName('declarator');
+  let walk = 8;
+  while (declarator !== null && walk-- > 0) {
+    if (declarator.type === 'function_declarator') break;
+    if (declarator.type === 'pointer_declarator' || declarator.type === 'reference_declarator') {
+      declarator = declarator.childForFieldName('declarator');
+      continue;
+    }
+    break;
+  }
+  return extractCppTemplateConstraints(templateDecl, declarator);
+}

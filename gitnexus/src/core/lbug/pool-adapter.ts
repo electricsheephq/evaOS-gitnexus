@@ -17,8 +17,23 @@
 
 import fs from 'fs/promises';
 import lbug from '@ladybugdb/core';
-import { loadFTSExtension } from './lbug-adapter.js';
-import { createLbugDatabase, isWalCorruptionError } from './lbug-config.js';
+import { isReadOnlyDbError, loadFTSExtension } from './lbug-adapter.js';
+import { closeQueryResults } from './query-result-utils.js';
+import {
+  createLbugDatabase,
+  isWalCorruptionError,
+  toNativeSafePath,
+  WAL_RECOVERY_SUGGESTION,
+} from './lbug-config.js';
+import {
+  isMissingFsError,
+  isMissingShadowSidecarError,
+  isReadOnlyShadowReplayError,
+  preflightLbugSidecars,
+  quarantineWalForMissingShadow,
+  renameFailureMessage,
+  statIfExists,
+} from './sidecar-recovery.js';
 
 /** Per-repo pool: one Database, many Connections */
 interface PoolEntry {
@@ -27,8 +42,14 @@ interface PoolEntry {
   available: lbug.Connection[];
   /** Number of connections currently checked out */
   checkedOut: number;
-  /** Queued waiters for when all connections are busy */
-  waiters: Array<(conn: lbug.Connection) => void>;
+  /** Queued waiters for when all connections are busy. Each carries `resolve`
+   *  (hand off a freed connection) and `reject` (fail fast when the pool is
+   *  closed before a connection frees, instead of hanging until the waiter
+   *  timeout — #2068 follow-up). */
+  waiters: Array<{
+    resolve: (conn: lbug.Connection) => void;
+    reject: (err: Error) => void;
+  }>;
   lastUsed: number;
   dbPath: string;
   /** Set to true when the pool entry is closed — checkin will close orphaned connections */
@@ -81,6 +102,19 @@ const MAX_POOL_SIZE = 5;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 /** Max connections per repo (caps concurrent queries per repo) */
 const MAX_CONNS_PER_REPO = 8;
+
+// Behavior-neutral RSS tracing for the FTS evict→reload memory repro
+// (gitnexus/scripts/bench/fts-evict-reload-rss.mjs). Two invariants keep it safe
+// in the pool init/close hot path: it writes ONLY to stderr (stdout is the MCP
+// JSON-RPC channel), and the GITNEXUS_POOL_RSS_TRACE gate makes it a no-op — one
+// env-var compare per call, nothing else — unless a harness explicitly enables it.
+function traceRss(event: 'init' | 'close', repoId: string): void {
+  if (process.env.GITNEXUS_POOL_RSS_TRACE !== '1') return;
+  const rssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
+  process.stderr.write(
+    `[pool-rss] ${event} repo=${repoId} pool=${pool.size} dbCache=${dbCache.size} rssMB=${rssMb}\n`,
+  );
+}
 
 let idleTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -162,6 +196,20 @@ function closeOne(repoId: string): void {
 
   entry.closed = true;
 
+  // Reject any callers still queued for a connection: the pool is going away
+  // (re-init / teardown / LRU eviction), so they must fail fast with an
+  // actionable error instead of hanging until WAITER_TIMEOUT_MS and then
+  // surfacing a misleading "pool exhausted" (#2068 follow-up). Draining the
+  // queue also guarantees checkin() below finds no waiter expecting a
+  // connection, so a connection returned after close is simply closed.
+  if (entry.waiters.length > 0) {
+    const closedErr = new Error(
+      `LadybugDB connection pool closed for repo "${repoId}" (re-init/teardown); retry the query.`,
+    );
+    for (const waiter of entry.waiters) waiter.reject(closedErr);
+    entry.waiters.length = 0;
+  }
+
   // Close available connections — fire-and-forget with .catch() to prevent
   // unhandled rejections.  Native close() returns Promise<void> but can crash
   // the N-API destructor on macOS/Windows; deferring to process exit lets
@@ -205,6 +253,8 @@ function closeOne(repoId: string): void {
       // Isolate listener failures — teardown must complete.
     }
   }
+
+  traceRss('close', repoId);
 }
 
 /**
@@ -262,16 +312,148 @@ const WAITER_TIMEOUT_MS = 15_000;
 
 const LOCK_RETRY_ATTEMPTS = 3;
 const LOCK_RETRY_DELAY_MS = 2000;
+const SHADOW_REPLAY_PROBE_QUERY = 'MATCH (n) RETURN n LIMIT 1';
+
+const poolSidecarLogger = {
+  warn: (message: string): void => {
+    realStderrWrite(`${message}\n`);
+  },
+  debug: (_message: string): void => {},
+  info: (message: string): void => {
+    realStderrWrite(`${message}\n`);
+  },
+};
+
+type TryQuarantineResult = { kind: 'quarantined'; path: string } | { kind: 'peer-handled' };
+
+/**
+ * Pool-local quarantine guard that tolerates the concurrent-peer race the
+ * direct adapter does NOT face (the direct adapter holds `acquireInitLock`,
+ * a cross-process file lock, around its quarantine calls — so any ENOENT
+ * there is a real bug, not a benign race).
+ *
+ * On ENOENT from `fs.rename`, re-inspects via `statIfExists` to confirm the
+ * WAL really is gone. If gone, returns `{ kind: 'peer-handled' }`. If the
+ * WAL is somehow still present after the ENOENT (filesystem race we don't
+ * fully model), re-throws as a classified error rather than silently
+ * returning success — preserves the lock-invariant principle at the pool
+ * sites too.
+ *
+ * On any non-ENOENT failure, classifies through `renameFailureMessage`:
+ * EACCES/EPERM/EBUSY → permission-specific message; everything else
+ * (including the LadybugDB missing-shadow error if it ever propagates here)
+ * → `shadowSidecarRecoveryMessage`.
+ *
+ * See plan: docs/plans/2026-05-21-001-fix-pr-1747-quarantine-enoent-and-large-wal-plan.md (U2)
+ */
+async function tryQuarantineForMissingShadow(
+  dbPath: string,
+  opts: { reason: string },
+): Promise<TryQuarantineResult> {
+  try {
+    const quarantinePath = await quarantineWalForMissingShadow(dbPath, {
+      logger: poolSidecarLogger,
+      level: 'warn',
+      reason: opts.reason,
+    });
+    return { kind: 'quarantined', path: quarantinePath };
+  } catch (err) {
+    if (isMissingFsError(err)) {
+      const walStat = await statIfExists(`${dbPath}.wal`);
+      if (walStat === null) {
+        return { kind: 'peer-handled' };
+      }
+      // Defensive: ENOENT during rename but WAL still present afterwards.
+      // Don't silently swallow — surface a classified error. ENOENT falls
+      // through to shadowSidecarRecoveryMessage in renameFailureMessage.
+      throw new Error(renameFailureMessage(dbPath, err));
+    }
+    // Classify the rename failure itself — EACCES/EPERM/EBUSY get the
+    // permission-specific message; everything else falls through.
+    throw new Error(renameFailureMessage(dbPath, err));
+  }
+}
+
+async function probeDatabaseForShadowReplay(db: lbug.Database): Promise<void> {
+  const conn = createConnection(db);
+  try {
+    const queryResult = await conn.query(SHADOW_REPLAY_PROBE_QUERY);
+    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+    await result.getAll();
+    result.close?.();
+  } finally {
+    await conn.close().catch(() => {});
+  }
+}
+
+async function replayShadowPagesWithWritableOpen(dbPath: string): Promise<void> {
+  let db: lbug.Database | undefined;
+  try {
+    db = createLbugDatabase(lbug, toNativeSafePath(dbPath), { throwOnWalReplayFailure: false });
+    await db.init();
+    await probeDatabaseForShadowReplay(db);
+  } catch (err) {
+    if (isMissingShadowSidecarError(err)) {
+      await tryQuarantineForMissingShadow(dbPath, {
+        reason: 'pool writable replay recovery',
+      });
+      return;
+    }
+    throw err;
+  } finally {
+    if (db) await db.close().catch(() => {});
+  }
+}
 
 async function openReadOnlyDatabase(dbPath: string): Promise<lbug.Database> {
   let db: lbug.Database | undefined;
   silenceStdout();
   try {
-    db = createLbugDatabase(lbug, dbPath, {
+    await preflightLbugSidecars(dbPath, {
+      mode: 'read-only',
+      logger: poolSidecarLogger,
+      allowQuarantine: true,
+    });
+    db = createLbugDatabase(lbug, toNativeSafePath(dbPath), {
       readOnly: true,
       throwOnWalReplayFailure: false,
     });
     await db.init();
+    try {
+      await probeDatabaseForShadowReplay(db);
+    } catch (err) {
+      if (isMissingShadowSidecarError(err)) {
+        await db.close().catch(() => {});
+        db = undefined;
+        await tryQuarantineForMissingShadow(dbPath, {
+          reason: 'pool read-only recovery',
+        });
+        await preflightLbugSidecars(dbPath, {
+          mode: 'read-only',
+          logger: poolSidecarLogger,
+          allowQuarantine: true,
+        });
+        db = createLbugDatabase(lbug, toNativeSafePath(dbPath), {
+          readOnly: true,
+          throwOnWalReplayFailure: false,
+        });
+        await db.init();
+        await probeDatabaseForShadowReplay(db);
+        return db;
+      }
+      if (!isReadOnlyShadowReplayError(err)) {
+        throw err;
+      }
+      await db.close().catch(() => {});
+      db = undefined;
+      await replayShadowPagesWithWritableOpen(dbPath);
+      db = createLbugDatabase(lbug, toNativeSafePath(dbPath), {
+        readOnly: true,
+        throwOnWalReplayFailure: false,
+      });
+      await db.init();
+      await probeDatabaseForShadowReplay(db);
+    }
     return db;
   } catch (err) {
     if (db) await db.close().catch(() => {});
@@ -375,15 +557,23 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
             break;
           } catch (retryErr) {
             throw new Error(
-              `LadybugDB WAL corruption detected for ${repoId}. ` +
-                `Run \`gitnexus analyze\` to rebuild the index. ` +
+              `LadybugDB WAL corruption detected for ${repoId}. ${WAL_RECOVERY_SUGGESTION} ` +
                 `(${retryErr instanceof Error ? retryErr.message : String(retryErr)})`,
             );
           }
         }
 
+        if (
+          lastError.message.startsWith('LadybugDB checkpoint sidecar is missing') ||
+          lastError.message.startsWith('GitNexus could not move the LadybugDB WAL sidecar') ||
+          isMissingShadowSidecarError(lastError)
+        ) {
+          throw lastError;
+        }
+
         const isLockError =
-          lastError.message.includes('Could not set lock') || lastError.message.includes('lock');
+          lastError.message.includes('Could not set lock') ||
+          /\block(\b|ed|ing)/i.test(lastError.message);
         if (!isLockError || attempt === LOCK_RETRY_ATTEMPTS) break;
         await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_DELAY_MS * attempt));
       }
@@ -436,6 +626,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     closed: false,
   });
   ensureIdleTimer();
+  traceRss('init', repoId);
 }
 
 /**
@@ -498,6 +689,7 @@ export async function initLbugWithDb(
     closed: false,
   });
   ensureIdleTimer();
+  traceRss('init', repoId);
 }
 
 /**
@@ -526,14 +718,20 @@ function checkout(entry: PoolEntry): Promise<lbug.Connection> {
 
   // At capacity — queue the caller with a timeout.
   return new Promise<lbug.Connection>((resolve, reject) => {
-    const waiter = (conn: lbug.Connection) => {
-      clearTimeout(timer);
-      resolve(conn);
+    const waiter = {
+      resolve: (conn: lbug.Connection) => {
+        clearTimeout(timer);
+        resolve(conn);
+      },
+      reject: (err: Error) => {
+        clearTimeout(timer);
+        reject(err);
+      },
     };
     const timer = setTimeout(() => {
       const idx = entry.waiters.indexOf(waiter);
       if (idx !== -1) entry.waiters.splice(idx, 1);
-      reject(
+      waiter.reject(
         new Error(
           `Connection pool exhausted: timed out after ${WAITER_TIMEOUT_MS}ms waiting for a free connection`,
         ),
@@ -559,7 +757,7 @@ function checkin(entry: PoolEntry, conn: lbug.Connection): void {
   if (entry.waiters.length > 0) {
     // Hand directly to the next waiter — no intermediate available state
     const waiter = entry.waiters.shift()!;
-    waiter(conn);
+    waiter.resolve(conn);
   } else {
     entry.checkedOut--;
     entry.available.push(conn);
@@ -580,30 +778,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 export const executeQuery = async (repoId: string, cypher: string): Promise<any[]> => {
-  const entry = pool.get(repoId);
-  if (!entry) {
-    throw new Error(`LadybugDB not initialized for repo "${repoId}". Call initLbug first.`);
-  }
-
-  if (isWriteQuery(cypher)) {
-    throw new Error('Write operations are not allowed. The pool adapter is read-only.');
-  }
-
-  entry.lastUsed = Date.now();
-
-  const conn = await checkout(entry);
-  silenceStdout();
-  activeQueryCount++;
-  try {
-    const queryResult = await withTimeout(conn.query(cypher), QUERY_TIMEOUT_MS, 'Query');
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
-    return rows;
-  } finally {
-    activeQueryCount--;
-    restoreStdout();
-    checkin(entry, conn);
-  }
+  return await executeParameterized(repoId, cypher, {});
 };
 
 /**
@@ -625,17 +800,33 @@ export const executeParameterized = async (
   const conn = await checkout(entry);
   silenceStdout();
   activeQueryCount++;
+  let queryResult: lbug.QueryResult | lbug.QueryResult[] | undefined;
   try {
     const stmt = await withTimeout(conn.prepare(cypher), QUERY_TIMEOUT_MS, 'Prepare');
     if (!stmt.isSuccess()) {
       const errMsg = await stmt.getErrorMessage();
       throw new Error(`Prepare failed: ${errMsg}`);
     }
-    const queryResult = await withTimeout(conn.execute(stmt, params), QUERY_TIMEOUT_MS, 'Execute');
+    queryResult = await withTimeout(conn.execute(stmt, params), QUERY_TIMEOUT_MS, 'Execute');
     const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
     return rows;
+  } catch (err) {
+    if (isReadOnlyDbError(err)) {
+      // Preserve the native error as `cause` so the original frame/message is
+      // not lost behind the friendly read-only message (#2068 follow-up).
+      throw new Error('Write operations are not allowed. The pool adapter is read-only.', {
+        cause: err,
+      });
+    }
+    throw err;
   } finally {
+    // Close the native QueryResult cursor(s) before returning the connection —
+    // getAll() drains rows but does not release the native cursor, so without
+    // this the cursor leaks for the connection's lifetime (#2068 follow-up).
+    // Best-effort via the shared helper; never masks the query result or a real
+    // error.
+    if (queryResult) await closeQueryResults(queryResult);
     activeQueryCount--;
     restoreStdout();
     checkin(entry, conn);
@@ -667,15 +858,3 @@ export const closeLbug = async (repoId?: string): Promise<void> => {
  * Check if a specific repo's pool is active
  */
 export const isLbugReady = (repoId: string): boolean => pool.has(repoId);
-
-/** Regex to detect write operations in user-supplied Cypher queries.
- * Note: CALL is NOT blocked — it's used for read-only FTS (CALL QUERY_FTS_INDEX)
- * and vector search (CALL QUERY_VECTOR_INDEX). The database is opened in
- * read-only mode as defense-in-depth against write procedures. */
-export const CYPHER_WRITE_RE =
-  /(?<!:)\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH|FOREACH|INSTALL|LOAD)\b/i;
-
-/** Check if a Cypher query contains write operations */
-export function isWriteQuery(query: string): boolean {
-  return CYPHER_WRITE_RE.test(query);
-}

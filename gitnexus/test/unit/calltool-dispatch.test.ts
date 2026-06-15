@@ -7,13 +7,16 @@
  * These are pure unit tests that mock the LadybugDB layer to test
  * the dispatch and error handling logic in isolation.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import os from 'os';
+import path from 'path';
 
 // We need to mock the LadybugDB adapter and repo-manager BEFORE importing LocalBackend.
 // local-backend.ts imports from core/lbug/pool-adapter.js; the mcp/core/lbug-adapter.js
 // re-exports from the same module, so we mock the canonical source.
 // vi.hoisted runs before vi.mock hoisting, making the fns available to both factories.
-const { lbugMocks, platformMocks } = vi.hoisted(() => ({
+const { lbugMocks, platformMocks, rerankMocks } = vi.hoisted(() => ({
   lbugMocks: {
     initLbug: vi.fn().mockResolvedValue(undefined),
     executeQuery: vi.fn().mockResolvedValue([]),
@@ -23,6 +26,10 @@ const { lbugMocks, platformMocks } = vi.hoisted(() => ({
   },
   platformMocks: {
     isVectorExtensionSupportedByPlatform: vi.fn().mockReturnValue(true),
+  },
+  rerankMocks: {
+    resolveRerankConfig: vi.fn().mockReturnValue(null),
+    rerankDocuments: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -37,11 +44,15 @@ vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
   return { ...actual, ...lbugMocks };
 });
 
-vi.mock('../../src/storage/repo-manager.js', () => ({
-  listRegisteredRepos: vi.fn().mockResolvedValue([]),
-  cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
-  findSiblingClones: vi.fn().mockResolvedValue([]),
-}));
+vi.mock('../../src/storage/repo-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/storage/repo-manager.js')>();
+  return {
+    ...actual,
+    listRegisteredRepos: vi.fn().mockResolvedValue([]),
+    cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
+    findSiblingClones: vi.fn().mockResolvedValue([]),
+  };
+});
 
 // `core/git-staleness` is also imported by `local-backend.ts` (for
 // `checkStaleness` and `checkCwdMatch`). Stub it out here so unit
@@ -51,6 +62,14 @@ vi.mock('../../src/core/git-staleness.js', () => ({
   checkStalenessAsync: vi.fn().mockResolvedValue({ isStale: false, commitsBehind: 0 }),
   checkCwdMatch: vi.fn().mockResolvedValue({ match: 'none' }),
 }));
+
+vi.mock('../../src/storage/git.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/storage/git.js')>();
+  return {
+    ...actual,
+    getGitRoot: vi.fn().mockReturnValue(null),
+  };
+});
 
 vi.mock('../../src/core/platform/capabilities.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/core/platform/capabilities.js')>();
@@ -70,8 +89,17 @@ vi.mock('../../src/mcp/core/embedder.js', () => ({
   getEmbeddingDims: vi.fn().mockReturnValue(384),
 }));
 
-import { LocalBackend } from '../../src/mcp/local/local-backend.js';
+vi.mock('../../src/core/rerank/voyage-reranker.js', () => ({
+  ...rerankMocks,
+}));
+
+import {
+  LocalBackend,
+  REPO_ID_HASH_LENGTH,
+  parseListReposPagination,
+} from '../../src/mcp/local/local-backend.js';
 import { listRegisteredRepos, cleanupOldKuzuFiles } from '../../src/storage/repo-manager.js';
+import { getGitRoot } from '../../src/storage/git.js';
 import { _captureLogger } from '../../src/core/logger.js';
 import {
   initLbug,
@@ -83,21 +111,6 @@ import {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-const MCP_ENV_KEYS = [
-  'GITNEXUS_MCP_ALLOWED_REPOS',
-  'OPENCLAW_CODE_INDEX_ALLOWED_REPOS',
-  'GITNEXUS_MCP_DEFAULT_REPO',
-  'OPENCLAW_CODE_INDEX_DEFAULT_REPO',
-  'GITNEXUS_MCP_READ_ONLY',
-  'OPENCLAW_CODE_INDEX_MCP',
-];
-
-afterEach(() => {
-  for (const key of MCP_ENV_KEYS) {
-    delete process.env[key];
-  }
-});
-
 const MOCK_REPO_ENTRY = {
   name: 'test-project',
   path: '/tmp/test-project',
@@ -106,6 +119,11 @@ const MOCK_REPO_ENTRY = {
   lastCommit: 'abc1234567890',
   stats: { files: 10, nodes: 50, edges: 100, communities: 3, processes: 5 },
 };
+
+beforeEach(() => {
+  rerankMocks.resolveRerankConfig.mockReturnValue(null);
+  rerankMocks.rerankDocuments.mockResolvedValue([]);
+});
 
 function setupSingleRepo() {
   (listRegisteredRepos as any).mockResolvedValue([MOCK_REPO_ENTRY]);
@@ -125,6 +143,89 @@ function setupMultipleRepos() {
 
 function setupNoRepos() {
   (listRegisteredRepos as any).mockResolvedValue([]);
+}
+
+const duplicateFixtureDirs: string[] = [];
+
+function makeDuplicateNameFixture() {
+  const mainDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-shared-main-'));
+  const wtDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-shared-wt-'));
+  duplicateFixtureDirs.push(mainDir, wtDir);
+  for (const dir of [mainDir, wtDir]) {
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(path.join(storagePath, 'lbug'), { recursive: true });
+    writeFileSync(path.join(storagePath, 'meta.json'), '{}');
+  }
+  return {
+    mainDir,
+    wtDir,
+    entries: [
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'shared',
+        path: mainDir,
+        storagePath: path.join(mainDir, '.gitnexus'),
+      },
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'shared',
+        path: wtDir,
+        storagePath: path.join(wtDir, '.gitnexus'),
+      },
+    ],
+  };
+}
+
+function makeSharedPrefixFixture(nameA: string, nameB: string) {
+  const dirA = mkdtempSync(path.join(os.tmpdir(), `gnx-${nameA}-`));
+  const dirB = mkdtempSync(path.join(os.tmpdir(), `gnx-${nameB}-`));
+  duplicateFixtureDirs.push(dirA, dirB);
+  for (const dir of [dirA, dirB]) {
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(path.join(storagePath, 'lbug'), { recursive: true });
+    writeFileSync(path.join(storagePath, 'meta.json'), '{}');
+  }
+  return {
+    dirA,
+    dirB,
+    entries: [
+      { ...MOCK_REPO_ENTRY, name: nameA, path: dirA, storagePath: path.join(dirA, '.gitnexus') },
+      { ...MOCK_REPO_ENTRY, name: nameB, path: dirB, storagePath: path.join(dirB, '.gitnexus') },
+    ],
+  };
+}
+
+// Mirrors the legacy `repoId()` suffix that #2054 replaced for genuine
+// collisions: base64url is an *encoding*, not a hash, so paths sharing a long
+// prefix produce the same sliced suffix. Used by the #2054 tests to assert the
+// collision precondition actually holds (so the regression isn't vacuous).
+function legacyPathSuffix(p: string): string {
+  return Buffer.from(p).toString('base64url').slice(0, REPO_ID_HASH_LENGTH).toLowerCase();
+}
+
+/**
+ * Build N sibling clones of one remote under a SINGLE parent directory, named
+ * REPO, REPO_2, …, REPO_N. All clones share the remote-inferred registry name
+ * ("REPO") and the same remoteUrl — this is the real-world #2054 setup. Because
+ * the clones live under one parent, their absolute paths share a long common
+ * prefix, which is exactly what made the 6-char base64url suffix collide.
+ * (mkdtemp'ing each clone separately would NOT reproduce the bug — the random
+ * suffixes diverge in the first few bytes.)
+ */
+function makeSiblingClonesFixture(count: number, remoteUrl = 'git@github.com:MYCOMPANY/REPO.git') {
+  const parent = mkdtempSync(path.join(os.tmpdir(), 'gnx-2054-'));
+  duplicateFixtureDirs.push(parent);
+  const folders = Array.from({ length: count }, (_, i) => (i === 0 ? 'REPO' : `REPO_${i + 1}`));
+  const dirs: string[] = [];
+  const entries = folders.map((folder) => {
+    const dir = path.join(parent, folder);
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(path.join(storagePath, 'lbug'), { recursive: true });
+    writeFileSync(path.join(storagePath, 'meta.json'), '{}');
+    dirs.push(dir);
+    return { ...MOCK_REPO_ENTRY, name: 'REPO', path: dir, storagePath, remoteUrl };
+  });
+  return { parent, dirs, entries };
 }
 
 // ─── LocalBackend lifecycle ──────────────────────────────────────────
@@ -192,9 +293,18 @@ describe('LocalBackend.callTool', () => {
   });
 
   it('routes list_repos without needing repo param', async () => {
+    // No-arg compatibility: callTool('list_repos', {}) returns the first page as
+    // a { repositories, pagination } object (Strategy A — always paginated, #2119).
     const result = await backend.callTool('list_repos', {});
-    expect(Array.isArray(result)).toBe(true);
-    expect(result[0].name).toBe('test-project');
+    expect(Array.isArray(result.repositories)).toBe(true);
+    expect(result.repositories[0].name).toBe('test-project');
+    expect(result.pagination).toEqual({
+      total: 1,
+      limit: 50,
+      offset: 0,
+      returned: 1,
+      hasMore: false,
+    });
   });
 
   it('throws for unknown tool name', async () => {
@@ -210,6 +320,169 @@ describe('LocalBackend.callTool', () => {
     expect(result).toHaveProperty('definitions');
   });
 
+  it('reranks merged query candidates when the premium repo gate is configured', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      ftsAvailable: true,
+      results: [
+        { filePath: 'src/alpha.ts', nodeIds: ['node-alpha'], score: 10 },
+        { filePath: 'src/beta.ts', nodeIds: ['node-beta'], score: 9 },
+      ],
+    });
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
+    rerankMocks.resolveRerankConfig.mockReturnValue({
+      baseUrl: 'https://api.voyageai.com/v1',
+      model: 'rerank-2.5',
+      apiKey: 'test-key',
+      candidates: 2,
+      maxDocChars: 3000,
+    });
+    rerankMocks.rerankDocuments.mockResolvedValueOnce([
+      { index: 1, relevance_score: 0.99 },
+      { index: 0, relevance_score: 0.25 },
+    ]);
+
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 0 }];
+      return [];
+    });
+    (executeParameterized as any).mockImplementation(
+      async (_repoId: string, cypher: string, params?: { nodeIds?: string[] }) => {
+        if (cypher.includes('RETURN n.id AS id')) {
+          return (params?.nodeIds ?? []).map((id) =>
+            id === 'node-alpha'
+              ? {
+                  id,
+                  name: 'Alpha',
+                  type: 'Function',
+                  filePath: 'src/alpha.ts',
+                  startLine: 1,
+                  endLine: 10,
+                }
+              : {
+                  id,
+                  name: 'Beta',
+                  type: 'Function',
+                  filePath: 'src/beta.ts',
+                  startLine: 20,
+                  endLine: 30,
+                },
+          );
+        }
+        if (cypher.includes('RETURN n.id AS nodeId, n.content AS content')) {
+          return (params?.nodeIds ?? []).map((id) => ({
+            nodeId: id,
+            content: id === 'node-alpha' ? 'alpha implementation' : 'beta implementation',
+          }));
+        }
+        return [];
+      },
+    );
+
+    const result = await backend.callTool('query', { query: 'auth', limit: 1, max_symbols: 2 });
+
+    expect(rerankMocks.resolveRerankConfig).toHaveBeenCalledWith('test-project');
+    expect(rerankMocks.rerankDocuments).toHaveBeenCalledWith(
+      'auth',
+      expect.arrayContaining([
+        expect.stringContaining('alpha implementation'),
+        expect.stringContaining('beta implementation'),
+      ]),
+      expect.objectContaining({ model: 'rerank-2.5' }),
+    );
+    expect(result.definitions.map((definition: any) => definition.name)).toEqual(['Beta', 'Alpha']);
+    expect(result.timing).toHaveProperty('rerank');
+  });
+
+  it('applies Voyage rerank scores to process ranking, not only standalone definitions', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      ftsAvailable: true,
+      results: [
+        { filePath: 'src/alpha.ts', nodeIds: ['node-alpha'], score: 10 },
+        { filePath: 'src/beta.ts', nodeIds: ['node-beta'], score: 9 },
+      ],
+    });
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
+    rerankMocks.resolveRerankConfig.mockReturnValue({
+      baseUrl: 'https://api.voyageai.com/v1',
+      model: 'rerank-2.5',
+      apiKey: 'test-key',
+      candidates: 2,
+      maxDocChars: 3000,
+    });
+    rerankMocks.rerankDocuments.mockResolvedValueOnce([
+      { index: 1, relevance_score: 0.99 },
+      { index: 0, relevance_score: 0.25 },
+    ]);
+
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 0 }];
+      return [];
+    });
+    (executeParameterized as any).mockImplementation(
+      async (_repoId: string, cypher: string, params?: { nodeIds?: string[] }) => {
+        if (cypher.includes('RETURN n.id AS id')) {
+          return (params?.nodeIds ?? []).map((id) =>
+            id === 'node-alpha'
+              ? {
+                  id,
+                  name: 'Alpha',
+                  type: 'Function',
+                  filePath: 'src/alpha.ts',
+                  startLine: 1,
+                  endLine: 10,
+                }
+              : {
+                  id,
+                  name: 'Beta',
+                  type: 'Function',
+                  filePath: 'src/beta.ts',
+                  startLine: 20,
+                  endLine: 30,
+                },
+          );
+        }
+        if (cypher.includes('STEP_IN_PROCESS')) {
+          return (params?.nodeIds ?? []).map((id) =>
+            id === 'node-alpha'
+              ? {
+                  nodeId: id,
+                  pid: 'proc-alpha',
+                  label: 'Alpha process',
+                  heuristicLabel: 'Alpha process',
+                  processType: 'execution_flow',
+                  stepCount: 1,
+                  step: 1,
+                }
+              : {
+                  nodeId: id,
+                  pid: 'proc-beta',
+                  label: 'Beta process',
+                  heuristicLabel: 'Beta process',
+                  processType: 'execution_flow',
+                  stepCount: 1,
+                  step: 1,
+                },
+          );
+        }
+        if (cypher.includes('RETURN n.id AS nodeId, c.cohesion AS cohesion')) return [];
+        if (cypher.includes('RETURN n.id AS nodeId, n.content AS content')) {
+          return (params?.nodeIds ?? []).map((id) => ({
+            nodeId: id,
+            content: id === 'node-alpha' ? 'alpha implementation' : 'beta implementation',
+          }));
+        }
+        return [];
+      },
+    );
+
+    const result = await backend.callTool('query', { query: 'auth', limit: 2, max_symbols: 2 });
+
+    expect(result.processes.map((process: any) => process.id)).toEqual(['proc-beta', 'proc-alpha']);
+    expect(result.process_symbols.map((symbol: any) => symbol.name)).toEqual(['Beta', 'Alpha']);
+  });
+
   it('includes FTS-unavailable warning when ftsAvailable is false (#1403)', async () => {
     const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
     vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({ results: [], ftsAvailable: false });
@@ -218,7 +491,7 @@ describe('LocalBackend.callTool', () => {
     const result = await backend.callTool('query', { query: 'ProcessActivity' });
 
     expect(result).toHaveProperty('warning');
-    expect((result as any).warning).toMatch(/gitnexus analyze --force/);
+    expect((result as any).warning).toMatch(/gitnexus analyze --repair-fts/);
   });
 
   it('does not include warning when ftsAvailable is true with zero results', async () => {
@@ -229,6 +502,19 @@ describe('LocalBackend.callTool', () => {
     const result = await backend.callTool('query', { query: 'nonexistent' });
 
     expect(result).not.toHaveProperty('warning');
+  });
+
+  it('does not crash when searchFTSFromLbug throws (#1489)', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockRejectedValueOnce(new Error('bm25Results is not iterable'));
+    (executeParameterized as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('query', { query: 'auth' });
+
+    // Should still return a valid result shape (semantic-only fallback)
+    expect(result).toHaveProperty('processes');
+    expect(result).toHaveProperty('definitions');
+    expect(result).not.toHaveProperty('error');
   });
 
   it('skips vector index query when VECTOR is unsupported by the platform', async () => {
@@ -294,13 +580,14 @@ describe('LocalBackend.callTool', () => {
   });
 
   it('dispatches cypher tool and blocks write queries', async () => {
+    (executeParameterized as any).mockRejectedValueOnce(new Error('read-only database'));
     const result = await backend.callTool('cypher', { query: 'CREATE (n:Test)' });
     expect(result).toHaveProperty('error');
     expect(result.error).toContain('Write operations');
   });
 
   it('dispatches cypher tool with valid read query', async () => {
-    (executeQuery as any).mockResolvedValue([{ name: 'test', filePath: 'src/test.ts' }]);
+    (executeParameterized as any).mockResolvedValue([{ name: 'test', filePath: 'src/test.ts' }]);
     const result = await backend.callTool('cypher', {
       query: 'MATCH (n:Function) RETURN n.name AS name, n.filePath AS filePath LIMIT 5',
     });
@@ -652,6 +939,276 @@ describe('LocalBackend.callTool', () => {
     expect(result.target).toBeDefined();
   });
 
+  it('impact byDepth items include a processes field (default empty when no processes)', async () => {
+    // Resolver returns target; BFS returns one frontier caller; no STEP_IN_PROCESS rows.
+    (executeParameterized as any).mockImplementation((_repoId: string, cypher: string) => {
+      // BFS frontier query is now parameterized (#1907 U3).
+      if (cypher.includes('r.type IN') && !cypher.includes('STEP_IN_PROCESS')) {
+        return Promise.resolve([
+          {
+            id: 'func:caller',
+            name: 'caller',
+            type: 'Function',
+            filePath: 'src/uses-main.ts',
+            relType: 'CALLS',
+            confidence: 0.9,
+          },
+        ]);
+      }
+      // Symbol resolution.
+      return Promise.resolve([
+        { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+      ]);
+    });
+    (executeQuery as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('impact', { target: 'main', direction: 'upstream' });
+    const d1 = result.byDepth?.[1] || result.byDepth?.['1'] || [];
+    expect(d1.length).toBeGreaterThan(0);
+    for (const item of d1) {
+      expect(item).toHaveProperty('processes');
+      expect(Array.isArray(item.processes)).toBe(true);
+    }
+  });
+
+  it('impact populates byDepth processes when STEP_IN_PROCESS rows exist', async () => {
+    (executeParameterized as any).mockImplementation((_repoId: string, cypher: string) => {
+      // BFS frontier query is now parameterized (#1907 U3).
+      if (cypher.includes('r.type IN') && !cypher.includes('STEP_IN_PROCESS')) {
+        return Promise.resolve([
+          {
+            id: 'func:caller',
+            name: 'caller',
+            type: 'Function',
+            filePath: 'src/uses-main.ts',
+            relType: 'CALLS',
+            confidence: 0.9,
+          },
+        ]);
+      }
+      // Symbol resolver name-lookup
+      if (cypher.includes('WHERE n.name =')) {
+        return Promise.resolve([
+          { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+        ]);
+      }
+      // Aggregation pass (must return at least one row so per-symbol pass is gated open)
+      if (cypher.includes('COUNT(DISTINCT s.id)')) {
+        return Promise.resolve([
+          {
+            pId: 'proc:cron_daily',
+            name: 'Daily cron',
+            heuristicLabel: 'Daily cron',
+            processType: 'cron',
+            entryPointId: 'func:cron_entry',
+            hits: 1,
+            minStep: 1,
+            stepCount: 5,
+            epName: 'cron_entry',
+            epType: 'Function',
+            epFilePath: 'src/cron.ts',
+          },
+        ]);
+      }
+      // New per-symbol pass added by this change
+      if (cypher.includes('RETURN s.id AS sid')) {
+        return Promise.resolve([
+          {
+            sid: 'func:caller',
+            pid: 'proc:cron_daily',
+            pName: 'Daily cron',
+            pType: 'cron',
+            step: 2,
+          },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    (executeQuery as any).mockResolvedValue([
+      {
+        id: 'func:caller',
+        name: 'caller',
+        type: 'Function',
+        filePath: 'src/uses-main.ts',
+        relType: 'CALLS',
+        confidence: 0.9,
+      },
+    ]);
+
+    const result = await backend.callTool('impact', { target: 'main', direction: 'upstream' });
+    const d1 = result.byDepth?.[1] || result.byDepth?.['1'] || [];
+    const caller = d1.find((it: any) => it.id === 'func:caller');
+    expect(caller).toBeDefined();
+    expect(caller.processes).toHaveLength(1);
+    expect(caller.processes[0]).toMatchObject({
+      id: 'proc:cron_daily',
+      label: 'Daily cron',
+      processType: 'cron',
+      step: 2,
+    });
+  });
+
+  it('impact summaryOnly:true skips the per-symbol STEP_IN_PROCESS enrichment pass', async () => {
+    // Resolver returns target; BFS returns one caller; aggregation returns one process row.
+    (executeParameterized as any).mockImplementation((_repoId: string, cypher: string) => {
+      // BFS frontier query is now parameterized (#1907 U3) — return a caller so
+      // the per-symbol-skip assertion below is meaningful (not vacuous).
+      if (cypher.includes('r.type IN') && !cypher.includes('STEP_IN_PROCESS')) {
+        return Promise.resolve([
+          {
+            id: 'func:caller',
+            name: 'caller',
+            type: 'Function',
+            filePath: 'src/a.ts',
+            relType: 'CALLS',
+            confidence: 0.9,
+          },
+        ]);
+      }
+      if (cypher.includes('WHERE n.name =')) {
+        return Promise.resolve([
+          { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+        ]);
+      }
+      if (cypher.includes('COUNT(DISTINCT s.id)')) {
+        return Promise.resolve([
+          {
+            pId: 'proc:daily',
+            name: 'Daily cron',
+            heuristicLabel: 'Daily cron',
+            processType: 'cron',
+            entryPointId: 'func:cron_entry',
+            hits: 1,
+            minStep: 1,
+            stepCount: 5,
+            epName: 'cron_entry',
+            epType: 'Function',
+            epFilePath: 'src/cron.ts',
+          },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    (executeQuery as any).mockResolvedValue([
+      {
+        id: 'func:caller',
+        name: 'caller',
+        type: 'Function',
+        filePath: 'src/a.ts',
+        relType: 'CALLS',
+        confidence: 0.9,
+      },
+    ]);
+
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      summaryOnly: true,
+    });
+
+    // summaryOnly should return base fields only, no byDepth
+    expect(result.summary).toBeDefined();
+    expect(result.byDepth).toBeUndefined();
+
+    // The per-symbol enrichment query contains 'RETURN s.id AS sid'; verify it
+    // was never called (the gate should have suppressed it).
+    const perSymbolCalls = (executeParameterized as any).mock.calls.filter(
+      ([, cypher]: [string, string]) =>
+        typeof cypher === 'string' && cypher.includes('RETURN s.id AS sid'),
+    );
+    expect(perSymbolCalls).toHaveLength(0);
+  });
+
+  it('impactByUid preserves byDepth while skipping per-symbol enrichment (group fan-out)', async () => {
+    // Regression guard for the cross-repo by_depth contract: impactByUid must
+    // suppress only the per-symbol STEP_IN_PROCESS pass, NOT the whole byDepth
+    // field. cross-impact.ts reads fan.byDepth to populate group `by_depth`;
+    // using summaryOnly here would silently empty it.
+    //
+    // impactByUid takes an explicit repoId and calls refreshRepos() internally.
+    // Use a fresh backend whose repo path is already absolute/resolved so the
+    // derived repoId stays stable across that refresh (an unresolved POSIX
+    // fixture path triggers the path-collision rehash and drops the key).
+    const resolvedRepoPath = path.resolve('/tmp/test-project');
+    (listRegisteredRepos as any).mockResolvedValue([
+      { ...MOCK_REPO_ENTRY, path: resolvedRepoPath },
+    ]);
+    backend = new LocalBackend();
+    await backend.init();
+
+    (executeParameterized as any).mockImplementation((_repoId: string, cypher: string) => {
+      // BFS frontier query is now parameterized (#1907 U3).
+      if (cypher.includes('r.type IN') && !cypher.includes('STEP_IN_PROCESS')) {
+        return Promise.resolve([
+          {
+            id: 'func:caller',
+            name: 'caller',
+            type: 'Function',
+            filePath: 'src/uses-main.ts',
+            relType: 'CALLS',
+            confidence: 0.9,
+          },
+        ]);
+      }
+      // UID resolver
+      if (cypher.includes('WHERE n.id = $uid')) {
+        return Promise.resolve([
+          { id: 'func:main', name: 'main', filePath: 'src/index.ts', type: 'Function' },
+        ]);
+      }
+      // Aggregation pass (returns a process row so affectedProcesses > 0; if the
+      // per-symbol pass were not skipped, this would open its gate)
+      if (cypher.includes('COUNT(DISTINCT s.id)')) {
+        return Promise.resolve([
+          {
+            pId: 'proc:daily',
+            name: 'Daily cron',
+            heuristicLabel: 'Daily cron',
+            processType: 'cron',
+            entryPointId: 'func:cron_entry',
+            hits: 1,
+            minStep: 1,
+            stepCount: 5,
+            epName: 'cron_entry',
+            epType: 'Function',
+            epFilePath: 'src/cron.ts',
+          },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    (executeQuery as any).mockResolvedValue([
+      {
+        id: 'func:caller',
+        name: 'caller',
+        type: 'Function',
+        filePath: 'src/uses-main.ts',
+        relType: 'CALLS',
+        confidence: 0.9,
+      },
+    ]);
+
+    const result = await backend.impactByUid('test-project', 'uid:main', 'upstream', {
+      maxDepth: 5,
+      relationTypes: ['CALLS'],
+      minConfidence: 0,
+      includeTests: true,
+    });
+
+    // byDepth must survive (Finding A regression guard)
+    expect(result).not.toBeNull();
+    expect(result.byDepth).toBeDefined();
+    const d1 = result.byDepth?.[1] || result.byDepth?.['1'] || [];
+    expect(d1.find((it: any) => it.id === 'func:caller')).toBeDefined();
+
+    // The per-symbol enrichment query must never fire under skipPerSymbolEnrichment
+    const perSymbolCalls = (executeParameterized as any).mock.calls.filter(
+      ([, cypher]: [string, string]) =>
+        typeof cypher === 'string' && cypher.includes('RETURN s.id AS sid'),
+    );
+    expect(perSymbolCalls).toHaveLength(0);
+  });
+
   it('dispatches detect_changes tool', async () => {
     // detect_changes calls execFileSync which we haven't mocked at module level,
     // so it will throw a git error — that's fine, we test the error path
@@ -854,13 +1411,20 @@ describe('LocalBackend.resolveRepo', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    (getGitRoot as any).mockReturnValue(null);
     backend = new LocalBackend();
+  });
+
+  afterEach(() => {
+    for (const dir of duplicateFixtureDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('resolves single repo without param', async () => {
     setupSingleRepo();
     await backend.init();
-    const result = await backend.callTool('list_repos', {});
+    const result = await backend.listRepos();
     expect(result).toHaveLength(1);
   });
 
@@ -898,6 +1462,95 @@ describe('LocalBackend.resolveRepo', () => {
     await expect(backend.callTool('query', { query: 'test', repo: 'nonexistent' })).rejects.toThrow(
       'not found',
     );
+  });
+
+  it('prefers duplicate-name repo matching process.cwd() git root (#1658)', async () => {
+    const { wtDir, entries } = makeDuplicateNameFixture();
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    (getGitRoot as any).mockReturnValue(wtDir);
+    await backend.init();
+    (executeParameterized as any).mockResolvedValue([]);
+    await backend.callTool('query', { query: 'test', repo: 'shared' });
+    const resolved = await backend.resolveRepo('shared');
+    expect(resolved.repoPath).toBe(wtDir);
+  });
+
+  it('throws RegistryAmbiguousTargetError when duplicate name cannot be disambiguated (#1658)', async () => {
+    const { entries } = makeDuplicateNameFixture();
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    (getGitRoot as any).mockReturnValue(null);
+    await backend.init();
+    await expect(backend.resolveRepo('shared')).rejects.toThrow(/Multiple registered repos match/);
+    await expect(backend.resolveRepo('shared')).rejects.toThrow(/absolute path/i);
+  });
+
+  it('resolves duplicate-name repos by absolute path before name (#1658)', async () => {
+    const { mainDir, wtDir, entries } = makeDuplicateNameFixture();
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    (getGitRoot as any).mockReturnValue(mainDir);
+    await backend.init();
+    (executeParameterized as any).mockResolvedValue([]);
+    const resolved = await backend.resolveRepo(wtDir);
+    expect(resolved.repoPath).toBe(wtDir);
+  });
+
+  it('does not treat a bare duplicate alias as a relative path (#1658)', async () => {
+    const { entries } = makeDuplicateNameFixture();
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    (getGitRoot as any).mockReturnValue(null);
+    await backend.init();
+    await expect(backend.resolveRepo('shared')).rejects.toThrow(/Multiple registered repos match/);
+  });
+
+  it('refreshes registry after ambiguity when duplicates are removed (#1658)', async () => {
+    const { mainDir, entries } = makeDuplicateNameFixture();
+    const singleEntry = [entries[0]];
+    (listRegisteredRepos as any).mockResolvedValueOnce(entries).mockResolvedValueOnce(singleEntry);
+    (getGitRoot as any).mockReturnValue(null);
+    await backend.init();
+    const resolved = await backend.resolveRepo('shared');
+    expect(resolved.repoPath).toBe(mainDir);
+  });
+
+  it('detect_changes surfaces RegistryAmbiguousTargetError on duplicate repo name (#1658)', async () => {
+    const { entries } = makeDuplicateNameFixture();
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    (getGitRoot as any).mockReturnValue(null);
+    await backend.init();
+    await expect(
+      backend.callTool('detect_changes', { scope: 'unstaged', repo: 'shared' }),
+    ).rejects.toThrow(/Multiple registered repos match/);
+  });
+
+  it('resolves second duplicate-name repo by its stable hashed id (#1658)', async () => {
+    const { wtDir, entries } = makeDuplicateNameFixture();
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    // Couples this test to repoId's suffix formula on purpose — if repoId changes
+    // its suffix, this assertion should fail and force a re-review of the hashed-id
+    // resolution tier. Mirrors LocalBackend.repoId: base64url(repoPath) sliced to
+    // REPO_ID_HASH_LENGTH and lowercased so it survives the paramLower lookup in
+    // resolveRepoFromCache.
+    const wtId = `shared-${Buffer.from(wtDir)
+      .toString('base64url')
+      .slice(0, REPO_ID_HASH_LENGTH)
+      .toLowerCase()}`;
+    await backend.init();
+    const resolved = await backend.resolveRepo(wtId);
+    expect(resolved.repoPath).toBe(wtDir);
+  });
+
+  it('does not silently return first partial match for ambiguous prefix (#1658)', async () => {
+    const { dirA, entries } = makeSharedPrefixFixture('project-a', 'project-b');
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    (getGitRoot as any).mockReturnValue(null);
+    await backend.init();
+
+    await expect(backend.resolveRepo('project')).rejects.toThrow(/Repository "project" not found/);
+
+    // Sanity: exact names still resolve unambiguously against the same fixture.
+    const exact = await backend.resolveRepo('project-a');
+    expect(exact.name).toBe('project-a');
+    expect(exact.repoPath).toBe(dirA);
   });
 
   it('resolves repo case-insensitively', async () => {
@@ -969,6 +1622,312 @@ describe('LocalBackend.resolveRepo', () => {
       cap.restore();
       (checkCwdMatch as any).mockResolvedValue({ match: 'none' });
     }
+  });
+});
+
+// ─── repo-id collisions (sibling clones) ────────────────────────────
+
+describe('LocalBackend repo-id collisions (#2054)', () => {
+  let backend: LocalBackend;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (getGitRoot as any).mockReturnValue(null);
+    backend = new LocalBackend();
+  });
+
+  afterEach(() => {
+    for (const dir of duplicateFixtureDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('serves all sibling clones through the list_repos tool with siblings/remoteUrl intact (#2054, #2119)', async () => {
+    const { dirs, entries } = makeSiblingClonesFixture(4);
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    await backend.init();
+
+    // Exercise the real TOOL surface (callTool → listReposPage), not just
+    // listRepos(): the paginated wrapper must not drop sibling-clone fields
+    // during its sort + slice.
+    const page = await backend.callTool('list_repos', {});
+    expect(page.repositories).toHaveLength(4);
+    expect(page.pagination.total).toBe(4);
+    const paths = page.repositories.map((r: any) => path.resolve(r.path)).sort();
+    expect(paths).toEqual(dirs.map((d) => path.resolve(d)).sort());
+    for (const entry of page.repositories) {
+      expect(entry.remoteUrl).toBe('git@github.com:MYCOMPANY/REPO.git');
+      expect(entry.siblings).toHaveLength(3);
+    }
+  });
+
+  it('lists all four sibling clones that share a name and remote (#2054)', async () => {
+    const { dirs, entries } = makeSiblingClonesFixture(4);
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+
+    // Precondition: the historical 6-char base64url suffixes really do collide
+    // for these sibling paths — otherwise this test would not exercise the bug.
+    expect(legacyPathSuffix(dirs[1])).toBe(legacyPathSuffix(dirs[2]));
+    expect(legacyPathSuffix(dirs[2])).toBe(legacyPathSuffix(dirs[3]));
+
+    expect(await backend.init()).toBe(true);
+
+    const listed = await backend.listRepos();
+    expect(listed).toHaveLength(4);
+
+    // Every distinct on-disk clone survives exactly once — no silent overwrite.
+    const listedPaths = listed.map((r: any) => path.resolve(r.path)).sort();
+    expect(listedPaths).toEqual(dirs.map((d) => path.resolve(d)).sort());
+    expect(new Set(listedPaths).size).toBe(4);
+
+    // The shared remoteUrl must NOT collapse the entries; instead each entry
+    // reports the other three as siblings (existing list_repos contract).
+    for (const entry of listed) {
+      expect(entry.remoteUrl).toBe('git@github.com:MYCOMPANY/REPO.git');
+      expect(entry.siblings).toHaveLength(3);
+    }
+
+    // Every clone is addressable by its absolute path.
+    for (const dir of dirs) {
+      const resolved = await backend.resolveRepo(dir);
+      expect(resolved.repoPath).toBe(dir);
+    }
+
+    // Re-running list_repos (which re-reads the registry) is idempotent.
+    const again = await backend.listRepos();
+    expect(again).toHaveLength(4);
+  });
+
+  it('assigns distinct, resolvable generated ids past the first legacy collision (#2054)', async () => {
+    const { dirs, entries } = makeSiblingClonesFixture(4);
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    await backend.init();
+
+    // Resolve each clone by path, collect its in-memory id.
+    const handles = await Promise.all(dirs.map((d) => backend.resolveRepo(d)));
+    const ids = handles.map((h) => h.id);
+
+    // Ids are unique across all four clones.
+    expect(new Set(ids).size).toBe(4);
+    // First clone keeps the bare name; the rest are name-prefixed generated ids.
+    expect(ids[0]).toBe('repo');
+    for (const id of ids.slice(1)) expect(id.startsWith('repo-')).toBe(true);
+
+    // Clones that collided on the legacy suffix fall back to a content hash —
+    // i.e. they are NOT addressable by the (colliding) legacy id, but ARE
+    // addressable by whatever stable id they actually hold.
+    const collidedLegacy = `repo-${legacyPathSuffix(dirs[2])}`;
+    expect(handles[2].id).not.toBe(collidedLegacy);
+    expect(handles[3].id).not.toBe(handles[2].id);
+
+    // Each *suffixed* generated id resolves back to its own clone. The bare
+    // "repo" id is intentionally shadowed by the shared repo *name* (the #1658
+    // name tier runs before the id tier), so the first clone is addressed by
+    // path instead — covered by the headline test.
+    for (const h of handles.slice(1)) {
+      const viaId = await backend.resolveRepo(h.id);
+      expect(viaId.repoPath).toBe(h.repoPath);
+    }
+  });
+
+  it('keeps each clone’s generated id stable across a registry reorder (#2067)', async () => {
+    // Ids are assigned over a path-sorted view, so the same resolved path always
+    // gets the same id regardless of registry order — a memorized hashed id
+    // can't drift to a different clone after a reorder.
+    const { dirs, entries } = makeSiblingClonesFixture(4);
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    await backend.init();
+    const before: Record<string, string> = {};
+    for (const d of dirs) before[d] = (await backend.resolveRepo(d)).id;
+
+    // Reverse the registry order and refresh.
+    (listRegisteredRepos as any).mockResolvedValue([...entries].reverse());
+    await backend.callTool('list_repos', {});
+
+    for (const d of dirs) {
+      expect((await backend.resolveRepo(d)).id).toBe(before[d]); // same path → same id
+    }
+  });
+
+  it('refresh stability: reorder, remove-one, and re-add never drop a different clone (#2054)', async () => {
+    const { dirs, entries } = makeSiblingClonesFixture(4);
+    const listedPaths = async () =>
+      (await backend.listRepos()).map((r: any) => path.resolve(r.path)).sort();
+    const allPaths = dirs.map((d) => path.resolve(d)).sort();
+
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    await backend.init();
+    expect(await listedPaths()).toEqual(allPaths);
+
+    // Reordering the registry must not silently lose a clone. (Under path-sorted
+    // assignment a reorder is a no-op for id assignment; id stability across
+    // reorder is asserted separately above. This step remains a set-survival
+    // guard.)
+    (listRegisteredRepos as any).mockResolvedValue([...entries].reverse());
+    expect(await listedPaths()).toEqual(allPaths);
+
+    // Removing one entry prunes only that entry.
+    (listRegisteredRepos as any).mockResolvedValue(entries.slice(0, 3));
+    expect(await listedPaths()).toEqual(
+      dirs
+        .slice(0, 3)
+        .map((d) => path.resolve(d))
+        .sort(),
+    );
+
+    // Re-adding it restores it without replacing another clone.
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    expect(await listedPaths()).toEqual(allPaths);
+  });
+
+  it('gives two same-name clones independent pools and never evicts on id reassignment (#2067)', async () => {
+    // The pool (and the init/staleness/reinit maps) are keyed by the immutable
+    // lbugPath, so two clones that transiently share a name-derived id get
+    // SEPARATE pool entries — neither can be served the other's database — and a
+    // pure id reassignment (path still registered) needs no pool eviction.
+    const parent = mkdtempSync(path.join(os.tmpdir(), 'gnx-remap-'));
+    duplicateFixtureDirs.push(parent);
+    const a = path.join(parent, 'A'); // 'A' sorts before 'B'
+    const b = path.join(parent, 'B');
+    const lbug = (dir: string) => path.join(dir, '.gitnexus', 'lbug');
+    const mk = (dir: string) => {
+      mkdirSync(lbug(dir), { recursive: true });
+      writeFileSync(path.join(dir, '.gitnexus', 'meta.json'), '{}');
+      return {
+        ...MOCK_REPO_ENTRY,
+        name: 'dup',
+        path: dir,
+        storagePath: path.join(dir, '.gitnexus'),
+      };
+    };
+    const entryA = mk(a);
+    const entryB = mk(b);
+
+    // Start with only B → B owns the bare "dup" id; resolve it.
+    (listRegisteredRepos as any).mockResolvedValue([entryB]);
+    await backend.init();
+    const handleB = await backend.resolveRepo(b);
+    expect(handleB.id).toBe('dup');
+
+    // Add A (sorts before B) → the bare "dup" id is reassigned to A.
+    (closeLbug as any).mockClear();
+    (listRegisteredRepos as any).mockResolvedValue([entryB, entryA]);
+    await backend.callTool('list_repos', {});
+    const handleA = await backend.resolveRepo(a);
+    expect(handleA.id).toBe('dup'); // A now owns the bare id
+    expect((await backend.resolveRepo(b)).id).not.toBe('dup'); // B moved to a suffix
+
+    // Reassigning the id evicts nothing — both paths are still registered.
+    expect(closeLbug).not.toHaveBeenCalled();
+
+    // Each clone initializes its OWN pool entry, keyed by its own lbugPath — no
+    // cross-serving even though they shared the "dup" id.
+    (initLbug as any).mockClear();
+    await (backend as any).ensureInitialized(handleA);
+    await (backend as any).ensureInitialized(handleB);
+    expect(initLbug).toHaveBeenCalledWith(lbug(a), lbug(a));
+    expect(initLbug).toHaveBeenCalledWith(lbug(b), lbug(b));
+  });
+
+  it('releases the pooled connection when a repo path leaves the registry (#2054)', async () => {
+    // When a clone's path is unregistered its pooled LadybugDB connection must
+    // be released. The pool is keyed by lbugPath, so eviction targets the path.
+    const parent = mkdtempSync(path.join(os.tmpdir(), 'gnx-vanish-'));
+    duplicateFixtureDirs.push(parent);
+    const dir = path.join(parent, 'solo');
+    const lbugPath = path.join(dir, '.gitnexus', 'lbug');
+    mkdirSync(lbugPath, { recursive: true });
+    writeFileSync(path.join(dir, '.gitnexus', 'meta.json'), '{}');
+    const entry = {
+      ...MOCK_REPO_ENTRY,
+      name: 'solo',
+      path: dir,
+      storagePath: path.join(dir, '.gitnexus'),
+    };
+
+    (listRegisteredRepos as any).mockResolvedValue([entry]);
+    await backend.init();
+    expect((await backend.resolveRepo(dir)).id).toBe('solo');
+
+    // Registry now empty → the clone's path vanishes on refresh.
+    (closeLbug as any).mockClear();
+    (listRegisteredRepos as any).mockResolvedValue([]);
+    await backend.callTool('list_repos', {});
+
+    expect(closeLbug).toHaveBeenCalledWith(lbugPath);
+  });
+
+  it('initializes the resolved clone, not a clone the id was remapped to mid-call (#2067)', async () => {
+    // ensureInitialized takes the resolved RepoHandle, so even if a concurrent
+    // refresh remaps the (floating) bare id to a different clone between resolve
+    // and init, it opens the clone the caller actually resolved — not whatever
+    // the id now points at. Pre-fix (by-id re-derivation) it opened the remapped
+    // clone's database.
+    const parent = mkdtempSync(path.join(os.tmpdir(), 'gnx-race-'));
+    duplicateFixtureDirs.push(parent);
+    const a = path.join(parent, 'A'); // 'A' sorts before 'B'
+    const b = path.join(parent, 'B');
+    const mk = (dir: string) => {
+      mkdirSync(path.join(dir, '.gitnexus', 'lbug'), { recursive: true });
+      writeFileSync(path.join(dir, '.gitnexus', 'meta.json'), '{}');
+      return {
+        ...MOCK_REPO_ENTRY,
+        name: 'dup',
+        path: dir,
+        storagePath: path.join(dir, '.gitnexus'),
+      };
+    };
+    const entryA = mk(a);
+    const entryB = mk(b);
+
+    // Only B registered → B owns the bare "dup" id; resolve it.
+    (listRegisteredRepos as any).mockResolvedValue([entryB]);
+    await backend.init();
+    const resolvedB = await backend.resolveRepo(b);
+    expect(resolvedB.id).toBe('dup');
+
+    // Concurrent refresh adds A (sorts first) → the bare "dup" id now maps to A.
+    (listRegisteredRepos as any).mockResolvedValue([entryB, entryA]);
+    await backend.callTool('list_repos', {});
+    expect((await backend.resolveRepo(a)).id).toBe('dup'); // id remapped to A
+
+    // Initialize with the handle resolved BEFORE the remap → must open B's path
+    // (pool keyed by B's lbugPath), never A's.
+    (initLbug as any).mockClear();
+    await (backend as any).ensureInitialized(resolvedB);
+    const lbug = (dir: string) => path.join(dir, '.gitnexus', 'lbug');
+    expect(initLbug).toHaveBeenCalledWith(lbug(b), lbug(b));
+    expect(initLbug).not.toHaveBeenCalledWith(lbug(a), lbug(a));
+  });
+
+  it('handles more than four sibling clones — all listed once and resolvable (#2067)', async () => {
+    const { dirs, entries } = makeSiblingClonesFixture(6);
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    await backend.init();
+
+    const listed = await backend.listRepos();
+    expect(listed).toHaveLength(6);
+
+    // All six ids are distinct (clones 3–6 exercise the sha256 fallback tier).
+    const ids = await Promise.all(dirs.map(async (d) => (await backend.resolveRepo(d)).id));
+    expect(new Set(ids).size).toBe(6);
+    for (const d of dirs) expect((await backend.resolveRepo(d)).repoPath).toBe(d);
+  });
+
+  it('lists same-name clones with no remoteUrl without grouping or collapse (#2067)', async () => {
+    const { dirs, entries } = makeSiblingClonesFixture(2);
+    // Strip remoteUrl — same name, no remote fingerprint.
+    const noRemote = entries.map((e) => ({ ...e, remoteUrl: undefined }));
+    (listRegisteredRepos as any).mockResolvedValue(noRemote);
+    await backend.init();
+
+    const listed = await backend.listRepos();
+    expect(listed).toHaveLength(2); // both present, not collapsed
+    for (const e of listed) {
+      expect(e.remoteUrl).toBeUndefined();
+      expect(e.siblings).toBeUndefined(); // no remote → no sibling grouping
+    }
+    for (const d of dirs) expect((await backend.resolveRepo(d)).repoPath).toBe(d);
   });
 });
 
@@ -1071,6 +2030,7 @@ describe('callTool cypher write blocking', () => {
 
   for (const query of writeQueries) {
     it(`blocks write query: ${query.slice(0, 30)}...`, async () => {
+      (executeParameterized as any).mockRejectedValueOnce(new Error('read-only database'));
       const result = await backend.callTool('cypher', { query });
       expect(result).toHaveProperty('error');
       expect(result.error).toContain('Write operations');
@@ -1078,7 +2038,7 @@ describe('callTool cypher write blocking', () => {
   }
 
   it('allows read query through callTool', async () => {
-    (executeQuery as any).mockResolvedValue([]);
+    (executeParameterized as any).mockResolvedValue([]);
     const result = await backend.callTool('cypher', {
       query: 'MATCH (n:Function) RETURN n.name LIMIT 5',
     });
@@ -1100,14 +2060,14 @@ describe('LocalBackend.listRepos', () => {
   it('returns empty array when no repos', async () => {
     setupNoRepos();
     await backend.init();
-    const repos = await backend.callTool('list_repos', {});
+    const repos = await backend.listRepos();
     expect(repos).toEqual([]);
   });
 
   it('returns repo metadata', async () => {
     setupSingleRepo();
     await backend.init();
-    const repos = await backend.callTool('list_repos', {});
+    const repos = await backend.listRepos();
     expect(repos).toHaveLength(1);
     expect(repos[0]).toEqual(
       expect.objectContaining({
@@ -1122,37 +2082,269 @@ describe('LocalBackend.listRepos', () => {
   it('re-reads registry on each listRepos call', async () => {
     setupSingleRepo();
     await backend.init();
-    await backend.callTool('list_repos', {});
-    await backend.callTool('list_repos', {});
+    await backend.listRepos();
+    await backend.listRepos();
     // listRegisteredRepos called: once in init, once per listRepos
     expect(listRegisteredRepos).toHaveBeenCalledTimes(3);
   });
+});
 
-  it('filters listed and default repos using the MCP allow-list', async () => {
-    process.env.GITNEXUS_MCP_ALLOWED_REPOS = 'other-project';
-    process.env.GITNEXUS_MCP_DEFAULT_REPO = 'other-project';
-    setupMultipleRepos();
-    await backend.init();
+// ─── list_repos pagination (#2119) ─────────────────────────────────────
 
-    const repos = await backend.callTool('list_repos', {});
-    expect(repos).toHaveLength(1);
-    expect(repos[0].name).toBe('other-project');
+describe('parseListReposPagination', () => {
+  const opts = { defaultLimit: 50, maxLimit: 200 };
 
-    const resolved = await backend.resolveRepo();
-    expect(resolved.name).toBe('other-project');
-    await expect(backend.resolveRepo('test-project')).rejects.toThrow(
-      'Repository "test-project" not found',
-    );
+  it('applies defaults when nothing is supplied', () => {
+    expect(parseListReposPagination(undefined, opts)).toEqual({ limit: 50, offset: 0 });
+    expect(parseListReposPagination({}, opts)).toEqual({ limit: 50, offset: 0 });
   });
 
-  it('rejects mutating tools in MCP read-only mode', async () => {
-    process.env.GITNEXUS_MCP_READ_ONLY = '1';
-    setupSingleRepo();
+  it('accepts valid integer limit/offset', () => {
+    expect(parseListReposPagination({ limit: 10, offset: 20 }, opts)).toEqual({
+      limit: 10,
+      offset: 20,
+    });
+  });
+
+  it('rejects a limit above the maximum (does not silently clamp)', () => {
+    expect(() => parseListReposPagination({ limit: 201 }, opts)).toThrow(/limit/);
+    expect(() => parseListReposPagination({ limit: 99999 }, opts)).toThrow(/limit/);
+  });
+
+  it('accepts a valid in-range limit, including the boundary', () => {
+    expect(parseListReposPagination({ limit: 200 }, opts).limit).toBe(200);
+    expect(parseListReposPagination({ limit: 199 }, opts).limit).toBe(199);
+  });
+
+  it('rejects malformed limit values', () => {
+    for (const bad of [0, -5, 1.5, NaN, Infinity, '5', null, true, {}]) {
+      expect(() => parseListReposPagination({ limit: bad as any }, opts)).toThrow(/limit/);
+    }
+  });
+
+  it('rejects malformed offset values', () => {
+    for (const bad of [-1, 2.5, NaN, Infinity, '0', null, false]) {
+      expect(() => parseListReposPagination({ offset: bad as any }, opts)).toThrow(/offset/);
+    }
+  });
+});
+
+describe('LocalBackend.listReposPage / callTool list_repos pagination (#2119)', () => {
+  let backend: LocalBackend;
+
+  // Build N registry entries with unique, lexically-ordered names + paths and
+  // no remoteUrl (so no sibling grouping). Zero-padding makes lexical order
+  // equal numeric order, so page boundaries are predictable.
+  const id = (i: number) => `repo-${String(i).padStart(4, '0')}`;
+  const makeRepoEntries = (count: number) =>
+    Array.from({ length: count }, (_, i) => ({
+      ...MOCK_REPO_ENTRY,
+      name: id(i),
+      path: `/tmp/repos/${id(i)}`,
+      storagePath: `/tmp/repos/${id(i)}/.gitnexus`,
+    }));
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    backend = new LocalBackend();
+  });
+
+  it('default page caps a large registry and reports continuation metadata', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
     await backend.init();
 
-    await expect(
-      backend.callTool('rename', { repo: 'test-project', from: 'oldName', to: 'newName' }),
-    ).rejects.toThrow('read-only mode');
+    const page = await backend.callTool('list_repos', {});
+    expect(page.repositories).toHaveLength(50);
+    expect(page.pagination).toEqual({
+      total: 437,
+      limit: 50,
+      offset: 0,
+      returned: 50,
+      hasMore: true,
+      nextOffset: 50,
+    });
+    // First page starts at the first repo in deterministic order.
+    expect(page.repositories[0].name).toBe(id(0));
+  });
+
+  it('limit controls the page size', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
+    await backend.init();
+
+    const page = await backend.callTool('list_repos', { limit: 100 });
+    expect(page.repositories).toHaveLength(100);
+    expect(page.pagination.limit).toBe(100);
+    expect(page.pagination.nextOffset).toBe(100);
+  });
+
+  it('offset selects a middle page', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
+    await backend.init();
+
+    const page = await backend.callTool('list_repos', { limit: 50, offset: 50 });
+    expect(page.repositories[0].name).toBe(id(50));
+    expect(page.repositories[49].name).toBe(id(99));
+    // Assert total + limit too (a total miscalculation at non-zero offset would
+    // otherwise slip past this targeted middle-page test).
+    expect(page.pagination).toEqual({
+      total: 437,
+      limit: 50,
+      offset: 50,
+      returned: 50,
+      hasMore: true,
+      nextOffset: 100,
+    });
+  });
+
+  it('returns the final partial page with hasMore=false and no nextOffset', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
+    await backend.init();
+
+    const page = await backend.callTool('list_repos', { limit: 50, offset: 400 });
+    expect(page.repositories).toHaveLength(37); // 437 - 400
+    expect(page.pagination.returned).toBe(37);
+    expect(page.pagination.hasMore).toBe(false);
+    expect(page.pagination).not.toHaveProperty('nextOffset');
+  });
+
+  it('limit larger than the remaining count returns only the remaining entries', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
+    await backend.init();
+
+    const page = await backend.callTool('list_repos', { limit: 200, offset: 400 });
+    expect(page.repositories).toHaveLength(37);
+    expect(page.pagination.hasMore).toBe(false);
+  });
+
+  it('offset equal to total returns an empty page (total preserved)', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
+    await backend.init();
+
+    const page = await backend.callTool('list_repos', { offset: 437 });
+    expect(page.repositories).toHaveLength(0);
+    expect(page.pagination).toMatchObject({ total: 437, returned: 0, hasMore: false });
+    expect(page.pagination).not.toHaveProperty('nextOffset');
+  });
+
+  it('offset beyond total returns an empty page', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
+    await backend.init();
+
+    const page = await backend.callTool('list_repos', { offset: 1000 });
+    expect(page.repositories).toHaveLength(0);
+    expect(page.pagination).toMatchObject({
+      total: 437,
+      offset: 1000,
+      returned: 0,
+      hasMore: false,
+    });
+  });
+
+  it('accepts a negative-zero offset (treated as the first page)', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
+    await backend.init();
+
+    const page = await backend.callTool('list_repos', { limit: 5, offset: -0 });
+    expect(page.repositories[0].name).toBe(id(0));
+    expect(page.pagination.returned).toBe(5);
+    // -0 is accepted (not rejected) and behaves as offset 0 (=== treats them equal).
+    expect(page.pagination.offset === 0).toBe(true);
+  });
+
+  it('accepts a MAX_SAFE_INTEGER offset and returns an empty page', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
+    await backend.init();
+
+    const page = await backend.callTool('list_repos', { offset: Number.MAX_SAFE_INTEGER });
+    expect(page.repositories).toHaveLength(0);
+    expect(page.pagination).toMatchObject({ total: 437, returned: 0, hasMore: false });
+    expect(page.pagination).not.toHaveProperty('nextOffset');
+  });
+
+  it('returns the full set with metadata when everything fits on one page', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(3));
+    await backend.init();
+
+    const page = await backend.callTool('list_repos', {});
+    expect(page.repositories).toHaveLength(3);
+    expect(page.pagination).toEqual({
+      total: 3,
+      limit: 50,
+      offset: 0,
+      returned: 3,
+      hasMore: false,
+    });
+  });
+
+  it('rejects a limit above the maximum through the real callTool path', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(437));
+    await backend.init();
+
+    await expect(backend.callTool('list_repos', { limit: 99999 })).rejects.toThrow(/limit/);
+    // A request at the documented maximum is still accepted.
+    const page = await backend.callTool('list_repos', { limit: 200 });
+    expect(page.repositories).toHaveLength(200);
+    expect(page.pagination.limit).toBe(200);
+    expect(page.pagination.hasMore).toBe(true);
+  });
+
+  it('rejects malformed limit/offset through the real callTool path', async () => {
+    (listRegisteredRepos as any).mockResolvedValue(makeRepoEntries(3));
+    await backend.init();
+
+    await expect(backend.callTool('list_repos', { limit: 0 })).rejects.toThrow(/limit/);
+    await expect(backend.callTool('list_repos', { limit: -5 })).rejects.toThrow(/limit/);
+    await expect(backend.callTool('list_repos', { limit: 1.5 })).rejects.toThrow(/limit/);
+    await expect(backend.callTool('list_repos', { limit: 'all' as any })).rejects.toThrow(/limit/);
+    await expect(backend.callTool('list_repos', { offset: -1 })).rejects.toThrow(/offset/);
+    await expect(backend.callTool('list_repos', { offset: 2.5 })).rejects.toThrow(/offset/);
+  });
+
+  it('traverses every repository exactly once across pages (the #2119 guarantee)', async () => {
+    const entries = makeRepoEntries(437);
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    await backend.init();
+
+    const collected: string[] = [];
+    let offset = 0;
+    const limit = 50;
+    // Hard cap iterations to avoid an infinite loop if hasMore were ever wrong.
+    for (let guard = 0; guard < 100; guard++) {
+      const page = await backend.callTool('list_repos', { limit, offset });
+      collected.push(...page.repositories.map((r: any) => r.path));
+      expect(page.pagination.total).toBe(437);
+      if (!page.pagination.hasMore) break;
+      offset = page.pagination.nextOffset;
+    }
+
+    expect(collected).toHaveLength(437);
+    expect(new Set(collected).size).toBe(437); // no duplicates
+    expect(new Set(collected)).toEqual(new Set(entries.map((e) => e.path))); // exact set
+  });
+
+  it('orders pages deterministically by name then path, stable across calls', async () => {
+    // Scrambled input order; two entries deliberately SHARE a name (collision)
+    // and must be tie-broken by path, never collapsed.
+    const entries = [
+      { ...MOCK_REPO_ENTRY, name: 'zeta', path: '/tmp/z', storagePath: '/tmp/z/.gitnexus' },
+      { ...MOCK_REPO_ENTRY, name: 'shared', path: '/tmp/b', storagePath: '/tmp/b/.gitnexus' },
+      { ...MOCK_REPO_ENTRY, name: 'Alpha', path: '/tmp/a', storagePath: '/tmp/a/.gitnexus' },
+      { ...MOCK_REPO_ENTRY, name: 'shared', path: '/tmp/a2', storagePath: '/tmp/a2/.gitnexus' },
+    ];
+    (listRegisteredRepos as any).mockResolvedValue(entries);
+    await backend.init();
+
+    const first = await backend.callTool('list_repos', {});
+    const order = first.repositories.map((r: any) => `${r.name}@${r.path}`);
+    // lower-cased name primary (Alpha < shared < zeta), path tie-break for the
+    // two "shared" entries (/tmp/a2 < /tmp/b).
+    expect(order).toEqual(['Alpha@/tmp/a', 'shared@/tmp/a2', 'shared@/tmp/b', 'zeta@/tmp/z']);
+    expect(first.repositories).toHaveLength(4); // collision not collapsed
+
+    // Re-listing yields identical page boundaries.
+    const second = await backend.callTool('list_repos', {});
+    expect(second.repositories.map((r: any) => `${r.name}@${r.path}`)).toEqual(order);
   });
 });
 
@@ -1204,7 +2396,7 @@ describe('cypher result formatting', () => {
   });
 
   it('formats tabular results as markdown table', async () => {
-    (executeQuery as any).mockResolvedValue([
+    (executeParameterized as any).mockResolvedValue([
       { name: 'main', filePath: 'src/index.ts' },
       { name: 'helper', filePath: 'src/utils.ts' },
     ]);
@@ -1218,7 +2410,7 @@ describe('cypher result formatting', () => {
   });
 
   it('returns empty array as-is', async () => {
-    (executeQuery as any).mockResolvedValue([]);
+    (executeParameterized as any).mockResolvedValue([]);
     const result = await backend.callTool('cypher', {
       query: 'MATCH (n:Function) RETURN n.name LIMIT 0',
     });
@@ -1226,7 +2418,7 @@ describe('cypher result formatting', () => {
   });
 
   it('returns error object when cypher fails', async () => {
-    (executeQuery as any).mockRejectedValue(new Error('Syntax error'));
+    (executeParameterized as any).mockRejectedValue(new Error('Syntax error'));
     const result = await backend.callTool('cypher', {
       query: 'INVALID CYPHER SYNTAX',
     });

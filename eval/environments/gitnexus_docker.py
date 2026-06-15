@@ -27,9 +27,11 @@ import time
 from pathlib import Path
 
 from constants import (
+    EVAL_SERVER_HOST,
     EVAL_SERVER_HEALTH_INTERVAL_SECONDS,
     EVAL_SERVER_HEALTH_RETRIES,
     EVAL_SERVER_HEALTH_TIMEOUT_SECONDS,
+    EVAL_SERVER_PORT,
 )
 from minisweagent.environments.docker import DockerEnvironment
 from tool_registry import TOOL_SPECS, ToolScriptSpec
@@ -38,7 +40,19 @@ from utils.errors import is_debug_enabled, log_safe_exception
 logger = logging.getLogger("gitnexus_docker")
 
 DEFAULT_CACHE_DIR = Path.home() / ".gitnexus-eval-cache"
-EVAL_SERVER_PORT = 4848
+
+
+def _http_probe_host(host: str) -> str:
+    """Return a host literal suitable for probing the daemon from inside the container."""
+    if host == "0.0.0.0":
+        return "127.0.0.1"
+    if host in {"::", "[::]"}:
+        return "[::1]"
+    if host.startswith("[") and host.endswith("]"):
+        return host
+    if ":" in host:
+        return f"[{host}]"
+    return host
 
 
 class GitNexusDockerEnvironment(DockerEnvironment):
@@ -62,6 +76,7 @@ class GitNexusDockerEnvironment(DockerEnvironment):
         skip_embeddings: bool = True,
         gitnexus_timeout: int = 120,
         eval_server_port: int = EVAL_SERVER_PORT,
+        eval_server_host: str = EVAL_SERVER_HOST,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -70,6 +85,7 @@ class GitNexusDockerEnvironment(DockerEnvironment):
         self.skip_embeddings = skip_embeddings
         self.gitnexus_timeout = gitnexus_timeout
         self.eval_server_port = eval_server_port
+        self.eval_server_host = eval_server_host
         self.index_time: float = 0.0
         self._gitnexus_ready = False
 
@@ -165,22 +181,27 @@ class GitNexusDockerEnvironment(DockerEnvironment):
 
     def _start_eval_server(self):
         """Start the GitNexus eval-server daemon in the background."""
-        logger.info(f"Starting eval-server on port {self.eval_server_port}...")
+        logger.info(
+            f"Starting eval-server on {self.eval_server_host}:{self.eval_server_port}..."
+        )
 
         self.execute({
             "command": (
                 f"nohup npx gitnexus eval-server --port {self.eval_server_port} "
+                f"--host {self.eval_server_host} "
                 f"--idle-timeout 600 "
                 f"> /tmp/gitnexus-eval-server.log 2>&1 &"
             ),
             "timeout": 5,
         })
 
+        health_host = _http_probe_host(self.eval_server_host)
+
         # Wait for the server to be ready (up to ~15s for KuzuDB init)
         for i in range(EVAL_SERVER_HEALTH_RETRIES):
             time.sleep(EVAL_SERVER_HEALTH_INTERVAL_SECONDS)
             health = self.execute({
-                "command": f"curl -sf http://127.0.0.1:{self.eval_server_port}/health 2>/dev/null || echo 'NOT_READY'",
+                "command": f"curl -sf http://{health_host}:{self.eval_server_port}/health 2>/dev/null || echo 'NOT_READY'",
                 "timeout": EVAL_SERVER_HEALTH_TIMEOUT_SECONDS,
             })
             output = health.get("output", "").strip()
@@ -201,7 +222,7 @@ class GitNexusDockerEnvironment(DockerEnvironment):
         )
 
     @staticmethod
-    def _render_tool_script(spec: ToolScriptSpec, port: str) -> str:
+    def _render_tool_script(spec: ToolScriptSpec, port: str, host: str = EVAL_SERVER_HOST) -> str:
         """
         Render a standalone bash script for a GitNexus tool.
 
@@ -212,6 +233,7 @@ class GitNexusDockerEnvironment(DockerEnvironment):
 
         if spec.endpoint:
             lines.append(f'PORT="${{GITNEXUS_EVAL_PORT:-{port}}}"')
+            lines.append(f'HOST="${{GITNEXUS_EVAL_HOST:-{host}}}"')
 
         if spec.header:
             lines.append(spec.header.strip())
@@ -221,7 +243,7 @@ class GitNexusDockerEnvironment(DockerEnvironment):
 
         if spec.endpoint:
             lines.append(
-                f'result=$(curl -sf -X POST "http://127.0.0.1:${{PORT}}{spec.endpoint}" '
+                f'result=$(curl -sf -X POST "http://${{HOST}}:${{PORT}}{spec.endpoint}" '
                 '-H "Content-Type: application/json" -d "$payload" 2>/dev/null)'
             )
             lines.append('if [ $? -eq 0 ] && [ -n "$result" ]; then echo "$result"; exit 0; fi')
@@ -244,9 +266,10 @@ class GitNexusDockerEnvironment(DockerEnvironment):
         Uses heredocs with quoted delimiter to avoid all quoting/escaping issues.
         """
         port = str(self.eval_server_port)
+        host = self.eval_server_host
 
         for spec in TOOL_SPECS.values():
-            script_content = self._render_tool_script(spec, port).strip()
+            script_content = self._render_tool_script(spec, port, host).strip()
             # Use heredoc with quoted delimiter — prevents all variable expansion and quoting issues
             self.execute({
                 "command": (
@@ -387,5 +410,6 @@ class GitNexusDockerEnvironment(DockerEnvironment):
             "index_time_seconds": round(self.index_time, 2),
             "skip_embeddings": self.skip_embeddings,
             "eval_server_port": self.eval_server_port,
+            "eval_server_host": self.eval_server_host,
         }
         return base

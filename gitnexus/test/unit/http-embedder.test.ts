@@ -92,23 +92,43 @@ describe('HTTP embedding backend', () => {
       const body = JSON.parse((fetch as any).mock.calls[0][1].body);
       expect(body.model).toBe('test-model');
       expect(body.input).toEqual(['test text']);
-      expect(body.dimensions).toBeUndefined();
       expect(result).toBeInstanceOf(Float32Array);
       expect(result.length).toBe(384);
     });
 
-    it('sends configured dimensions in HTTP embedding requests', async () => {
+    it('omits dimensions from request body when GITNEXUS_EMBEDDING_DIMS is unset', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
-      process.env.GITNEXUS_EMBEDDING_API_KEY = 'test-key';
-      process.env.GITNEXUS_EMBEDDING_DIMS = '1024';
+      // GITNEXUS_EMBEDDING_DIMS intentionally unset
 
-      const mockEmbedding = Array.from({ length: 1024 }, (_, i) => i * 0.001);
       vi.stubGlobal(
         'fetch',
         vi.fn().mockResolvedValue({
           ok: true,
-          json: async () => ({ data: [{ embedding: mockEmbedding }] }),
+          json: async () => ({ data: [{ embedding: mockVec }] }),
+        }),
+      );
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      await embedText('test text');
+
+      const body = JSON.parse((fetch as any).mock.calls[0][1].body);
+      // Backends that reject unknown fields must see the pre-existing
+      // request shape. The field must be absent, not `undefined`.
+      expect('dimensions' in body).toBe(false);
+    });
+
+    it('forwards GITNEXUS_EMBEDDING_DIMS as dimensions in request body', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'text-embedding-3-large';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '1024';
+
+      const vec1024 = Array.from({ length: 1024 }, (_, i) => i / 1024);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          ok: true,
+          json: async () => ({ data: [{ embedding: vec1024 }] }),
         }),
       );
 
@@ -116,26 +136,22 @@ describe('HTTP embedding backend', () => {
       const result = await embedText('test text');
 
       const body = JSON.parse((fetch as any).mock.calls[0][1].body);
-      expect(body).toMatchObject({
-        model: 'test-model',
-        input: ['test text'],
-        dimensions: 1024,
-      });
+      expect(body.dimensions).toBe(1024);
+      expect(body.model).toBe('text-embedding-3-large');
       expect(result.length).toBe(1024);
     });
 
-    it('sends configured dimensions as output_dimension for Voyage', async () => {
+    it('forwards GITNEXUS_EMBEDDING_DIMS as output_dimension for Voyage', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'https://api.voyageai.com/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'voyage-code-3';
-      process.env.GITNEXUS_EMBEDDING_API_KEY = 'test-key';
-      process.env.GITNEXUS_EMBEDDING_DIMS = '1024';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '2048';
 
-      const mockEmbedding = Array.from({ length: 1024 }, (_, i) => i * 0.001);
+      const vec2048 = Array.from({ length: 2048 }, (_, i) => i / 2048);
       vi.stubGlobal(
         'fetch',
         vi.fn().mockResolvedValue({
           ok: true,
-          json: async () => ({ data: [{ embedding: mockEmbedding }] }),
+          json: async () => ({ data: [{ embedding: vec2048 }] }),
         }),
       );
 
@@ -143,13 +159,32 @@ describe('HTTP embedding backend', () => {
       const result = await embedText('test text');
 
       const body = JSON.parse((fetch as any).mock.calls[0][1].body);
-      expect(body).toMatchObject({
-        model: 'voyage-code-3',
-        input: ['test text'],
-        output_dimension: 1024,
-      });
+      expect(body.output_dimension).toBe(2048);
       expect(body.dimensions).toBeUndefined();
-      expect(result.length).toBe(1024);
+      expect(body.model).toBe('voyage-code-3');
+      expect(result.length).toBe(2048);
+    });
+
+    it('forwards dimensions on the single-query path', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'text-embedding-3-large';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '512';
+
+      const vec512 = Array.from({ length: 512 }, (_, i) => i / 512);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          ok: true,
+          json: async () => ({ data: [{ embedding: vec512 }] }),
+        }),
+      );
+
+      const mod = await import('../../src/mcp/core/embedder.js');
+      const result = await mod.embedQuery('query text');
+
+      const body = JSON.parse((fetch as any).mock.calls[0][1].body);
+      expect(body.dimensions).toBe(512);
+      expect(result.length).toBe(512);
     });
 
     it('retries on server error', async () => {
@@ -195,7 +230,8 @@ describe('HTTP embedding backend', () => {
     it('excludes API key from error messages', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
-      process.env.GITNEXUS_EMBEDDING_API_KEY = 'secret-key-12345';
+      const redactionProbeKey = 'test-api-key-redaction-check';
+      process.env.GITNEXUS_EMBEDDING_API_KEY = redactionProbeKey;
 
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 500 }));
 
@@ -203,7 +239,7 @@ describe('HTTP embedding backend', () => {
       try {
         await embedText('test');
       } catch (e: any) {
-        expect(e.message).not.toContain('secret-key-12345');
+        expect(e.message).not.toContain(redactionProbeKey);
         expect(e.message).not.toContain('Authorization');
       }
     });
@@ -245,6 +281,51 @@ describe('HTTP embedding backend', () => {
 
       expect(fetch).toHaveBeenCalledTimes(2);
       expect(results).toHaveLength(70);
+    });
+
+    it('forwards dimensions in every batch when splitting large inputs', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '512';
+
+      const vec512 = Array.from({ length: 512 }, (_, i) => i / 512);
+      const makeResp = (n: number) => ({
+        ok: true,
+        json: async () => ({ data: Array.from({ length: n }, () => ({ embedding: vec512 })) }),
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValueOnce(makeResp(64)).mockResolvedValueOnce(makeResp(6)),
+      );
+
+      const { embedBatch } = await import('../../src/core/embeddings/embedder.js');
+      const results = await embedBatch(Array.from({ length: 70 }, (_, i) => `text ${i}`));
+
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(results).toHaveLength(70);
+
+      // Verify dimensions is sent in BOTH batch requests
+      const body0 = JSON.parse((fetch as any).mock.calls[0][1].body);
+      const body1 = JSON.parse((fetch as any).mock.calls[1][1].body);
+      expect(body0.dimensions).toBe(512);
+      expect(body1.dimensions).toBe(512);
+    });
+
+    it('rejects non-numeric GITNEXUS_EMBEDDING_DIMS values', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '1024abc';
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          ok: true,
+          json: async () => ({ data: [{ embedding: mockVec }] }),
+        }),
+      );
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      await expect(embedText('test')).rejects.toThrow('must be a positive integer');
     });
 
     it('rejects initEmbedder when using HTTP backend', async () => {

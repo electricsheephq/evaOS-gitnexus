@@ -5,17 +5,26 @@
  * and standard export/import resolution. PHP files can use a variety of
  * extensions from legacy versions through modern PHP 8.
  */
+import {
+  emitPhpScopeCaptures,
+  interpretPhpImport,
+  interpretPhpTypeBinding,
+  phpArityCompatibility,
+  phpMergeBindings,
+  resolvePhpImportTarget,
+  phpBindingScopeFor,
+  phpImportOwningScope,
+  phpReceiverBinding,
+} from './php/index.js';
 
 import { SupportedLanguages } from 'gitnexus-shared';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import { phpClassConfig } from '../class-extractors/configs/php.js';
-import { defineLanguage } from '../language-provider.js';
-import type { AstFrameworkPatternConfig } from '../language-provider.js';
+import { defineLanguage, type AstFrameworkPatternConfig } from '../language-provider.js';
 import { typeConfig as phpConfig } from '../type-extractors/php.js';
 import { phpExportChecker } from '../export-detection.js';
 import { createImportResolver } from '../import-resolvers/resolver-factory.js';
 import { phpImportConfig } from '../import-resolvers/configs/php.js';
-import { extractPhpNamedBindings } from '../named-bindings/php.js';
 import { PHP_QUERIES } from '../tree-sitter-queries.js';
 import { findDescendant, extractStringContent, type SyntaxNode } from '../utils/ast-helpers.js';
 import type { NodeLabel } from 'gitnexus-shared';
@@ -27,7 +36,6 @@ import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { phpVariableConfig } from '../variable-extractors/configs/php.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { phpCallConfig } from '../call-extractors/configs/php.js';
-import { createHeritageExtractor } from '../heritage-extractors/generic.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'echo',
@@ -279,14 +287,26 @@ export const phpProvider = defineLanguage({
   typeConfig: phpConfig,
   exportChecker: phpExportChecker,
   importResolver: createImportResolver(phpImportConfig),
-  namedBindingExtractor: extractPhpNamedBindings,
   callExtractor: createCallExtractor(phpCallConfig),
   fieldExtractor: createFieldExtractor(phpFieldConfig),
   methodExtractor: createMethodExtractor(phpMethodConfig),
   variableExtractor: createVariableExtractor(phpVariableConfig),
   classExtractor: createClassExtractor(phpClassConfig),
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.PHP),
   descriptionExtractor: phpDescriptionExtractor,
   isRouteFile: isPhpRouteFile,
   builtInNames: BUILT_INS,
+  // ── RFC #909 Ring 3: scope-based resolution hooks ──────────────────────
+  emitScopeCaptures: emitPhpScopeCaptures,
+  interpretImport: interpretPhpImport,
+  interpretTypeBinding: interpretPhpTypeBinding,
+  // LanguageProvider uses (def, callsite); phpArityCompatibility uses (def, callsite) — same.
+  arityCompatibility: phpArityCompatibility,
+  // LanguageProvider adapter: (parsedImport, workspaceIndex) → string | null
+  resolveImportTarget: resolvePhpImportTarget,
+  // mergeBindings on LanguageProvider: (scope, bindings) — ignore scope id,
+  // delegate to phpMergeBindings which uses binding origin tiers.
+  mergeBindings: (_scope, bindings) => [...phpMergeBindings(bindings)],
+  bindingScopeFor: phpBindingScopeFor,
+  importOwningScope: phpImportOwningScope,
+  receiverBinding: phpReceiverBinding,
 });

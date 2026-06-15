@@ -105,30 +105,62 @@ describe('analyzeCommand --embeddings [limit] parsing', () => {
     expect(opts.embeddingsNodeLimit).toBeUndefined();
   });
 
-  it('forwards --skip-ai-context to the shared analyzer', async () => {
+  it('sets HTTP embedding CLI flags only for the analyze invocation', async () => {
+    const prior = {
+      url: process.env.GITNEXUS_EMBEDDING_URL,
+      model: process.env.GITNEXUS_EMBEDDING_MODEL,
+      apiKey: process.env.GITNEXUS_EMBEDDING_API_KEY,
+      dims: process.env.GITNEXUS_EMBEDDING_DIMS,
+    };
+    runFullAnalysisMock.mockImplementationOnce(async () => {
+      expect(process.env.GITNEXUS_EMBEDDING_URL).toBe('https://api.voyageai.com/v1');
+      expect(process.env.GITNEXUS_EMBEDDING_MODEL).toBe('voyage-code-3');
+      expect(process.env.GITNEXUS_EMBEDDING_API_KEY).toBe('test-embedding-token');
+      expect(process.env.GITNEXUS_EMBEDDING_DIMS).toBe('2048');
+      return {
+        repoName: 'repo',
+        repoPath: '/repo',
+        stats: {},
+        alreadyUpToDate: true,
+      };
+    });
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
-    await analyzeCommand(undefined, { skipAiContext: true });
+    await analyzeCommand(undefined, {
+      embeddings: true,
+      embeddingBaseUrl: ' https://api.voyageai.com/v1 ',
+      embeddingModel: ' voyage-code-3 ',
+      embeddingAuthToken: ' test-embedding-token ',
+      embeddingDims: '2048',
+    });
 
-    const opts = runFullAnalysisMock.mock.calls[0][1];
-    expect(opts.skipAiContext).toBe(true);
+    expect(process.env.GITNEXUS_EMBEDDING_URL).toBe(prior.url);
+    expect(process.env.GITNEXUS_EMBEDDING_MODEL).toBe(prior.model);
+    expect(process.env.GITNEXUS_EMBEDDING_API_KEY).toBe(prior.apiKey);
+    expect(process.env.GITNEXUS_EMBEDDING_DIMS).toBe(prior.dims);
   });
 
-  it('does not force a reindex when --skills is paired with --skip-ai-context', async () => {
+  it('applies --embedding-dims before LadybugDB embedding schema is imported', async () => {
+    runFullAnalysisMock.mockImplementationOnce(async () => {
+      const { EMBEDDING_DIMS, EMBEDDING_SCHEMA } = await import('../../src/core/lbug/schema.js');
+      expect(EMBEDDING_DIMS).toBe(2048);
+      expect(EMBEDDING_SCHEMA).toContain('embedding FLOAT[2048]');
+      return {
+        repoName: 'repo',
+        repoPath: '/repo',
+        stats: {},
+        alreadyUpToDate: true,
+      };
+    });
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
-    await analyzeCommand(undefined, { skills: true, skipAiContext: true });
+    await analyzeCommand(undefined, {
+      embeddings: true,
+      embeddingBaseUrl: 'https://api.voyageai.com/v1',
+      embeddingModel: 'voyage-code-3',
+      embeddingDims: '2048',
+    });
 
-    const opts = runFullAnalysisMock.mock.calls[0][1];
-    expect(opts.force).toBe(false);
-  });
-
-  it('still forces a reindex when --skills will generate AI context', async () => {
-    const { analyzeCommand } = await import('../../src/cli/analyze.js');
-
-    await analyzeCommand(undefined, { skills: true });
-
-    const opts = runFullAnalysisMock.mock.calls[0][1];
-    expect(opts.force).toBe(true);
+    expect(runFullAnalysisMock).toHaveBeenCalledTimes(1);
   });
 });

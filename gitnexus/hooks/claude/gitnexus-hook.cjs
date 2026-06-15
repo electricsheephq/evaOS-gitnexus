@@ -14,6 +14,9 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { acquireHookSlot } = require('./hook-lock.cjs');
+const { hasGitNexusDbLockedByGitNexusServer } = require('./hook-db-lock-probe.cjs');
+const { formatAnalyzeCommand } = require('./resolve-analyze-cmd.cjs');
 
 /**
  * Read JSON input from stdin synchronously.
@@ -75,6 +78,7 @@ function findCanonicalRepoRoot(cwd) {
       timeout: 2000,
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
     if (result.error || result.status !== 0) return null;
     const commonDir = (result.stdout || '').trim();
@@ -100,6 +104,28 @@ function findGitNexusDir(startDir) {
     return walkForGitNexusDir(canonicalRoot);
   }
   return null;
+}
+
+function hasGitNexusServerOwner(gitNexusDir) {
+  return hasGitNexusDbLockedByGitNexusServer(path.join(gitNexusDir, 'lbug'), process.pid);
+}
+
+function extractAugmentContext(stderr) {
+  const output = (stderr || '').trim();
+  const marker = output.indexOf('[GitNexus]');
+  const debug = process.env.GITNEXUS_DEBUG === '1' || process.env.GITNEXUS_DEBUG === 'true';
+  if (debug && output.length > 0) {
+    // Emit the FULL discarded prefix (everything before the marker, or all of
+    // it when no marker is present) so suppressed diagnostics — KuzuDB lock
+    // warnings, parser errors, etc. — remain recoverable on the hook's own
+    // stderr. The untruncated payload lets operators see exactly what was
+    // filtered out instead of a 180-char JSON-quoted preview.
+    const discarded = marker === -1 ? output : output.slice(0, marker).trim();
+    if (discarded.length > 0) {
+      process.stderr.write(`[GitNexus hook] augment stderr discarded prefix:\n${discarded}\n`);
+    }
+  }
+  return marker === -1 ? '' : output.slice(marker).trim();
 }
 
 /**
@@ -167,6 +193,10 @@ function extractPattern(toolName, toolInput) {
  * 3. Fall back to npx (returns empty string)
  */
 function resolveCliPath() {
+  const fromEnv = process.env.GITNEXUS_HOOK_CLI_PATH;
+  if (fromEnv !== undefined && String(fromEnv).trim() && fs.existsSync(String(fromEnv))) {
+    return String(fromEnv);
+  }
   let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');
   if (!fs.existsSync(cliPath)) {
     try {
@@ -190,6 +220,7 @@ function runGitNexusCli(cliPath, args, cwd, timeout) {
       timeout,
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
   }
   // On Windows, invoke npx.cmd directly (no shell needed)
@@ -198,6 +229,7 @@ function runGitNexusCli(cliPath, args, cwd, timeout) {
     timeout: timeout + 5000,
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
   });
 }
 
@@ -207,7 +239,8 @@ function runGitNexusCli(cliPath, args, cwd, timeout) {
 function handlePreToolUse(input) {
   const cwd = input.cwd || process.cwd();
   if (!path.isAbsolute(cwd)) return;
-  if (!findGitNexusDir(cwd)) return;
+  const gitNexusDir = findGitNexusDir(cwd);
+  if (!gitNexusDir) return;
 
   const toolName = input.tool_name || '';
   const toolInput = input.tool_input || {};
@@ -216,20 +249,29 @@ function handlePreToolUse(input) {
 
   const pattern = extractPattern(toolName, toolInput);
   if (!pattern || pattern.length < 3) return;
+  if (hasGitNexusServerOwner(gitNexusDir)) {
+    process.stderr.write('[GitNexus] augment skipped: MCP server owns DB\n');
+    return;
+  }
+
+  const release = acquireHookSlot(gitNexusDir);
+  if (!release) return;
 
   const cliPath = resolveCliPath();
   let result = '';
   try {
     const child = runGitNexusCli(cliPath, ['augment', '--', pattern], cwd, 7000);
     if (!child.error && child.status === 0) {
-      result = child.stderr || '';
+      result = extractAugmentContext(child.stderr || '');
     }
   } catch {
     /* graceful failure */
+  } finally {
+    release();
   }
 
-  if (result && result.trim()) {
-    sendHookResponse('PreToolUse', result.trim());
+  if (result) {
+    sendHookResponse('PreToolUse', result);
   }
 }
 
@@ -277,6 +319,7 @@ function handlePostToolUse(input) {
       timeout: 3000,
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
     currentHead = (headResult.stdout || '').trim();
   } catch {
@@ -296,9 +339,9 @@ function handlePostToolUse(input) {
   }
 
   // If HEAD matches last indexed commit, no reindex needed
-  if (currentHead && currentHead === lastCommit) return;
+  if (currentHead === lastCommit) return;
 
-  const analyzeCmd = `npx gitnexus analyze${hadEmbeddings ? ' --embeddings' : ''}`;
+  const analyzeCmd = formatAnalyzeCommand({ embeddings: hadEmbeddings });
   sendHookResponse(
     'PostToolUse',
     `GitNexus index is stale (last indexed: ${lastCommit ? lastCommit.slice(0, 7) : 'never'}). ` +

@@ -25,6 +25,10 @@ import { getGroupDir } from './storage.js';
 import { closeBridgeDb, openBridgeDbReadOnly, queryBridge, readBridgeMeta } from './bridge-db.js';
 import { BRIDGE_SCHEMA_VERSION } from './bridge-schema.js';
 
+// High limit for the local phase of group impact so collectImpactSymbolUids
+// sees (nearly) all symbols. Bypasses the MCP-facing default of 100.
+const GROUP_LOCAL_PHASE_LIMIT = 10000;
+
 /** Cross-boundary hops beyond this value are clamped (multi-hop reserved for future work). */
 export const MAX_SUPPORTED_CROSS_DEPTH = 1;
 
@@ -106,8 +110,11 @@ export const IMPACT_TIMEOUT_MIN_MS = 100;
 export const IMPACT_TIMEOUT_MAX_MS = 5 * 60 * 1_000;
 
 export function clampTimeout(timeoutMs: number): number {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return IMPACT_TIMEOUT_MIN_MS;
-  return Math.min(IMPACT_TIMEOUT_MAX_MS, Math.max(IMPACT_TIMEOUT_MIN_MS, Math.trunc(timeoutMs)));
+  if (!Number.isFinite(timeoutMs)) return IMPACT_TIMEOUT_MIN_MS;
+  const integerTimeoutMs = Math.trunc(timeoutMs);
+  if (integerTimeoutMs < IMPACT_TIMEOUT_MIN_MS) return IMPACT_TIMEOUT_MIN_MS;
+  if (integerTimeoutMs > IMPACT_TIMEOUT_MAX_MS) return IMPACT_TIMEOUT_MAX_MS;
+  return integerTimeoutMs;
 }
 
 export function validateGroupImpactParams(params: Record<string, unknown>):
@@ -217,6 +224,9 @@ async function safeLocalImpact(
   timeoutMs: number,
 ): Promise<{ value: unknown; timedOut: boolean }> {
   const safeTimeoutMs = clampTimeout(timeoutMs);
+  if (safeTimeoutMs < IMPACT_TIMEOUT_MIN_MS || safeTimeoutMs > IMPACT_TIMEOUT_MAX_MS) {
+    throw new Error('Internal error: group impact timeout clamp returned an out-of-range value.');
+  }
   let timer: ReturnType<typeof setTimeout> | undefined;
   const impactP = port.impact(repo, impactParams).catch((err) => ({
     error: err instanceof Error ? err.message : String(err),
@@ -429,6 +439,7 @@ export async function runGroupImpact(
     relationTypes: relationTypes && relationTypes.length > 0 ? relationTypes : undefined,
     includeTests,
     minConfidence,
+    limit: GROUP_LOCAL_PHASE_LIMIT,
   };
 
   const deadline = Date.now() + Math.max(0, timeoutMs);

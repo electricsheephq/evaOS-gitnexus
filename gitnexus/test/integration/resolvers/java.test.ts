@@ -81,6 +81,104 @@ describe('Java heritage resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Generic-base heritage (#1951): extends Box<T> + implements IFoo<T>. An
+// earlier query was type_identifier-only and matched 0 generic bases; the synth
+// resolves the generic base to its bare name. Scope-resolution (the single path
+// since #942) owns these edges.
+// ---------------------------------------------------------------------------
+
+describe('Java generic-base heritage resolution (#1951)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-generic-base'), () => {});
+  }, 60000);
+
+  it('emits EXTENDS Service → Box for a generic superclass (extends Box<String>)', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toEqual(['Service → Box']);
+  });
+
+  it('emits IMPLEMENTS Service → IFoo for a generic interface (implements IFoo<String>)', () => {
+    const implements_ = getRelationships(result, 'IMPLEMENTS');
+    expect(edgeSet(implements_)).toEqual(['Service → IFoo']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Qualified (namespaced) bases (#1956 tri-review U2). Three shapes:
+//   - Service: 3-segment generic (extends app.base.Box<T>, implements app.base.IFoo<T>)
+//   - Plain:   2-segment plain    (extends base.Base, implements base.IBar)
+//   - Two:     2-segment generic  (extends base.Box<T>, implements base.IFoo<T>)
+// Scope-resolution resolves each by its scoped-name tail (end-anchored
+// scoped_type_identifier handling). The 2-segment cases are the regression
+// guard: an un-anchored arm double-matches a 2-segment base (both segments are
+// direct type_identifier children) and emits a spurious prefix edge — this
+// asserts exactly one edge per base.
+// ---------------------------------------------------------------------------
+
+describe('Java qualified-base heritage resolution (#1956 U2)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-qualified-base'), () => {});
+  }, 60000);
+
+  it('emits exactly one EXTENDS per class, tail-resolved (no spurious prefix edge)', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toEqual(['Plain → Base', 'Service → Box', 'Two → Box']);
+  });
+
+  it('emits exactly one IMPLEMENTS per class, tail-resolved (no spurious prefix edge)', () => {
+    const implements_ = getRelationships(result, 'IMPLEMENTS');
+    expect(edgeSet(implements_)).toEqual(['Plain → IBar', 'Service → IFoo', 'Two → IFoo']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interface-to-interface EXTENDS (#1951): `interface IA extends IB, IC<String>`.
+// An earlier synth walked class_declaration ONLY, so it NEVER emitted
+// interface-to-interface heritage — production silently dropped these edges.
+// Widening the synth's traversal to also walk
+// interface_declaration > extends_interfaces > type_list closes it.
+// Both bases resolve to Interface symbols, so preEmitInheritanceEdges emits them
+// as IMPLEMENTS. IC<String> exercises the generic-base reduction (IC<String> ->
+// IC). Scope-resolution (the single resolution path since #942) owns these
+// edges.
+// ---------------------------------------------------------------------------
+
+describe('Java interface-extends-interface heritage resolution (#1951)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-iface-extends'), () => {});
+  }, 60000);
+
+  it('detects 3 interfaces and no classes', () => {
+    expect(getNodesByLabel(result, 'Interface')).toEqual(['IA', 'IB', 'IC']);
+    expect(getNodesByLabel(result, 'Class')).toEqual([]);
+  });
+
+  it('emits IMPLEMENTS IA → IB and IA → IC for interface-to-interface extends', () => {
+    const implements_ = getRelationships(result, 'IMPLEMENTS');
+    expect(edgeSet(implements_)).toEqual(['IA → IB', 'IA → IC']);
+  });
+
+  it('emits no EXTENDS edges (interface bases resolve to Interface → IMPLEMENTS)', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(extends_).toEqual([]);
+  });
+
+  it('all interface-heritage edges point to real Interface graph nodes', () => {
+    for (const edge of getRelationships(result, 'IMPLEMENTS')) {
+      const target = result.graph.getNode(edge.rel.targetId);
+      expect(target).toBeDefined();
+      expect(target!.properties.name).toBe(edge.target);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Ambiguous: Handler + Processor in two packages, imports disambiguate
 // ---------------------------------------------------------------------------
 
@@ -168,6 +266,72 @@ describe('Java call resolution with arity filtering', () => {
     expect(calls[0].target).toBe('writeAudit');
     expect(calls[0].targetFilePath).toBe('util/OneArg.java');
     expect(calls[0].rel.reason).toBe('import-resolved');
+  });
+});
+
+describe('Java same-module priority for duplicate FQNs', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-duplicate-fqn-modules'), () => {});
+  }, 60000);
+
+  it('resolves Module1App.run calls to module1 UserService, not module2', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const module1ToModule1 = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module1/src/main/java/com/example/Module1App.java' &&
+        c.targetFilePath === 'module1/src/main/java/com/example/UserService.java',
+    );
+    const module1ToModule2 = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module1/src/main/java/com/example/Module1App.java' &&
+        c.targetFilePath === 'module2/src/main/java/com/example/UserService.java',
+    );
+    const module1ToAnyUserService = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module1/src/main/java/com/example/Module1App.java' &&
+        /module[12]\/src\/main\/java\/com\/example\/UserService\.java/.test(c.targetFilePath),
+    );
+
+    expect(module1ToModule1.length).toBe(1);
+    expect(module1ToModule2.length).toBe(0);
+    expect(module1ToAnyUserService.length).toBe(1);
+  });
+
+  it('resolves Module2App.run calls to module2 UserService, not module1', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const module2ToModule2 = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module2/src/main/java/com/example/Module2App.java' &&
+        c.targetFilePath === 'module2/src/main/java/com/example/UserService.java',
+    );
+    const module2ToModule1 = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module2/src/main/java/com/example/Module2App.java' &&
+        c.targetFilePath === 'module1/src/main/java/com/example/UserService.java',
+    );
+    const module2ToAnyUserService = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module2/src/main/java/com/example/Module2App.java' &&
+        /module[12]\/src\/main\/java\/com\/example\/UserService\.java/.test(c.targetFilePath),
+    );
+
+    expect(module2ToModule2.length).toBe(1);
+    expect(module2ToModule1.length).toBe(0);
+    expect(module2ToAnyUserService.length).toBe(1);
   });
 });
 
@@ -437,6 +601,52 @@ describe('Java variadic call resolution', () => {
       }
     }
     expect(allDangling).toEqual([]);
+  });
+
+  it('resolves 2-arg call to fixed-prefix varargs method format(int, String...) in Formatter.java', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const fmtCall = calls.find((c) => c.target === 'format' && c.source === 'run');
+    expect(fmtCall).toBeDefined();
+    expect(fmtCall!.targetFilePath).toBe('com/example/util/Formatter.java');
+  });
+
+  it('0-arg call to format(int, String...) still resolves in legacy mode (arity rejection is registry-only)', () => {
+    // When `requiredParameterCount = 1`, `javaArityCompatibility` returns
+    // 'incompatible' for 0-arg calls, which would prevent the CALLS edge.
+    // This test documents the current resolution behavior for this shape.
+    const calls = getRelationships(result, 'CALLS');
+    const zeroArgFmtCall = calls.find((c) => c.target === 'format' && c.source === 'badCall');
+    expect(zeroArgFmtCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wildcard import: `import com.example.models.*` resolves to a package file
+// ---------------------------------------------------------------------------
+
+describe('Java wildcard import resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-wildcard-import'), () => {});
+  }, 60000);
+
+  it('parses wildcard import without errors and creates graph nodes', () => {
+    // The wildcard import (`import com.example.models.*`) exercises the
+    // directoryChild branch in resolveJavaImportTarget.  Even if no IMPORTS
+    // edge is created (nondeterministic file selection — documented flip
+    // blocker), the graph must contain valid nodes for all classes.
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Main');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Order');
+  });
+
+  it('resolves user.save() call via wildcard-imported User', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'save' && c.source === 'run');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.targetFilePath).toBe('com/example/models/User.java');
   });
 });
 
@@ -1968,18 +2178,14 @@ describe('Java overloaded method disambiguation (METHOD_IMPLEMENTS)', () => {
 
 // ── Phase P: Sequential path parity — same-arity overloads ────────────────
 
-describe('Java same-arity overloads via sequential path (skipWorkers)', () => {
+describe('Java same-arity overloads (worker path)', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
-    result = await runPipelineFromRepo(
-      path.join(FIXTURES, 'java-same-arity-cross-file'),
-      () => {},
-      { skipWorkers: true },
-    );
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-same-arity-cross-file'), () => {});
   }, 60000);
 
-  it('produces distinct graph nodes for find(int) and find(String) — sequential path', () => {
+  it('produces distinct graph nodes for find(int) and find(String)', () => {
     const methods = getNodesByLabelFull(result, 'Method');
     const findNodes = methods.filter(
       (m) => m.name === 'find' && m.properties.filePath?.includes('DbLookup'),
@@ -2100,8 +2306,8 @@ describe('Cross-class method chain resolution (Java) — #575', () => {
 });
 
 // ---------------------------------------------------------------------------
-// SM-9: lookupMethodByOwnerWithMRO — class Child extends Parent
-// child.parentMethod() resolves to Parent#parentMethod via MRO parent walk.
+// SM-9: inherited method resolution — class Child extends Parent
+// child.parentMethod() resolves to Parent#parentMethod via the parent walk.
 // ---------------------------------------------------------------------------
 
 describe('Java Child extends Parent — inherited method resolution (SM-9)', () => {
