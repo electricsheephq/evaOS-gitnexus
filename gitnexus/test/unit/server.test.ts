@@ -107,6 +107,67 @@ describe('createMCPServer', () => {
           minimum: 1,
         });
       }
+      const queryTool = response.tools.find((candidate) => candidate.name === 'query')!;
+      expect((queryTool.inputSchema as any).properties.rerank).toEqual({
+        type: 'boolean',
+        description:
+          'Use premium reranking when configured for this repo (default: true). Set false for broad state/session/workspace/event discovery or low-overlap retries.',
+        default: true,
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('applies MCP default maxTokens when callers omit maxTokens', async () => {
+    vi.stubEnv('GITNEXUS_MCP_DEFAULT_MAX_TOKENS', '4');
+    const backend = createMockBackend({
+      callTool: vi.fn().mockResolvedValue({
+        message: 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz',
+      }),
+    });
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const response = await client.callTool({
+        name: 'query',
+        arguments: { query: 'auth' },
+      });
+      const text = (response.content as any[])[0].text as string;
+      expect(text).toContain('... (truncated,');
+      expect(text.length).toBeLessThan(120);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('lets explicit maxTokens override the MCP default maxTokens', async () => {
+    vi.stubEnv('GITNEXUS_MCP_DEFAULT_MAX_TOKENS', '4');
+    const backend = createMockBackend({
+      callTool: vi.fn().mockResolvedValue({
+        message: 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz',
+      }),
+    });
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const response = await client.callTool({
+        name: 'query',
+        arguments: { query: 'auth', maxTokens: 100 },
+      });
+      const text = (response.content as any[])[0].text as string;
+      expect(text).toContain('abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz');
+      expect(text).not.toContain('... (truncated,');
     } finally {
       await client.close();
       await server.close();
@@ -139,6 +200,14 @@ describe('createMCPServer', () => {
           description: 'Truncate output to N estimated tokens',
           minimum: 1,
         });
+        if (name === 'query') {
+          expect(properties.rerank).toEqual({
+            type: 'boolean',
+            description:
+              'Use premium reranking when configured for this repo (default: true). Set false for broad state/session/workspace/event discovery or low-overlap retries.',
+            default: true,
+          });
+        }
         expect(properties.service).toBeUndefined();
         expect(properties.subgroup).toBeUndefined();
         expect(properties.crossDepth).toBeUndefined();
@@ -168,6 +237,36 @@ describe('createMCPServer', () => {
       expect(response.resourceTemplates.map((template) => template.uriTemplate)).not.toContain(
         'gitnexus://group/{name}/status',
       );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('rejects hidden write tools before backend dispatch in read-only mode', async () => {
+    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
+    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'test');
+    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', 'test');
+    const backend = createMockBackend();
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).not.toContain('rename');
+
+      const response = await client.callTool({
+        name: 'rename',
+        arguments: { oldName: 'oldSymbol', newName: 'newSymbol' },
+      });
+      expect(response.isError).toBe(true);
+      expect((response.content as any[])[0].text).toContain(
+        'Tool "rename" is not available in GitNexus MCP read-only mode.',
+      );
+      expect(backend.callTool).not.toHaveBeenCalled();
     } finally {
       await client.close();
       await server.close();

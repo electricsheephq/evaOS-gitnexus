@@ -391,7 +391,7 @@ const isRenderableQueryCandidateData = (data: any): boolean => {
 
   if (nodeId !== undefined && !isSafeQueryResultString(nodeId)) return false;
   if (!isSafeQueryResultString(name)) return false;
-  if (type !== undefined && !isSafeQueryResultString(type)) return false;
+  if (type !== undefined && !isSafeQueryResultString(type, { allowEmpty: true })) return false;
   if (!isSafeQueryResultString(filePath)) return false;
   return Boolean(nodeId || filePath);
 };
@@ -1246,6 +1246,7 @@ export class LocalBackend {
       limit?: number;
       max_symbols?: number;
       include_content?: boolean;
+      rerank?: boolean;
     },
   ): Promise<any> {
     if (!params.query?.trim()) {
@@ -1318,18 +1319,20 @@ export class LocalBackend {
     timer.stop(); // merge
 
     let rerankWarning: string | undefined;
-    try {
-      const config = resolveRerankConfig(repo.name);
-      if (config) {
-        merged = await timer.time(
-          'rerank',
-          this.rerankMergedCandidates(repo, searchQuery, merged, config),
-        );
+    if (params.rerank !== false) {
+      try {
+        const config = resolveRerankConfig(repo.name);
+        if (config) {
+          merged = await timer.time(
+            'rerank',
+            this.rerankMergedCandidates(repo, searchQuery, merged, config),
+          );
+        }
+      } catch (err) {
+        rerankWarning =
+          'Rerank unavailable — using existing BM25/vector ranking. ' +
+          (err instanceof Error ? err.message : String(err));
       }
-    } catch (err) {
-      rerankWarning =
-        'Rerank unavailable — using existing BM25/vector ranking. ' +
-        (err instanceof Error ? err.message : String(err));
     }
 
     // Step 2: For each match with a nodeId, trace to process(es)
