@@ -67,6 +67,7 @@ import {
   resolveRepoIdentityRoot,
 } from '../storage/git.js';
 import type { CachedEmbedding } from './embeddings/types.js';
+import type { VectorIndexState } from './embeddings/embedding-pipeline.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
 import { STALE_HASH_SENTINEL } from './lbug/schema.js';
@@ -141,6 +142,12 @@ export interface AnalyzeOptions {
    */
   allowDuplicateName?: boolean;
   /**
+   * Allow premium Voyage embedding runs to register/query through exact scan
+   * when VECTOR index creation fails. Defaults to false for premium repos so
+   * large paid indexes cannot silently degrade into expensive linear scans.
+   */
+  allowExactScanFallback?: boolean;
+  /**
    * Worker pool size override, threaded from the CLI `--workers` flag.
    * Forwarded to `PipelineOptions.workerPoolSize` so the parse phase
    * sizes the pool without `analyzeCommand` mutating `process.env`.
@@ -148,6 +155,27 @@ export interface AnalyzeOptions {
    * removed); `undefined` defers to the env / auto-formula fallback.
    */
   workerPoolSize?: number;
+}
+
+export function exactScanFallbackAllowed(
+  options: Pick<AnalyzeOptions, 'allowExactScanFallback'>,
+): boolean {
+  const raw = process.env.GITNEXUS_ALLOW_EXACT_SCAN_FALLBACK;
+  return options.allowExactScanFallback === true || raw === '1' || raw === 'true';
+}
+
+export function shouldBlockPremiumExactScanFallback(opts: {
+  isVoyageHttpMode: boolean;
+  premiumRepoAllowed: boolean;
+  semanticMode: 'vector-index' | 'exact-scan';
+  allowExactScanFallback: boolean;
+}): boolean {
+  return (
+    opts.isVoyageHttpMode &&
+    opts.premiumRepoAllowed &&
+    opts.semanticMode === 'exact-scan' &&
+    !opts.allowExactScanFallback
+  );
 }
 
 export interface AnalyzeResult {
@@ -886,6 +914,8 @@ export async function runFullAnalysis(
     const stats = await getLbugStats();
     let embeddingSkipped = true;
     let semanticMode: 'vector-index' | 'exact-scan' | undefined;
+    let vectorIndexState: VectorIndexState | undefined;
+    let vectorIndexReason: string | undefined;
 
     if (shouldGenerateEmbeddings) {
       const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
@@ -915,6 +945,8 @@ export async function runFullAnalysis(
     if (!embeddingSkipped) {
       const { isHttpMode, isVoyageHttpMode } = await import('./embeddings/http-client.js');
       const httpMode = isHttpMode();
+      const voyageHttpMode = isVoyageHttpMode();
+      let premiumVoyageRepoAllowed = false;
       // Mirror the registry's name-resolution chain so premium embedding gates,
       // server mapping, and the final registry name all agree (#1259):
       //   --name → remote-derived → canonical-root basename
@@ -922,9 +954,10 @@ export async function runFullAnalysis(
         options.registryName ??
         getInferredRepoName(repoPath) ??
         path.basename(resolveRepoIdentityRoot(repoPath));
-      if (isVoyageHttpMode()) {
+      if (voyageHttpMode) {
         const { premiumRepoAllowed } = await import('./rerank/voyage-reranker.js');
-        if (!premiumRepoAllowed(projectName)) {
+        premiumVoyageRepoAllowed = premiumRepoAllowed(projectName);
+        if (!premiumVoyageRepoAllowed) {
           embeddingSkipped = true;
           log(
             `Voyage embeddings skipped for "${projectName}": repo is not listed in ` +
@@ -1022,12 +1055,36 @@ export async function runFullAnalysis(
             await pendingCheckpoint.catch(() => undefined);
           }
         })();
+        vectorIndexState = embeddingResult.vectorIndexState;
+        vectorIndexReason = embeddingResult.vectorIndexError;
         if (embeddingResult.semanticMode === 'exact-scan') {
           semanticMode = 'exact-scan';
-          log(
+          const diagnostic =
             'Semantic embeddings were generated without a VECTOR index; ' +
-              'queries will use exact-scan fallback within the configured limit.',
-          );
+            'queries will use exact-scan fallback within the configured limit.' +
+            (embeddingResult.vectorIndexState
+              ? ` State: ${embeddingResult.vectorIndexState}.`
+              : '') +
+            (embeddingResult.vectorIndexError
+              ? ` Reason: ${embeddingResult.vectorIndexError}`
+              : '');
+          log(diagnostic);
+          if (
+            shouldBlockPremiumExactScanFallback({
+              isVoyageHttpMode: voyageHttpMode,
+              premiumRepoAllowed: premiumVoyageRepoAllowed,
+              semanticMode: embeddingResult.semanticMode,
+              allowExactScanFallback: exactScanFallbackAllowed(options),
+            })
+          ) {
+            throw new Error(
+              `Premium Voyage embeddings for "${projectName}" fell back to exact scan ` +
+                `(${embeddingResult.vectorIndexState}). ${embeddingResult.vectorIndexError ?? ''} ` +
+                'Install/load VECTOR and create the vector index, or rerun with ' +
+                '--allow-exact-scan-fallback / GITNEXUS_ALLOW_EXACT_SCAN_FALLBACK=1 ' +
+                'if this small repo is explicitly approved for exact scan.',
+            );
+          }
         } else {
           semanticMode = 'vector-index';
         }
@@ -1061,6 +1118,13 @@ export async function runFullAnalysis(
     const effectiveSemanticMode =
       semanticMode ??
       (runtimeCapabilities.semanticMode === 'vector-index' ? 'vector-index' : 'exact-scan');
+    const effectiveVectorIndexState: VectorIndexState | 'unavailable' =
+      embeddingCount > 0
+        ? (vectorIndexState ??
+          (effectiveSemanticMode === 'vector-index'
+            ? 'vector-index'
+            : 'exact-scan-extension-missing'))
+        : 'unavailable';
 
     // Convert the post-run file-hash map to the on-disk Record<string,string>
     // shape consumed by RepoMeta.fileHashes.
@@ -1097,10 +1161,12 @@ export async function runFullAnalysis(
           status: ftsAvailable ? runtimeCapabilities.fts : 'unavailable',
         },
         vectorSearch: {
-          provider: effectiveSemanticMode === 'vector-index' ? 'ladybugdb-vector' : 'exact-scan',
-          status: embeddingCount > 0 ? effectiveSemanticMode : 'unavailable',
+          provider:
+            effectiveVectorIndexState === 'vector-index' ? 'ladybugdb-vector' : 'exact-scan',
+          status: effectiveVectorIndexState,
+          mode: embeddingCount > 0 ? effectiveSemanticMode : 'unavailable',
           exactScanLimit: runtimeCapabilities.exactScanLimit,
-          reason: runtimeCapabilities.reason,
+          reason: vectorIndexReason ?? runtimeCapabilities.reason,
         },
       },
       // Incremental-indexing fields. Populated for git repos so the next

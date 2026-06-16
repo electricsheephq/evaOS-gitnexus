@@ -4,6 +4,8 @@ import { isHttpMode } from '../core/embeddings/http-client.js';
 import { getLocalEmbeddingRuntimeBlocker } from '../core/embeddings/runtime-support.js';
 import { checkLbugNative } from '../core/lbug/native-check.js';
 import { getExtensionInstallPolicy } from '../core/lbug/extension-loader.js';
+import { getStoragePaths, loadMeta, type RepoMeta } from '../storage/repo-manager.js';
+import { getGitRoot } from '../storage/git.js';
 import { t } from './i18n/index.js';
 
 function isCombiningMark(codePoint: number): boolean {
@@ -78,6 +80,44 @@ export function localEmbeddingDoctorStatus(opts: {
   return { status: '✓ local embeddings supported', detail: null };
 }
 
+type RepoMetaWithCapabilities = RepoMeta & {
+  capabilities?: {
+    vectorSearch?: {
+      provider?: string;
+      status?: string;
+      reason?: string;
+      exactScanLimit?: number;
+    };
+  };
+};
+
+export function repoVectorDoctorStatus(meta: RepoMetaWithCapabilities | null | undefined): {
+  status: string;
+  detail: string | null;
+} {
+  if (!meta) return { status: 'not indexed in current repo', detail: null };
+  const embeddings = Number(meta.stats?.embeddings ?? 0);
+  if (embeddings <= 0) return { status: 'no embeddings in current repo index', detail: null };
+
+  const vectorSearch = meta.capabilities?.vectorSearch;
+  const status =
+    typeof vectorSearch?.status === 'string'
+      ? vectorSearch.status
+      : vectorSearch?.provider === 'ladybugdb-vector'
+        ? 'vector-index'
+        : 'exact-scan-extension-missing';
+  const reason = typeof vectorSearch?.reason === 'string' ? vectorSearch.reason : null;
+  const limit =
+    typeof vectorSearch?.exactScanLimit === 'number'
+      ? ` exact scan limit: ${vectorSearch.exactScanLimit} chunks.`
+      : '';
+
+  return {
+    status,
+    detail: reason ? `${reason}${limit}` : limit.trim() || null,
+  };
+}
+
 export const doctorCommand = async () => {
   const fingerprint = getRuntimeFingerprint();
   const capabilities = getRuntimeCapabilities();
@@ -119,6 +159,13 @@ export const doctorCommand = async () => {
   );
   if (capabilities.reason)
     console.log(`  ${label('doctor.labels.note', 18)}${capabilities.reason}`);
+  const repoRoot = getGitRoot(process.cwd()) ?? process.cwd();
+  const repoMeta = await loadMeta(getStoragePaths(repoRoot).storagePath).catch(() => null);
+  const repoVector = repoVectorDoctorStatus(repoMeta);
+  console.log(`  ${padDisplayEnd('Repo VECTOR:', 18)}${repoVector.status}`);
+  if (repoVector.detail) {
+    console.log(`  ${padDisplayEnd('Repo VECTOR note:', 18)}${repoVector.detail}`);
+  }
   console.log('');
   console.log(t('doctor.embeddings'));
   console.log(`  ${label('doctor.labels.backend', 12)}${isHttpMode() ? 'http' : 'local'}`);

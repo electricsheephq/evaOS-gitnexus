@@ -15,6 +15,7 @@ import {
   executeParameterized,
   closeLbug,
   isLbugReady,
+  ensureVectorExtensionForRepo,
 } from '../../core/lbug/pool-adapter.js';
 import { isValidQueryParams } from '../../core/lbug/query-params.js';
 import { isWalCorruptionError, WAL_RECOVERY_SUGGESTION } from '../../core/lbug/lbug-config.js';
@@ -69,6 +70,16 @@ const MCP_READ_ONLY_TOOLS = new Set([
   'detect_changes',
   'cypher',
 ]);
+
+interface SemanticSearchDegradation {
+  mode: 'exact-scan';
+  reason: string;
+}
+
+interface SemanticSearchOutput {
+  results: any[];
+  degraded?: SemanticSearchDegradation;
+}
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -1273,7 +1284,7 @@ export class LocalBackend {
     // each so both get independent wall-time records without fighting
     // over a single `current` phase slot.
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const [bm25SearchResult, semanticResults] = await Promise.all([
+    const [bm25SearchResult, semanticSearchOutput] = await Promise.all([
       timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
       timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit)),
     ]);
@@ -1299,7 +1310,7 @@ export class LocalBackend {
       }
     }
 
-    const safeSemanticResults = semanticResults ?? [];
+    const safeSemanticResults = semanticSearchOutput?.results ?? [];
     for (let i = 0; i < safeSemanticResults.length; i++) {
       const result = safeSemanticResults[i];
       const key = result.nodeId || result.filePath;
@@ -1591,6 +1602,12 @@ export class LocalBackend {
     if (rerankWarning) {
       warnings.push(rerankWarning);
     }
+    if (semanticSearchOutput?.degraded) {
+      warnings.push(
+        `Semantic vector search degraded: ${semanticSearchOutput.degraded.reason}. ` +
+          'Using exact-scan fallback within the configured limit.',
+      );
+    }
 
     return {
       processes,
@@ -1799,14 +1816,20 @@ export class LocalBackend {
   /**
    * Semantic vector search helper
    */
-  private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
+  private async semanticSearch(
+    repo: RepoHandle,
+    query: string,
+    limit: number,
+  ): Promise<SemanticSearchOutput> {
     try {
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       const tableCheck = await executeQuery(
         repo.lbugPath,
         `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN COUNT(*) AS cnt LIMIT 1`,
       );
-      if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
+      if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) {
+        return { results: [] };
+      }
 
       const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
       const queryVec = await embedQuery(query);
@@ -1817,10 +1840,19 @@ export class LocalBackend {
         string,
         { distance: number; chunkIndex: number; startLine: number; endLine: number }
       >();
+      let degraded: SemanticSearchDegradation | undefined;
       if (isVectorExtensionSupportedByPlatform()) {
-        try {
-          bestChunks = await collectBestChunks(limit, async (fetchLimit) => {
-            const vectorQuery = `
+        const vectorLoaded = await ensureVectorExtensionForRepo(repo.lbugPath);
+        if (!vectorLoaded) {
+          degraded = {
+            mode: 'exact-scan',
+            reason: 'VECTOR extension unavailable on the query path',
+          };
+        }
+        if (vectorLoaded) {
+          try {
+            bestChunks = await collectBestChunks(limit, async (fetchLimit) => {
+              const vectorQuery = `
             CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
               CAST(${queryVecStr} AS FLOAT[${dims}]), ${fetchLimit})
             YIELD node AS emb, distance
@@ -1831,33 +1863,44 @@ export class LocalBackend {
             ORDER BY distance
           `;
 
-            const embResults = await executeQuery(repo.lbugPath, vectorQuery);
-            return embResults.map((row) => ({
-              nodeId: row.nodeId ?? row[0],
-              chunkIndex: row.chunkIndex ?? row[1] ?? 0,
-              startLine: row.startLine ?? row[2] ?? 0,
-              endLine: row.endLine ?? row[3] ?? 0,
-              distance: row.distance ?? row[4],
-            }));
-          });
-        } catch {
-          bestChunks = new Map();
+              const embResults = await executeQuery(repo.lbugPath, vectorQuery);
+              return embResults.map((row) => ({
+                nodeId: row.nodeId ?? row[0],
+                chunkIndex: row.chunkIndex ?? row[1] ?? 0,
+                startLine: row.startLine ?? row[2] ?? 0,
+                endLine: row.endLine ?? row[3] ?? 0,
+                distance: row.distance ?? row[4],
+              }));
+            });
+          } catch {
+            degraded = {
+              mode: 'exact-scan',
+              reason: `VECTOR index "${EMBEDDING_INDEX_NAME}" unavailable or query failed`,
+            };
+            bestChunks = new Map();
+          }
         }
-      } else if (!this.warnedVectorUnsupported) {
-        // Rare diagnostic: surface why we fell back to the exact scan path so
-        // operators can see at a glance that VECTOR is disabled by platform
-        // policy. Emitted once per `LocalBackend` instance lifetime to avoid
-        // noisy stderr on hot semantic-search paths (DoD §2.8).
-        this.warnedVectorUnsupported = true;
-        logger.warn(
-          'GitNexus [query:vector]: VECTOR extension not supported on this platform; using exact scan fallback',
-        );
+      } else {
+        if (!this.warnedVectorUnsupported) {
+          // Rare diagnostic: surface why we fell back to the exact scan path so
+          // operators can see at a glance that VECTOR is disabled by platform
+          // policy. Emitted once per `LocalBackend` instance lifetime to avoid
+          // noisy stderr on hot semantic-search paths (DoD §2.8).
+          this.warnedVectorUnsupported = true;
+          logger.warn(
+            'GitNexus [query:vector]: VECTOR extension not supported on this platform; using exact scan fallback',
+          );
+        }
+        degraded = {
+          mode: 'exact-scan',
+          reason: 'VECTOR extension not supported on this platform',
+        };
       }
 
       if (bestChunks.size === 0) {
         const embeddingCount = Number(tableCheck[0].cnt ?? tableCheck[0][0] ?? 0);
         const exactLimit = getExactScanLimit();
-        if (embeddingCount > exactLimit) return [];
+        if (embeddingCount > exactLimit) return { results: [], degraded };
 
         const rows = await executeQuery(
           repo.lbugPath,
@@ -1887,7 +1930,7 @@ export class LocalBackend {
         );
       }
 
-      if (bestChunks.size === 0) return [];
+      if (bestChunks.size === 0) return { results: [], degraded };
 
       const results: any[] = [];
 
@@ -1923,10 +1966,10 @@ export class LocalBackend {
         } catch {}
       }
 
-      return results;
+      return { results, degraded };
     } catch {
       // Expected when embeddings are disabled — silently fall back to BM25-only
-      return [];
+      return { results: [] };
     }
   }
 

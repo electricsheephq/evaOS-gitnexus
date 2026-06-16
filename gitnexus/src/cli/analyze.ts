@@ -661,6 +661,7 @@ export interface AnalyzeOptions {
   embeddingModel?: string;
   embeddingAuthToken?: string;
   embeddingDims?: string;
+  allowExactScanFallback?: boolean;
 }
 
 /**
@@ -1129,6 +1130,7 @@ const analyzeCommandImpl = async (
         // be able to accept the duplicate name without also paying the
         // cost of a full pipeline re-index. See #829 review round 2.
         allowDuplicateName: options.allowDuplicateName,
+        allowExactScanFallback: options.allowExactScanFallback,
         // Worker pool size threaded from --workers, replacing the previous
         // GITNEXUS_WORKER_POOL_SIZE env mutation. `undefined` defers to the
         // env / auto-formula fallback inside the pipeline.

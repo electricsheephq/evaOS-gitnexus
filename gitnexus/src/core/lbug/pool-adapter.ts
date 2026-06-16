@@ -17,7 +17,7 @@
 
 import fs from 'fs/promises';
 import lbug from '@ladybugdb/core';
-import { isReadOnlyDbError, loadFTSExtension } from './lbug-adapter.js';
+import { isReadOnlyDbError, loadFTSExtension, loadVectorExtension } from './lbug-adapter.js';
 import { closeQueryResults } from './query-result-utils.js';
 import {
   createLbugDatabase,
@@ -91,6 +91,7 @@ interface SharedDB {
   db: lbug.Database;
   refCount: number;
   ftsLoaded: boolean;
+  vectorLoaded: boolean;
   /** When true, closeOne skips db.close() — the Database is owned externally. */
   external?: boolean;
 }
@@ -235,6 +236,7 @@ function closeOne(repoId: string): void {
         // for the same dbPath reuse it instead of hitting a file lock.
         shared.refCount = 0;
         shared.ftsLoaded = false;
+        shared.vectorLoaded = false;
       } else {
         shared.db.close().catch(() => {});
         dbCache.delete(entry.dbPath);
@@ -543,7 +545,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     for (let attempt = 1; attempt <= LOCK_RETRY_ATTEMPTS; attempt++) {
       try {
         const db = await openReadOnlyDatabase(dbPath);
-        shared = { db, refCount: 0, ftsLoaded: false };
+        shared = { db, refCount: 0, ftsLoaded: false, vectorLoaded: false };
         dbCache.set(dbPath, shared);
         break;
       } catch (err: any) {
@@ -552,7 +554,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
         if (isWalCorruptionError(lastError)) {
           try {
             const db = await tryQuarantineAndReopen(dbPath, repoId);
-            shared = { db, refCount: 0, ftsLoaded: false };
+            shared = { db, refCount: 0, ftsLoaded: false, vectorLoaded: false };
             dbCache.set(dbPath, shared);
             break;
           } catch (retryErr) {
@@ -657,7 +659,13 @@ export async function initLbugWithDb(
   // closeOne() respects the external flag and skips db.close().
   let shared = dbCache.get(dbPath);
   if (!shared) {
-    shared = { db: existingDb, refCount: 0, ftsLoaded: false, external: true };
+    shared = {
+      db: existingDb,
+      refCount: 0,
+      ftsLoaded: false,
+      vectorLoaded: false,
+      external: true,
+    };
     dbCache.set(dbPath, shared);
   }
   shared.refCount++;
@@ -779,6 +787,37 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 export const executeQuery = async (repoId: string, cypher: string): Promise<any[]> => {
   return await executeParameterized(repoId, cypher, {});
+};
+
+/**
+ * Load the VECTOR extension on the read-only pool's shared Database.
+ *
+ * Analyze owns installation/index creation. Query/MCP paths are strictly
+ * `load-only`: if VECTOR was not pre-installed on this machine, callers get a
+ * clean `false` and can fall back to exact scan with an explicit diagnostic.
+ */
+export const ensureVectorExtensionForRepo = async (repoId: string): Promise<boolean> => {
+  const entry = pool.get(repoId);
+  if (!entry) {
+    throw new Error(`LadybugDB not initialized for repo "${repoId}". Call initLbug first.`);
+  }
+
+  entry.lastUsed = Date.now();
+  const shared = dbCache.get(entry.dbPath);
+  if (shared?.vectorLoaded) return true;
+
+  const conn = await checkout(entry);
+  silenceStdout();
+  activeQueryCount++;
+  try {
+    const loaded = await loadVectorExtension(conn, { policy: 'load-only' });
+    if (loaded && shared) shared.vectorLoaded = true;
+    return loaded;
+  } finally {
+    activeQueryCount--;
+    restoreStdout();
+    checkin(entry, conn);
+  }
 };
 
 /**

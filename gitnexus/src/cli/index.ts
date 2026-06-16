@@ -109,6 +109,10 @@ program
   .option('--embedding-model <model>', 'HTTP embedding model name')
   .option('--embedding-auth-token <token>', 'HTTP embedding bearer token')
   .option('--embedding-dims <n>', 'HTTP embedding output dimensions')
+  .option(
+    '--allow-exact-scan-fallback',
+    'Allow premium Voyage embeddings to register without a VECTOR index (small approved repos only)',
+  )
   .addHelpText('after', () => t('help.analyze.environment'))
   .action(createLbugLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 

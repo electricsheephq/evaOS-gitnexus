@@ -36,13 +36,12 @@ import {
 } from './types.js';
 import { resolveEmbeddingConfig } from './config.js';
 import { rankExactEmbeddingRows, type ExactEmbeddingRow } from './exact-search.js';
+import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME, STALE_HASH_SENTINEL } from '../lbug/schema.js';
 import {
-  EMBEDDING_TABLE_NAME,
-  EMBEDDING_INDEX_NAME,
-  CREATE_VECTOR_INDEX_QUERY,
-  STALE_HASH_SENTINEL,
-} from '../lbug/schema.js';
-import { loadVectorExtension } from '../lbug/lbug-adapter.js';
+  createCodeEmbeddingVectorIndex,
+  getVectorExtensionUnavailableReason,
+  loadVectorExtension,
+} from '../lbug/lbug-adapter.js';
 import type { ExtensionInstallPolicy } from '../lbug/extension-loader.js';
 import { getExactScanLimit } from '../platform/capabilities.js';
 import { logger } from '../logger.js';
@@ -76,6 +75,18 @@ export const resolveEmbeddingInstallPolicy = (): ExtensionInstallPolicy => {
 const ensureVectorExtensionAvailable = async (): Promise<boolean> => {
   return loadVectorExtension(undefined, { policy: resolveEmbeddingInstallPolicy() });
 };
+
+export type VectorIndexState =
+  | 'vector-index'
+  | 'exact-scan-extension-missing'
+  | 'exact-scan-index-create-failed'
+  | 'exact-scan-disabled';
+
+export interface VectorIndexDiagnostic {
+  ready: boolean;
+  state: VectorIndexState;
+  error?: string;
+}
 /**
  * Bump this when the embedding text template changes in a way that should
  * invalidate existing vectors, such as metadata/header shape changes,
@@ -222,18 +233,39 @@ export const batchInsertEmbeddings = async (
  * which owns the VECTOR extension lifecycle and state tracking.
 
  */
-const createVectorIndex = async (
-  executeQuery: (cypher: string) => Promise<any[]>,
-): Promise<boolean> => {
-  if (!(await ensureVectorExtensionAvailable())) return false;
+const createVectorIndex = async (): Promise<VectorIndexDiagnostic> => {
+  const policy = resolveEmbeddingInstallPolicy();
+  if (policy === 'never') {
+    return {
+      ready: false,
+      state: 'exact-scan-disabled',
+      error:
+        'VECTOR index creation disabled by GITNEXUS_LBUG_EXTENSION_INSTALL=never; semantic embeddings fall back to exact scan.',
+    };
+  }
+
+  if (!(await loadVectorExtension(undefined, { policy }))) {
+    const reason = getVectorExtensionUnavailableReason();
+    return {
+      ready: false,
+      state: 'exact-scan-extension-missing',
+      error: reason ? `${vectorUnavailableMessage} (${reason})` : vectorUnavailableMessage,
+    };
+  }
+
   try {
-    await executeQuery(CREATE_VECTOR_INDEX_QUERY);
-    return true;
+    await createCodeEmbeddingVectorIndex();
+    return { ready: true, state: 'vector-index' };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     if (isDev) {
       logger.warn({ error }, 'Vector index creation warning:');
     }
-    return false;
+    return {
+      ready: false,
+      state: 'exact-scan-index-create-failed',
+      error: `CREATE_VECTOR_INDEX failed: ${message}`,
+    };
   }
 };
 
@@ -242,6 +274,8 @@ export interface EmbeddingPipelineResult {
   chunksProcessed: number;
   vectorIndexReady: boolean;
   semanticMode: 'vector-index' | 'exact-scan';
+  vectorIndexState: VectorIndexState;
+  vectorIndexError?: string;
 }
 
 /**
@@ -383,7 +417,7 @@ export const runEmbeddingPipeline = async (
       // Ensure the vector index exists even when no new nodes need embedding.
       // A prior crash or first-time incremental run may have left CodeEmbedding
       // rows without ever reaching index creation.
-      const vectorIndexReady = await createVectorIndex(executeQuery);
+      const vectorIndex = await createVectorIndex();
 
       onProgress({
         phase: 'ready',
@@ -394,8 +428,10 @@ export const runEmbeddingPipeline = async (
       return {
         nodesProcessed: 0,
         chunksProcessed: 0,
-        vectorIndexReady,
-        semanticMode: vectorIndexReady ? 'vector-index' : 'exact-scan',
+        vectorIndexReady: vectorIndex.ready,
+        semanticMode: vectorIndex.ready ? 'vector-index' : 'exact-scan',
+        vectorIndexState: vectorIndex.state,
+        vectorIndexError: vectorIndex.error,
       };
     }
 
@@ -544,7 +580,7 @@ export const runEmbeddingPipeline = async (
       logger.info('📇 Creating vector index...');
     }
 
-    const vectorIndexReady = await createVectorIndex(executeQuery);
+    const vectorIndex = await createVectorIndex();
 
     onProgress({
       phase: 'ready',
@@ -561,8 +597,10 @@ export const runEmbeddingPipeline = async (
     return {
       nodesProcessed: totalNodes,
       chunksProcessed: totalChunks,
-      vectorIndexReady,
-      semanticMode: vectorIndexReady ? 'vector-index' : 'exact-scan',
+      vectorIndexReady: vectorIndex.ready,
+      semanticMode: vectorIndex.ready ? 'vector-index' : 'exact-scan',
+      vectorIndexState: vectorIndex.state,
+      vectorIndexError: vectorIndex.error,
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';

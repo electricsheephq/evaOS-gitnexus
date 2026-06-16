@@ -23,6 +23,7 @@ const { lbugMocks, platformMocks, rerankMocks } = vi.hoisted(() => ({
     executeParameterized: vi.fn().mockResolvedValue([]),
     closeLbug: vi.fn().mockResolvedValue(undefined),
     isLbugReady: vi.fn().mockReturnValue(true),
+    ensureVectorExtensionForRepo: vi.fn().mockResolvedValue(true),
   },
   platformMocks: {
     isVectorExtensionSupportedByPlatform: vi.fn().mockReturnValue(true),
@@ -107,6 +108,7 @@ import {
   executeParameterized,
   isLbugReady,
   closeLbug,
+  ensureVectorExtensionForRepo,
 } from '../../src/mcp/core/lbug-adapter.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -123,6 +125,7 @@ const MOCK_REPO_ENTRY = {
 beforeEach(() => {
   rerankMocks.resolveRerankConfig.mockReturnValue(null);
   rerankMocks.rerankDocuments.mockResolvedValue([]);
+  lbugMocks.ensureVectorExtensionForRepo.mockResolvedValue(true);
 });
 
 function setupSingleRepo() {
@@ -686,7 +689,26 @@ describe('LocalBackend.callTool', () => {
     await backend.callTool('query', { query: 'auth' });
 
     const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
+    expect(ensureVectorExtensionForRepo).toHaveBeenCalledWith('/tmp/.gitnexus/test-project/lbug');
     expect(queries.some((cypher: string) => cypher.includes('QUERY_VECTOR_INDEX'))).toBe(true);
+  });
+
+  it('falls back explicitly when VECTOR is supported but not loadable on the read connection', async () => {
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    lbugMocks.ensureVectorExtensionForRepo.mockResolvedValue(false);
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 1 }];
+      if (cypher.includes('MATCH (e:CodeEmbedding)')) return [];
+      return [];
+    });
+    (executeParameterized as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('query', { query: 'auth' });
+
+    const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
+    expect(ensureVectorExtensionForRepo).toHaveBeenCalledWith('/tmp/.gitnexus/test-project/lbug');
+    expect(queries.some((cypher: string) => cypher.includes('QUERY_VECTOR_INDEX'))).toBe(false);
+    expect(result.warning).toContain('VECTOR extension unavailable on the query path');
   });
 
   it('query tool returns error for empty query', async () => {
