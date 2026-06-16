@@ -580,6 +580,44 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(result.vectorIndexError).toMatch(/FLOAT\[2048\] is unsupported/);
   });
 
+  it('treats an existing VECTOR index as ready when refreshing embeddings', async () => {
+    vi.doMock('../../src/core/embeddings/embedder.js', () => ({
+      initEmbedder: vi.fn().mockResolvedValue(undefined),
+      embedBatch: vi
+        .fn()
+        .mockImplementation((texts: string[]) =>
+          Promise.resolve(texts.map(() => new Float32Array(384))),
+        ),
+      embedText: vi.fn().mockResolvedValue(new Float32Array(384)),
+      embeddingToArray: vi.fn().mockImplementation((emb: Float32Array) => Array.from(emb)),
+      isEmbedderReady: vi.fn().mockReturnValue(true),
+    }));
+    vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      loadVectorExtension: vi.fn().mockResolvedValue(true),
+      getVectorExtensionUnavailableReason: vi.fn().mockReturnValue(undefined),
+      createCodeEmbeddingVectorIndex: vi
+        .fn()
+        .mockRejectedValue(
+          new Error(
+            'Binder exception: Index code_embedding_idx already exists in table CodeEmbedding.',
+          ),
+        ),
+    }));
+
+    const node = makeNode();
+    const executeQuery = mockExecuteQuery([node]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    const result = await runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress);
+
+    expect(result.vectorIndexReady).toBe(true);
+    expect(result.semanticMode).toBe('vector-index');
+    expect(result.vectorIndexState satisfies VectorIndexState).toBe('vector-index');
+    expect(result.vectorIndexError).toBeUndefined();
+  });
+
   it('does not inject preceding context when overlap is disabled', async () => {
     const embedBatchSpy = vi
       .fn()
