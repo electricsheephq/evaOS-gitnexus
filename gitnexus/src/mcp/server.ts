@@ -89,6 +89,12 @@ function assertMcpReadOnlyResource(uri: string): void {
   }
 }
 
+function assertMcpReadOnlyTool(toolName: string): void {
+  if (!mcpReadOnlyMode()) return;
+  if (MCP_READ_ONLY_TOOLS.has(toolName)) return;
+  throw new Error(`Tool "${toolName}" is not available in GitNexus MCP read-only mode.`);
+}
+
 function scrubReadOnlyDescription(description: string): string {
   return description
     .replace(/\nGROUP MODE:[\s\S]*?(?=\n\n[A-Z][A-Z ]*:|$)/gu, '')
@@ -125,7 +131,9 @@ function toolForMcp(tool: (typeof GITNEXUS_TOOLS)[number]): (typeof GITNEXUS_TOO
 
 function applyTokenBudget(toolName: string, args: any, text: string): string {
   if (!BUDGETED_TOOLS.has(toolName)) return text;
-  const parsed = parseMaxTokens(args?.maxTokens);
+  const rawMaxTokens =
+    args?.maxTokens ?? (process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS || undefined);
+  const parsed = parseMaxTokens(rawMaxTokens);
   if (parsed.error) throw new Error(`maxTokens ${parsed.error}`);
   return parsed.value ? truncateToTokenBudget(text, parsed.value) : text;
 }
@@ -275,6 +283,7 @@ export function createMCPServer(backend: LocalBackend): Server {
     const { name, arguments: args } = request.params;
 
     try {
+      assertMcpReadOnlyTool(name);
       const normalizedArgs = normalizeArgsForMcp(name, args);
       const result = await backend.callTool(name, normalizedArgs);
       const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);

@@ -30,10 +30,18 @@ interface HttpConfig {
   dimensions?: number;
   maxAttempts: number;
   minIntervalMs: number;
+  timeoutMs: number;
 }
 
 let lastHttpRequestStartedAt: number | undefined;
 let httpPaceQueue: Promise<void> = Promise.resolve();
+
+class EmbeddingAttemptTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`Embedding request timed out after ${timeoutMs}ms`);
+    this.name = 'EmbeddingAttemptTimeoutError';
+  }
+}
 
 const parsePositiveIntegerEnv = (
   name: string,
@@ -103,6 +111,7 @@ const readConfig = (): HttpConfig | null => {
       20,
     ),
     minIntervalMs: parseNonNegativeIntegerEnv('GITNEXUS_EMBEDDING_MIN_INTERVAL_MS', 0, 300_000),
+    timeoutMs: parsePositiveIntegerEnv('GITNEXUS_EMBEDDING_TIMEOUT_MS', HTTP_TIMEOUT_MS, 300_000),
   };
 };
 
@@ -231,6 +240,7 @@ const httpEmbedBatch = async (
   dimensions?: number,
   maxAttempts = HTTP_MAX_RETRIES + 1,
   minIntervalMs = 0,
+  timeoutMs = HTTP_TIMEOUT_MS,
 ): Promise<EmbeddingItem[]> => {
   const requestBody: {
     input: string[];
@@ -256,7 +266,6 @@ const httpEmbedBatch = async (
       url,
       {
         method: 'POST',
-        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
@@ -266,7 +275,17 @@ const httpEmbedBatch = async (
       {
         fetchImpl: async (input, init) => {
           await paceHttpRequest(minIntervalMs);
-          return globalThis.fetch(input, init);
+          try {
+            return await globalThis.fetch(input, {
+              ...init,
+              signal: AbortSignal.timeout(timeoutMs),
+            });
+          } catch (err) {
+            if (err instanceof DOMException && err.name === 'TimeoutError') {
+              throw new EmbeddingAttemptTimeoutError(timeoutMs);
+            }
+            throw err;
+          }
         },
         breakerKey: HTTP_BREAKER_KEY,
         retry: {
@@ -283,9 +302,15 @@ const httpEmbedBatch = async (
         `Embedding endpoint circuit open (${safeUrl(url)}, batch ${batchIndex}): retry in ${Math.ceil(err.retryAfterMs / 1000)}s`,
       );
     }
+    if (err instanceof EmbeddingAttemptTimeoutError) {
+      throw new Error(
+        `Embedding request timed out after ${err.timeoutMs}ms ` +
+          `(${safeUrl(url)}, batch ${batchIndex})`,
+      );
+    }
     if (err instanceof DOMException && err.name === 'TimeoutError') {
       throw new Error(
-        `Embedding request timed out after ${HTTP_TIMEOUT_MS}ms (${safeUrl(url)}, batch ${batchIndex})`,
+        `Embedding request timed out after ${timeoutMs}ms (${safeUrl(url)}, batch ${batchIndex})`,
       );
     }
     if (err instanceof ResilientFetchExhaustedError) {
@@ -339,6 +364,7 @@ export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
       config.dimensions,
       config.maxAttempts,
       config.minIntervalMs,
+      config.timeoutMs,
     );
 
     if (items.length !== batch.length) {
@@ -391,6 +417,7 @@ export const httpEmbedQuery = async (text: string): Promise<number[]> => {
     config.dimensions,
     config.maxAttempts,
     config.minIntervalMs,
+    config.timeoutMs,
   );
   if (!items.length) {
     throw new Error(`Embedding endpoint returned empty response (${safeUrl(url)})`);

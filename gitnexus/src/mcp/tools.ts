@@ -112,7 +112,7 @@ Returns results grouped by process (execution flow):
 - process_symbols: all symbols in those flows with file locations and module (functional area)
 - definitions: standalone types/interfaces not in any process
 
-Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion.
+Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion. Premium repos may add Voyage reranking for better first-hit ordering; set rerank=false for broad state/session/workspace/event discovery or low-overlap retries.
 
 GROUP MODE: set "repo" to "@<groupName>" to search all member repos in that group (merged via RRF), or "@<groupName>/<groupRepoPath>" to run against a single member (same path keys as in group.yaml). If you use "@<groupName>" only, the member repo defaults to the lexicographically first key in group.yaml "repos". Prefer resources for contracts/status (see migration from legacy group_* tools).
 
@@ -149,6 +149,12 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
           type: 'integer',
           description: 'Truncate output to N estimated tokens',
           minimum: 1,
+        },
+        rerank: {
+          type: 'boolean',
+          description:
+            'Use premium reranking when configured for this repo (default: true). Set false for broad state/session/workspace/event discovery or low-overlap retries.',
+          default: true,
         },
         include_content: {
           type: 'boolean',
