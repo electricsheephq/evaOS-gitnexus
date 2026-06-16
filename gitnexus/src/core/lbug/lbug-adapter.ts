@@ -13,6 +13,7 @@ import {
   NODE_TABLES,
   REL_TABLE_NAME,
   SCHEMA_QUERIES,
+  CREATE_VECTOR_INDEX_QUERY,
   EMBEDDING_TABLE_NAME,
   STALE_HASH_SENTINEL,
   NodeTableName,
@@ -1908,6 +1909,18 @@ export const loadVectorExtension = async (
   );
   if (loaded && useModuleState) vectorExtensionLoaded = true;
   return loaded;
+};
+
+export const getVectorExtensionUnavailableReason = (): string | undefined =>
+  extensionManager
+    .getCapabilities()
+    .find((capability) => capability.name === 'VECTOR' && !capability.loaded)?.reason;
+
+export const createCodeEmbeddingVectorIndex = async (): Promise<void> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  await queryAndDrain(conn, CREATE_VECTOR_INDEX_QUERY);
 };
 /**
  * Create a full-text search index on a table

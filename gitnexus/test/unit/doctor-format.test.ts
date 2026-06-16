@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { displayWidth, localEmbeddingDoctorStatus, padDisplayEnd } from '../../src/cli/doctor.js';
+import {
+  displayWidth,
+  localEmbeddingDoctorStatus,
+  padDisplayEnd,
+  repoVectorDoctorStatus,
+} from '../../src/cli/doctor.js';
 
 describe('doctor output formatting', () => {
   it('keeps ASCII padding equivalent to String.padEnd', () => {
@@ -53,5 +58,28 @@ describe('doctor embedding-runtime support status', () => {
     });
     expect(status).toBe('✓ http endpoint configured');
     expect(detail).toBeNull();
+  });
+});
+
+describe('doctor repo vector-index status', () => {
+  it('distinguishes platform VECTOR availability from a per-repo exact-scan fallback', () => {
+    const { status, detail } = repoVectorDoctorStatus({
+      stats: { embeddings: 9704 },
+      capabilities: {
+        vectorSearch: {
+          provider: 'exact-scan',
+          status: 'exact-scan-index-create-failed',
+          exactScanLimit: 20_000,
+          reason: 'CREATE_VECTOR_INDEX failed: FLOAT[2048] is unsupported',
+        },
+      },
+    } as any);
+
+    expect(status).toBe('exact-scan-index-create-failed');
+    expect(detail).toContain('CREATE_VECTOR_INDEX failed');
+  });
+
+  it('reports no current repo index when metadata is absent', () => {
+    expect(repoVectorDoctorStatus(null).status).toBe('not indexed in current repo');
   });
 });

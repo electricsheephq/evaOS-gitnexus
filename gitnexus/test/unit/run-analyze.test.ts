@@ -325,3 +325,55 @@ describe('deriveEmbeddingCap', () => {
     expect(deriveEmbeddingCap(15_000, 10_000).skipForCap).toBe(true);
   });
 });
+
+describe('premium exact-scan fallback guard', () => {
+  it('blocks Voyage premium repos when VECTOR index creation degraded and fallback is not allowed', async () => {
+    const { shouldBlockPremiumExactScanFallback } = await import('../../src/core/run-analyze.js');
+
+    expect(
+      shouldBlockPremiumExactScanFallback({
+        isVoyageHttpMode: true,
+        premiumRepoAllowed: true,
+        semanticMode: 'exact-scan',
+        allowExactScanFallback: false,
+      }),
+    ).toBe(true);
+  });
+
+  it('does not block explicit fallback, non-Voyage, non-premium, or vector-index paths', async () => {
+    const { shouldBlockPremiumExactScanFallback } = await import('../../src/core/run-analyze.js');
+
+    expect(
+      shouldBlockPremiumExactScanFallback({
+        isVoyageHttpMode: true,
+        premiumRepoAllowed: true,
+        semanticMode: 'exact-scan',
+        allowExactScanFallback: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockPremiumExactScanFallback({
+        isVoyageHttpMode: false,
+        premiumRepoAllowed: true,
+        semanticMode: 'exact-scan',
+        allowExactScanFallback: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockPremiumExactScanFallback({
+        isVoyageHttpMode: true,
+        premiumRepoAllowed: false,
+        semanticMode: 'exact-scan',
+        allowExactScanFallback: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockPremiumExactScanFallback({
+        isVoyageHttpMode: true,
+        premiumRepoAllowed: true,
+        semanticMode: 'vector-index',
+        allowExactScanFallback: false,
+      }),
+    ).toBe(false);
+  });
+});

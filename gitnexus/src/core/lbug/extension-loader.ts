@@ -175,6 +175,7 @@ export const installDuckDbExtensionOutOfProcess = async (
 export class ExtensionManager {
   private readonly capabilities = new Map<string, ExtensionCapability>();
   private readonly installAttempted = new Map<string, ExtensionInstallResult>();
+  private readonly lastLoadErrors = new Map<string, string>();
   private readonly warnedKeys = new Set<string>();
 
   constructor(private readonly options: ExtensionManagerOptions = {}) {}
@@ -183,6 +184,7 @@ export class ExtensionManager {
   reset(): void {
     this.capabilities.clear();
     this.installAttempted.clear();
+    this.lastLoadErrors.clear();
     this.warnedKeys.clear();
   }
 
@@ -223,8 +225,16 @@ export class ExtensionManager {
       return true;
     }
 
+    const loadError = this.lastLoadErrors.get(name);
     if (policy === 'load-only') {
-      this.markUnavailable(name, label, 'load-only policy: extension not pre-installed', warn);
+      this.markUnavailable(
+        name,
+        label,
+        loadError
+          ? `LOAD EXTENSION ${name} failed: ${loadError}; load-only policy: extension not pre-installed`
+          : 'load-only policy: extension not pre-installed',
+        warn,
+      );
       return false;
     }
 
@@ -245,17 +255,31 @@ export class ExtensionManager {
       return true;
     }
 
-    this.markUnavailable(name, label, `LOAD ${name} failed after successful INSTALL`, warn);
+    const postInstallLoadError = this.lastLoadErrors.get(name);
+    this.markUnavailable(
+      name,
+      label,
+      postInstallLoadError
+        ? `LOAD EXTENSION ${name} failed after successful INSTALL: ${postInstallLoadError}`
+        : `LOAD ${name} failed after successful INSTALL`,
+      warn,
+    );
     return false;
   }
 
   private async tryLoad(query: (sql: string) => Promise<unknown>, name: string): Promise<boolean> {
     try {
       await query(`LOAD EXTENSION ${name}`);
+      this.lastLoadErrors.delete(name);
       return true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return alreadyAvailable(msg);
+      if (alreadyAvailable(msg)) {
+        this.lastLoadErrors.delete(name);
+        return true;
+      }
+      this.lastLoadErrors.set(name, msg);
+      return false;
     }
   }
 

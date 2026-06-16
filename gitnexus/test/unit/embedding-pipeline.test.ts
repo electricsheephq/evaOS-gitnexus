@@ -4,6 +4,7 @@ import {
   contentHashForNode,
   EMBEDDING_TEXT_VERSION,
   resolveEmbeddingInstallPolicy,
+  type VectorIndexState,
 } from '../../src/core/embeddings/embedding-pipeline.js';
 import { generateEmbeddingText } from '../../src/core/embeddings/text-generator.js';
 import type { EmbeddableNode, EmbeddingProgress } from '../../src/core/embeddings/types.js';
@@ -218,6 +219,8 @@ describe('runEmbeddingPipeline incremental filter', () => {
     // Mock loadVectorExtension (avoids needing the native lbug module)
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       loadVectorExtension: vi.fn().mockResolvedValue(true),
+      getVectorExtensionUnavailableReason: vi.fn().mockReturnValue(undefined),
+      createCodeEmbeddingVectorIndex: vi.fn().mockResolvedValue(undefined),
     }));
   };
 
@@ -347,6 +350,8 @@ describe('runEmbeddingPipeline incremental filter', () => {
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       loadVectorExtension: vi.fn().mockResolvedValue(true),
+      getVectorExtensionUnavailableReason: vi.fn().mockReturnValue(undefined),
+      createCodeEmbeddingVectorIndex: vi.fn().mockResolvedValue(undefined),
     }));
 
     const executeQuery = vi.fn().mockImplementation(async (cypher: string) => {
@@ -496,9 +501,8 @@ describe('runEmbeddingPipeline incremental filter', () => {
       existingEmbeddings,
     );
 
-    // The CREATE_VECTOR_INDEX query should have been called via executeQuery
-    const vectorIndexCalls = queryCalls.filter((c) => c.includes('CREATE_VECTOR_INDEX'));
-    expect(vectorIndexCalls.length).toBeGreaterThanOrEqual(1);
+    const { createCodeEmbeddingVectorIndex } = await import('../../src/core/lbug/lbug-adapter.js');
+    expect(createCodeEmbeddingVectorIndex).toHaveBeenCalled();
   });
 
   it('stores embeddings with exact-scan fallback when VECTOR is unavailable', async () => {
@@ -515,6 +519,10 @@ describe('runEmbeddingPipeline incremental filter', () => {
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       loadVectorExtension: vi.fn().mockResolvedValue(false),
+      getVectorExtensionUnavailableReason: vi
+        .fn()
+        .mockReturnValue('LOAD EXTENSION VECTOR failed: extension not installed'),
+      createCodeEmbeddingVectorIndex: vi.fn().mockResolvedValue(undefined),
     }));
 
     const node = makeNode();
@@ -527,8 +535,49 @@ describe('runEmbeddingPipeline incremental filter', () => {
 
     expect(result.vectorIndexReady).toBe(false);
     expect(result.semanticMode).toBe('exact-scan');
+    expect(result.vectorIndexState satisfies VectorIndexState).toBe('exact-scan-extension-missing');
+    expect(result.vectorIndexError).toMatch(/LOAD EXTENSION VECTOR failed/i);
     expect(stmtCalls.some((call) => call.cypher.includes('CREATE'))).toBe(true);
     expect(progressUpdates.at(-1)?.phase).toBe('ready');
+  });
+
+  it('records an actionable diagnostic when VECTOR index creation fails after extension load', async () => {
+    vi.doMock('../../src/core/embeddings/embedder.js', () => ({
+      initEmbedder: vi.fn().mockResolvedValue(undefined),
+      embedBatch: vi
+        .fn()
+        .mockImplementation((texts: string[]) =>
+          Promise.resolve(texts.map(() => new Float32Array(384))),
+        ),
+      embedText: vi.fn().mockResolvedValue(new Float32Array(384)),
+      embeddingToArray: vi.fn().mockImplementation((emb: Float32Array) => Array.from(emb)),
+      isEmbedderReady: vi.fn().mockReturnValue(true),
+    }));
+    vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      loadVectorExtension: vi.fn().mockResolvedValue(true),
+      getVectorExtensionUnavailableReason: vi.fn().mockReturnValue(undefined),
+      createCodeEmbeddingVectorIndex: vi
+        .fn()
+        .mockRejectedValue(new Error('CREATE_VECTOR_INDEX failed: FLOAT[2048] is unsupported')),
+    }));
+
+    const node = makeNode();
+    const executeQuery = vi.fn().mockImplementation(async (cypher: string) => {
+      queryCalls.push(cypher);
+      return mockExecuteQuery([node])(cypher);
+    });
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    const result = await runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress);
+
+    expect(result.vectorIndexReady).toBe(false);
+    expect(result.semanticMode).toBe('exact-scan');
+    expect(result.vectorIndexState satisfies VectorIndexState).toBe(
+      'exact-scan-index-create-failed',
+    );
+    expect(result.vectorIndexError).toMatch(/FLOAT\[2048\] is unsupported/);
   });
 
   it('does not inject preceding context when overlap is disabled', async () => {
@@ -546,6 +595,8 @@ describe('runEmbeddingPipeline incremental filter', () => {
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       loadVectorExtension: vi.fn().mockResolvedValue(true),
+      getVectorExtensionUnavailableReason: vi.fn().mockReturnValue(undefined),
+      createCodeEmbeddingVectorIndex: vi.fn().mockResolvedValue(undefined),
     }));
 
     const node = makeNode({
@@ -600,6 +651,8 @@ describe('runEmbeddingPipeline incremental filter', () => {
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       loadVectorExtension: vi.fn().mockResolvedValue(true),
+      getVectorExtensionUnavailableReason: vi.fn().mockReturnValue(undefined),
+      createCodeEmbeddingVectorIndex: vi.fn().mockResolvedValue(undefined),
     }));
 
     const node = makeNode({

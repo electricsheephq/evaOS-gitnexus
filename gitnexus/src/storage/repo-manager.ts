@@ -72,6 +72,23 @@ export interface RepoMeta {
     processes?: number;
     embeddings?: number;
   };
+  capabilities?: {
+    graph?: {
+      provider?: string;
+      status?: string;
+    };
+    fts?: {
+      provider?: string;
+      status?: string;
+    };
+    vectorSearch?: {
+      provider?: string;
+      status?: string;
+      mode?: string;
+      exactScanLimit?: number;
+      reason?: string;
+    };
+  };
   /**
    * Bumped whenever incremental-indexing invariants change in an
    * incompatible way (delete-and-rewrite logic, subgraph extraction,
