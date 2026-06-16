@@ -54,6 +54,10 @@ const vectorUnavailableMessage =
   '(GITNEXUS_LBUG_EXTENSION_INSTALL=auto), or pre-install it for offline use. ' +
   'Set GITNEXUS_LBUG_EXTENSION_INSTALL=never to skip installs and silence this.';
 
+const isVectorIndexAlreadyExistsError = (message: string): boolean =>
+  message.toLowerCase().includes('already exists') &&
+  message.toLowerCase().includes(EMBEDDING_INDEX_NAME.toLowerCase());
+
 /**
  * Resolve the extension-install policy for the embedding WRITE path (analyze).
  *
@@ -258,6 +262,9 @@ const createVectorIndex = async (): Promise<VectorIndexDiagnostic> => {
     return { ready: true, state: 'vector-index' };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (isVectorIndexAlreadyExistsError(message)) {
+      return { ready: true, state: 'vector-index' };
+    }
     if (isDev) {
       logger.warn({ error }, 'Vector index creation warning:');
     }
