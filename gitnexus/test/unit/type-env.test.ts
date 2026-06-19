@@ -20,10 +20,11 @@ import Python from 'tree-sitter-python';
 import CPP from 'tree-sitter-cpp';
 import PHP from 'tree-sitter-php';
 import Ruby from 'tree-sitter-ruby';
+import { requireVendoredGrammar } from '../../src/core/tree-sitter/vendored-grammars.js';
 
 let Dart: unknown;
 try {
-  Dart = require('tree-sitter-dart');
+  Dart = requireVendoredGrammar('tree-sitter-dart');
   const testParser = new Parser();
   testParser.setLanguage(Dart as Parser.Language);
 } catch {
@@ -32,7 +33,7 @@ try {
 
 let Swift: unknown;
 try {
-  Swift = require('tree-sitter-swift');
+  Swift = requireVendoredGrammar('tree-sitter-swift');
   const testParser = new Parser();
   testParser.setLanguage(Swift as Parser.Language);
 } catch {
@@ -41,7 +42,7 @@ try {
 
 let Kotlin: unknown;
 try {
-  Kotlin = require('tree-sitter-kotlin');
+  Kotlin = requireVendoredGrammar('tree-sitter-kotlin');
   const testParser = new Parser();
   testParser.setLanguage(Kotlin as Parser.Language);
 } catch {
