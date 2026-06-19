@@ -17,7 +17,7 @@
  * Since the hooks are CJS scripts that call main() on load, we test them
  * by spawning them as child processes with controlled stdin JSON.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'child_process';
 import { createRequire } from 'node:module';
 import fs from 'fs';
@@ -211,6 +211,10 @@ function getHeadCommit(): string {
   return (result.stdout || '').trim();
 }
 
+function clearHookLocks() {
+  fs.rmSync(path.join(gitNexusDir, '.hook-locks'), { recursive: true, force: true });
+}
+
 function initGitRepo(dir: string) {
   runGit(dir, ['init']);
   runGit(dir, ['config', 'user.email', 'test@test.com']);
@@ -218,6 +222,14 @@ function initGitRepo(dir: string) {
   fs.writeFileSync(path.join(dir, 'file.txt'), 'hello');
   runGit(dir, ['add', '.']);
   runGit(dir, ['commit', '-m', 'init']);
+}
+
+function createHookFixtureRepo(prefix = 'gitnexus-hook-owner-') {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const repoGitNexusDir = path.join(repoDir, '.gitnexus');
+  fs.mkdirSync(repoGitNexusDir, { recursive: true });
+  initGitRepo(repoDir);
+  return { repoDir, repoGitNexusDir };
 }
 
 function createGlobalRegistry(homeDir: string, marker: 'both' | 'registry' | 'repos' = 'both') {
@@ -1912,6 +1924,25 @@ describe('PreToolUse augmentation filtering (integration)', () => {
 describe.skipIf(SKIP_LSOF_PATH)(
   'Ladybug DB owner guard — production-shaped ps + failure modes (#1493)',
   () => {
+    let savedTmpDir: string;
+    let savedGitNexusDir: string;
+
+    beforeEach(() => {
+      savedTmpDir = tmpDir;
+      savedGitNexusDir = gitNexusDir;
+      const fixture = createHookFixtureRepo();
+      tmpDir = fixture.repoDir;
+      gitNexusDir = fixture.repoGitNexusDir;
+    });
+
+    afterEach(() => {
+      const fixtureDir = tmpDir;
+      tmpDir = savedTmpDir;
+      gitNexusDir = savedGitNexusDir;
+      fs.rmSync(fixtureDir, { recursive: true, force: true });
+      clearHookLocks();
+    });
+
     // These tests assert owner *detection* via the lsof + ps backend: a positive
     // skip is signalled by the `[GitNexus] augment skipped` diagnostic. Since
     // #1913 made that diagnostic debug-gated (silent by default for strict hook
@@ -1982,7 +2013,7 @@ describe.skipIf(SKIP_LSOF_PATH)(
               cwd: tmpDir,
             },
             undefined,
-            { env: hookEnv(binDir) },
+            { env: { ...hookEnv(binDir), GITNEXUS_HOOK_TIMEOUT_PATH: 'disabled' } },
           );
           const output = parseHookOutput(result.stdout);
           expect(output).not.toBeNull();
@@ -2045,7 +2076,7 @@ describe.skipIf(SKIP_LSOF_PATH)(
               cwd: tmpDir,
             },
             undefined,
-            { env: hookEnv(binDir) },
+            { env: { ...hookEnv(binDir), GITNEXUS_DEBUG: '1' } },
           );
           expect(result.stdout.trim()).toBe('');
           expect(result.status).toBe(0);
@@ -2472,7 +2503,7 @@ describe.skipIf(SKIP_LSOF_PATH)(
               cwd: tmpDir,
             },
             undefined,
-            { env: hookEnv(binDir) },
+            { env: { ...hookEnv(binDir), GITNEXUS_HOOK_TIMEOUT_PATH: 'disabled' } },
           );
           const output = parseHookOutput(result.stdout);
           expect(output).not.toBeNull();

@@ -19,9 +19,18 @@ import { SupportedLanguages } from '../../src/config/supported-languages.js';
 import { getProvider } from '../../src/core/ingestion/languages/index.js';
 
 // Vendored grammar — loaded from vendor/ by absolute path, never node_modules (#2111).
-const Kotlin = requireVendoredGrammar('tree-sitter-kotlin');
-const describeKotlin = describe;
+let Kotlin: Parser.Language | null = null;
+try {
+  Kotlin = requireVendoredGrammar('tree-sitter-kotlin') as Parser.Language;
+  const testParser = new Parser();
+  testParser.setLanguage(Kotlin);
+} catch {
+  Kotlin = null;
+}
+
+const describeKotlin = Kotlin ? describe : describe.skip;
 const setKotlinLanguage = (parser: Parser) => {
+  if (!Kotlin) throw new Error('tree-sitter-kotlin not available');
   parser.setLanguage(Kotlin);
 };
 
