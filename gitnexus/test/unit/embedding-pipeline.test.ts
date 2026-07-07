@@ -266,6 +266,49 @@ describe('runEmbeddingPipeline incremental filter', () => {
     progressUpdates.push({ ...p });
   };
 
+  it('falls back to text-bearing File nodes when a repo has no code symbols', async () => {
+    const embedBatchSpy = vi
+      .fn()
+      .mockImplementation((texts: string[]) =>
+        Promise.resolve(texts.map(() => new Float32Array(384))),
+      );
+    vi.doMock('../../src/core/embeddings/embedder.js', () => ({
+      initEmbedder: vi.fn().mockResolvedValue(undefined),
+      embedBatch: embedBatchSpy,
+      embedText: vi.fn().mockResolvedValue(new Float32Array(384)),
+      embeddingToArray: vi.fn().mockImplementation((emb: Float32Array) => Array.from(emb)),
+      isEmbedderReady: vi.fn().mockReturnValue(true),
+    }));
+    vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      loadVectorExtension: vi.fn().mockResolvedValue(true),
+      getVectorExtensionUnavailableReason: vi.fn().mockReturnValue(undefined),
+      createCodeEmbeddingVectorIndex: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const fileNode = makeNode({
+      id: 'File:README.md',
+      name: 'README.md',
+      label: 'File',
+      filePath: 'README.md',
+      content: '# Bailey Bear Hub\n\nLanding page routing and recovery notes.',
+      startLine: 1,
+      endLine: 3,
+    });
+    const executeQuery = mockExecuteQuery([fileNode]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    const result = await runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress);
+
+    expect(queryCalls.some((cypher) => cypher.includes('MATCH (n:File)'))).toBe(true);
+    expect(embedBatchSpy).toHaveBeenCalled();
+    expect(stmtCalls.some((call) => call.params.some((p) => p.nodeId === fileNode.id))).toBe(true);
+    expect(result.nodesProcessed).toBe(1);
+    expect(progressUpdates.at(-1)?.phase).toBe('ready');
+  });
+
   it('skips unchanged nodes when hash matches', async () => {
     mockEmbedderSetup();
 

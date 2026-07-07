@@ -196,7 +196,52 @@ const queryEmbeddableNodes = async (
     }
   }
 
-  return allNodes;
+  return allNodes.length > 0 ? allNodes : queryFallbackFileNodes(executeQuery);
+};
+
+/**
+ * Static/documentation repos can have no code-symbol labels at all while still
+ * carrying useful File nodes with persisted content. Use those only as a
+ * zero-code-symbol fallback so normal code repos do not duplicate every file
+ * into the semantic index.
+ */
+const queryFallbackFileNodes = async (
+  executeQuery: (cypher: string) => Promise<any[]>,
+): Promise<EmbeddableNode[]> => {
+  try {
+    const rows = await executeQuery(`
+      MATCH (n:File)
+      RETURN n.id AS id, n.name AS name, 'File' AS label,
+             n.filePath AS filePath, n.content AS content
+    `);
+
+    return rows
+      .map((row) => {
+        const content = row.content ?? row[4] ?? '';
+        const lineCount = content ? content.split('\n').length : 0;
+        return {
+          id: row.id ?? row[0],
+          name: row.name ?? row[1],
+          label: row.label ?? row[2] ?? 'File',
+          filePath: row.filePath ?? row[3],
+          content,
+          startLine: 1,
+          endLine: Math.max(1, lineCount),
+        };
+      })
+      .filter(
+        (node) =>
+          node.id &&
+          node.filePath &&
+          node.content.trim() &&
+          node.content !== '[Binary file - content not stored]',
+      );
+  } catch (error) {
+    if (isDev) {
+      logger.warn({ error }, 'Fallback File-node embedding query failed:');
+    }
+    return [];
+  }
 };
 
 /**
