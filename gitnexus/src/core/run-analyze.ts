@@ -126,6 +126,11 @@ import { STALE_HASH_SENTINEL } from './lbug/schema.js';
 export interface AnalyzeCallbacks {
   onProgress: (phase: string, percent: number, message: string) => void;
   onLog?: (message: string) => void;
+  /** Test/recovery observability at durable incremental-write boundaries. */
+  onRecoveryBoundary?: (
+    boundary: 'before-delete' | 'during-delete' | 'during-insert' | 'before-finalize',
+    details: Readonly<Record<string, unknown>>,
+  ) => void;
 }
 
 export interface AnalyzeOptions {
@@ -1623,6 +1628,11 @@ export async function runFullAnalysis(
           effectiveWriteCount: effectiveWriteSet.size,
           deleteCount: filesToDelete.length,
         });
+        callbacks.onRecoveryBoundary?.('before-delete', {
+          phase: 'escalated-full-write',
+          effectiveWriteCount: effectiveWriteSet.size,
+          deleteCount: filesToDelete.length,
+        });
         // Strategy switch: stop the checkpoint driver around the close so its
         // in-flight CHECKPOINT can't race the reopen, drop the DB files
         // (sidecars included), and bulk-load the full graph into a fresh DB —
@@ -1633,14 +1643,52 @@ export async function runFullAnalysis(
         // to replace wholesale.
         await walCheckpointDriver.stop();
         await closeLbug();
-        await wipeLbugDbFiles(lbugPath);
+        let deletionBoundaryReported = false;
+        await wipeLbugDbFiles(lbugPath, {
+          onRemoved: (removedPath, index, total) => {
+            if (deletionBoundaryReported) return;
+            deletionBoundaryReported = true;
+            callbacks.onRecoveryBoundary?.('during-delete', {
+              phase: 'escalated-full-write',
+              removedPath,
+              index,
+              total,
+            });
+          },
+        });
+        await saveIncrementalDirtyState('escalated-load-graph', {
+          toWriteCount: 0,
+          importerExpansion,
+          shadowSeedCount: shadowSeed.length,
+          effectiveWriteCount: effectiveWriteSet.size,
+          deleteCount: filesToDelete.length,
+        });
         await initLbug(lbugPath);
         walCheckpointDriver = startWalCheckpointDriver();
-        await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
-          lbugMsgCount++;
-          const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
-          progress('lbug', pct, msg);
-        });
+        let insertionBoundaryReported = false;
+        await loadGraphToLbug(
+          pipelineResult.graph,
+          pipelineResult.repoPath,
+          storagePath,
+          (msg) => {
+            lbugMsgCount++;
+            const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
+            progress('lbug', pct, msg);
+          },
+          undefined,
+          {
+            onNodeCopyCommitted: (table, index, total) => {
+              if (insertionBoundaryReported) return;
+              insertionBoundaryReported = true;
+              callbacks.onRecoveryBoundary?.('during-insert', {
+                phase: 'escalated-load-graph',
+                table,
+                index,
+                total,
+              });
+            },
+          },
+        );
       } else {
         // The surgical plan is now final. Only at this point may
         // --incremental-only write its crash marker, immediately before the
@@ -2215,6 +2263,12 @@ export async function runFullAnalysis(
       // off==off and incremental eligibility is restored.
       pdg: resolvePdgConfig(options),
     };
+    if (isIncremental && hashDiff) {
+      callbacks.onRecoveryBoundary?.('before-finalize', {
+        phase: escalatedFullWrite ? 'escalated-load-graph' : 'load-graph',
+        targetCommit: currentCommit,
+      });
+    }
     await saveMeta(metaDir, meta);
 
     // Persist the incremental parse cache for the next run. Wraps in
