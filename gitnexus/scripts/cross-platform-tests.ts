@@ -113,6 +113,9 @@ const LBUG_NATIVE = [
   // environment for #2409 was Windows, so the write pattern must be proven
   // on the windows-latest native addon, not just Ubuntu.
   'test/integration/lbug-delete-nodes-for-files.test.ts',
+  // Real child-process large incremental cycle: native writeback, persisted
+  // dirty marker, SIGTERM, sidecars, and recovery differ across OSes.
+  'test/integration/large-incremental-subprocess-e2e.test.ts',
   // #2409 defect 2: dirty-flag recovery parks lbug.wal/.shadow (rename next
   // to a live native DB, rm-then-rename over an existing parked copy) before
   // any open — rename semantics are exactly what differs on Windows.
