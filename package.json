@@ -5,6 +5,7 @@
     "prepare": "husky",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "check:release-governance": "node .github/scripts/check-release-governance.mjs",
     "lint": "eslint .",
     "lint:fix": "eslint --fix .",
     "gitnexus:refresh": "gitnexus analyze --embeddings --skills",
@@ -20,7 +21,8 @@
     "husky": "^9.1.7",
     "lint-staged": "^15.5.0",
     "prettier": "^3.8.0",
-    "prettier-plugin-tailwindcss": "^0.7.0"
+    "prettier-plugin-tailwindcss": "^0.7.0",
+    "yaml": "2.8.3"
   },
   "lint-staged": {
     "*.{ts,tsx}": [

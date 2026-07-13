@@ -6,14 +6,12 @@ name: Workflow Lint
 #   - zizmor: security misconfigurations — unpinned actions, dangerous
 #     `${{ }}` interpolation, missing per-job permissions, etc.
 #
-# Scoped to PRs that touch .github/** only — keeps off the typical PR
-# critical path.
+# Runs on every main-targeted PR because both jobs are required merge gates.
+# Path filtering would leave unrelated PRs waiting on checks that never start.
 
 on:
   pull_request:
     branches: [main]
-    paths:
-      - '.github/**'
 
 permissions:
   contents: read

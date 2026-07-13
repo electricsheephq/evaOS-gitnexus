@@ -20,6 +20,7 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci
+      - run: npm run check:release-governance
       - run: npx prettier --check .
 
   lint:

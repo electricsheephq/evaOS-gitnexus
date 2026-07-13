@@ -63,10 +63,7 @@ import {
   isVectorExtensionSupportedByPlatform,
 } from '../../core/platform/capabilities.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
-import {
-  rerankDocuments,
-  type RerankRuntime,
-} from '../../core/rerank/provider.js';
+import { rerankDocuments, type RerankRuntime } from '../../core/rerank/provider.js';
 import { resolveRerankRuntime } from '../../core/rerank/voyage-provider.js';
 import { ftsDegradedWarning } from '../../core/search/fts-indexes.js';
 import {
@@ -742,8 +739,9 @@ export class LocalBackend {
   private warnedMissingEmbeddingStack = false;
 
   constructor(
-    private readonly rerankRuntimeResolver: (repoName: string) => RerankRuntime | null =
-      resolveRerankRuntime,
+    private readonly rerankRuntimeResolver: (
+      repoName: string,
+    ) => RerankRuntime | null = resolveRerankRuntime,
   ) {}
 
   /**

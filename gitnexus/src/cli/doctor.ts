@@ -162,9 +162,7 @@ export function repoVectorDoctorStatus(meta: RepoMeta | null | undefined): {
 
   const rawEmbeddingCount = Number(meta.stats?.embeddings ?? 0);
   const embeddingCount =
-    Number.isFinite(rawEmbeddingCount) && rawEmbeddingCount > 0
-      ? Math.floor(rawEmbeddingCount)
-      : 0;
+    Number.isFinite(rawEmbeddingCount) && rawEmbeddingCount > 0 ? Math.floor(rawEmbeddingCount) : 0;
   if (embeddingCount <= 0) return { status: 'no embeddings', detail: null };
 
   const vector = meta.capabilities?.vectorSearch;

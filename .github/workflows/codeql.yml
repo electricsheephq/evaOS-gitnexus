@@ -3,13 +3,12 @@ name: CodeQL
 # Static analysis (SAST) for TypeScript/JavaScript and Python sources.
 # Findings upload to the GitHub Security tab as SARIF.
 #
-# Advisory only on first introduction — see docs/plans/2026-05-03-001-feat-automated-security-scans-plan.md.
-# Promote to a required check after baseline triage (operator decision).
+# Required on every main-targeted pull request. Scheduled and main-push runs
+# continue to catch findings that appear between pull requests.
 
 on:
   pull_request:
     branches: [main]
-    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   push:
     branches: [main]
   schedule:

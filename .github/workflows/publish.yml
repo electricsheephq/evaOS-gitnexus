@@ -6,7 +6,7 @@ name: Publish
 # double-publish race this unification closes.
 #
 # Two release modes, both routed through this file:
-#   • Release candidate (rc)  — triggered by push to `main` or workflow_dispatch.
+#   • Release candidate (rc)  — triggered only by workflow_dispatch on `main`.
 #       The RC path computes the next rc version, applies it in-CI, pushes a
 #       detached release commit with v<X.Y.Z>-rc.<N> + rc/<SHA> marker
 #       atomically, then publishes to npm with --tag rc and creates a GitHub
@@ -28,11 +28,6 @@ name: Publish
 
 on:
   push:
-    branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
     tags:
       # Negative-globbed exclusion of RC tags this workflow itself produces
       # (see the SELF-TRIGGER INVARIANT in the header comment).
@@ -65,9 +60,9 @@ on:
 # Workflow-level deny-all; each job declares the minimum it needs.
 permissions: {}
 
-# Distinct refs (refs/heads/main, refs/tags/v*) run in parallel. The
-# release-PR-skip in rc-guard is the load-bearing invariant that prevents
-# an RC main-push and a stable tag-push colliding on the same release commit.
+# Manual RC dispatches and stable tag pushes use distinct refs and may run in
+# parallel. The release-PR skip remains a defense against a manually dispatched
+# RC colliding with a stable tag on the same release commit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -118,9 +113,6 @@ jobs:
               ;;
             push)
               case "${GH_REF}" in
-                refs/heads/main)
-                  MODE="rc"
-                  ;;
                 refs/tags/v*)
                   # The trigger filter already excluded v*-rc.* tags. Anything
                   # reaching here is either a stable semver or a malformed v*.
@@ -280,6 +272,8 @@ jobs:
     if: ${{ always() && needs.ci.result == 'success' && (needs.route.outputs.mode == 'stable' || needs.rc-guard.outputs.should_run == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment:
+      name: internal-release
     permissions:
       # contents: write — RC path needs it for `git push --atomic` (v-tag +
       # marker). Stable path runs in the same job and inherits the grant; it
