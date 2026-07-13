@@ -440,10 +440,7 @@ describe('LocalBackend.callTool', () => {
 
     const result = await rerankingBackend.callTool('query', { search_query: 'needle' });
 
-    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual([
-      'b.ts',
-      'a.ts',
-    ]);
+    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual(['b.ts', 'a.ts']);
     expect(runtime.provider.rerank).toHaveBeenCalledTimes(1);
   });
 
@@ -456,12 +453,14 @@ describe('LocalBackend.callTool', () => {
       ],
       ftsAvailable: true,
     });
-    const resolver = vi.fn((): RerankRuntime => ({
-      provider: { id: 'unused-test', rerank: vi.fn() },
-      candidates: 2,
-      maxDocChars: 1000,
-      failurePolicy: 'fallback',
-    }));
+    const resolver = vi.fn(
+      (): RerankRuntime => ({
+        provider: { id: 'unused-test', rerank: vi.fn() },
+        candidates: 2,
+        maxDocChars: 1000,
+        failurePolicy: 'fallback',
+      }),
+    );
     const bypassBackend = new LocalBackend(resolver);
     await bypassBackend.init();
 
@@ -470,10 +469,7 @@ describe('LocalBackend.callTool', () => {
       rerank: false,
     });
 
-    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual([
-      'a.ts',
-      'b.ts',
-    ]);
+    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual(['a.ts', 'b.ts']);
     expect(resolver).not.toHaveBeenCalled();
     expect(result.timing).not.toHaveProperty('rerank');
     expect(result.warning).toBeUndefined();
@@ -501,10 +497,7 @@ describe('LocalBackend.callTool', () => {
 
     const result = await fallbackBackend.callTool('query', { search_query: 'needle' });
 
-    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual([
-      'a.ts',
-      'b.ts',
-    ]);
+    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual(['a.ts', 'b.ts']);
     expect(result.warning).toMatch(/rerank unavailable.*existing bm25\/vector ranking/i);
   });
 

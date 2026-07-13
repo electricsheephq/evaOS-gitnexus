@@ -60,10 +60,7 @@ describe('resolveRerankRuntime', () => {
 
   it.each([
     [{ GITNEXUS_RERANK_PROVIDER: 'unknown', GITNEXUS_RERANK_ALLOWED_REPOS: 'repo' }, /provider/i],
-    [
-      { GITNEXUS_RERANK_PROVIDER: 'voyage', GITNEXUS_RERANK_ALLOWED_REPOS: 'repo' },
-      /api key/i,
-    ],
+    [{ GITNEXUS_RERANK_PROVIDER: 'voyage', GITNEXUS_RERANK_ALLOWED_REPOS: 'repo' }, /api key/i],
     [
       {
         GITNEXUS_RERANK_PROVIDER: 'voyage',
@@ -88,17 +85,20 @@ describe('VoyageRerankProvider', () => {
     );
     const provider = new VoyageRerankProvider(baseConfig, fetchImpl as typeof fetch);
 
-    await expect(
-      provider.rerank({ query: 'needle', documents: ['a', 'b'] }),
-    ).resolves.toEqual([{ index: 1, score: 0.8 }]);
+    await expect(provider.rerank({ query: 'needle', documents: ['a', 'b'] })).resolves.toEqual([
+      { index: 1, score: 0.8 },
+    ]);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it('surfaces timeout without retrying', async () => {
-    const fetchImpl = vi.fn((_url: string | URL, init?: RequestInit) =>
-      new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
-      }),
+    const fetchImpl = vi.fn(
+      (_url: string | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+            once: true,
+          });
+        }),
     );
     const provider = new VoyageRerankProvider(
       { ...baseConfig, timeoutMs: 5 },

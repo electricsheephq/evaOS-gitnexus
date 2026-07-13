@@ -1,9 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import {
-  rerankDocuments,
-  type RerankProvider,
-} from '../../src/core/rerank/provider.js';
+import { rerankDocuments, type RerankProvider } from '../../src/core/rerank/provider.js';
 
 const documents = ['first', 'second', 'third'];
 
@@ -28,7 +25,13 @@ describe('rerankDocuments', () => {
   it.each([
     ['non-array response', null],
     ['out-of-range index', [{ index: 3, score: 0.5 }]],
-    ['duplicate index', [{ index: 1, score: 0.5 }, { index: 1, score: 0.4 }]],
+    [
+      'duplicate index',
+      [
+        { index: 1, score: 0.5 },
+        { index: 1, score: 0.4 },
+      ],
+    ],
     ['non-finite score', [{ index: 0, score: Number.NaN }]],
   ])('rejects malformed provider output: %s', async (_label, output) => {
     const provider = {
