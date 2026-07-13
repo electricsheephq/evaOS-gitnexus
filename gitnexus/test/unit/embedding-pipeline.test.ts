@@ -289,6 +289,78 @@ describe('runEmbeddingPipeline incremental filter', () => {
     progressUpdates.push({ ...p });
   };
 
+  it('falls back to text-bearing File nodes when a repo has no code symbols', async () => {
+    mockEmbedderSetup();
+
+    const fileNode = makeNode({
+      id: 'File:README.md',
+      name: 'README.md',
+      label: 'File',
+      filePath: 'README.md',
+      content: '# Static Site\n\nDeployment and recovery notes.',
+      startLine: 1,
+      endLine: 3,
+    });
+    const emptyFile = makeNode({
+      id: 'File:empty.txt',
+      name: 'empty.txt',
+      label: 'File',
+      filePath: 'empty.txt',
+      content: '   ',
+    });
+    const binaryFile = makeNode({
+      id: 'File:logo.png',
+      name: 'logo.png',
+      label: 'File',
+      filePath: 'logo.png',
+      content: '[Binary file - content not stored]',
+    });
+    const executeQuery = mockExecuteQuery([fileNode, emptyFile, binaryFile]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    const result = await runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress);
+
+    expect(queryCalls.some((cypher) => cypher.includes('MATCH (n:File)'))).toBe(true);
+    const insertedNodeIds = stmtCalls
+      .filter((call) => call.cypher.includes('CREATE'))
+      .flatMap((call) => call.params.map((param) => param.nodeId));
+    expect(insertedNodeIds).toContain(fileNode.id);
+    expect(insertedNodeIds).not.toContain(emptyFile.id);
+    expect(insertedNodeIds).not.toContain(binaryFile.id);
+    expect(result.nodesProcessed).toBe(1);
+  });
+
+  it('retains symbol-first selection when code symbols exist', async () => {
+    mockEmbedderSetup();
+
+    const functionNode = makeNode();
+    const fileNode = makeNode({
+      id: 'File:src/main.ts',
+      name: 'main.ts',
+      label: 'File',
+      filePath: 'src/main.ts',
+      content: 'function foo() { return 1; }',
+    });
+    const executeQuery = mockExecuteQuery([functionNode, fileNode]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    const result = await runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress);
+
+    expect(queryCalls.some((cypher) => cypher.includes('MATCH (n:File)'))).toBe(false);
+    const insertedNodeIds = stmtCalls
+      .filter((call) => call.cypher.includes('CREATE'))
+      .flatMap((call) => call.params.map((param) => param.nodeId));
+    expect(insertedNodeIds).toContain(functionNode.id);
+    expect(insertedNodeIds).not.toContain(fileNode.id);
+    expect(result.nodesProcessed).toBe(1);
+  });
+
   it('skips unchanged nodes when hash matches', async () => {
     mockEmbedderSetup();
 

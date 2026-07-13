@@ -180,7 +180,50 @@ const queryEmbeddableNodes = async (
     }
   }
 
-  return allNodes;
+  return allNodes.length > 0 ? allNodes : queryFallbackFileNodes(executeQuery);
+};
+
+/**
+ * Static and documentation repositories may contain no code symbols while
+ * still persisting useful text on File nodes. Keep File embeddings as a
+ * zero-symbol fallback so code repositories retain symbol-first selection.
+ */
+const queryFallbackFileNodes = async (
+  executeQuery: (cypher: string) => Promise<any[]>,
+): Promise<EmbeddableNode[]> => {
+  try {
+    const rows = await executeQuery(`
+      MATCH (n:File)
+      RETURN n.id AS id, n.name AS name, 'File' AS label,
+             n.filePath AS filePath, n.content AS content
+    `);
+
+    return rows
+      .map((row) => {
+        const content = row.content ?? row[4] ?? '';
+        return {
+          id: row.id ?? row[0],
+          name: row.name ?? row[1],
+          label: row.label ?? row[2] ?? 'File',
+          filePath: row.filePath ?? row[3],
+          content,
+          startLine: 1,
+          endLine: Math.max(1, content.split('\n').length),
+        };
+      })
+      .filter(
+        (node) =>
+          node.id &&
+          node.filePath &&
+          node.content.trim() &&
+          node.content !== '[Binary file - content not stored]',
+      );
+  } catch (error) {
+    if (isDev) {
+      logger.warn({ error }, 'Fallback File-node embedding query failed:');
+    }
+    return [];
+  }
 };
 
 /**
