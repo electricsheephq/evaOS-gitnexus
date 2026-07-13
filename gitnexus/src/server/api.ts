@@ -1776,6 +1776,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           status: 'analyzing' as any,
           progress: { phase: 'analyzing', percent: 0, message: 'Starting embedding generation...' },
         });
+        const embedController = new AbortController();
+        embedJobManager.registerAbortController(job.id, embedController);
 
         // 30-minute timeout for embedding jobs (same as analyze jobs)
         const EMBED_TIMEOUT_MS = 30 * 60 * 1000;
@@ -1783,10 +1785,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           const current = embedJobManager.getJob(job.id);
           if (current && current.status !== 'complete' && current.status !== 'failed') {
             releaseRepoLock(repoLockPath);
-            embedJobManager.updateJob(job.id, {
-              status: 'failed',
-              error: 'Embedding timed out (30 minute limit)',
-            });
+            embedJobManager.cancelJob(job.id, 'Embedding timed out (30 minute limit)');
           }
         }, EMBED_TIMEOUT_MS);
 
@@ -1831,6 +1830,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 {}, // config: use defaults
                 undefined, // skipNodeIds
                 existingEmbeddings,
+                {
+                  signal: embedController.signal,
+                  onCheckpoint: async () => {
+                    // Make each reported pipeline checkpoint durable before the
+                    // next batch starts. A cancelled/restarted job then resumes
+                    // from content hashes already present in LadybugDB.
+                    await flushWAL();
+                  },
+                },
               );
 
               // Flush WAL so subsequent /api/search requests see the new

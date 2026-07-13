@@ -621,6 +621,94 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(insertN1).toBeLessThan(deleteN2);
   });
 
+  it('stops at a batch boundary when cancellation is requested', async () => {
+    mockEmbedderSetup();
+    const first = makeNode({ id: 'Function:first:src/first.ts', name: 'first' });
+    const second = makeNode({ id: 'Function:second:src/second.ts', name: 'second' });
+    const executeQuery = mockExecuteQuery([first, second]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+    const controller = new AbortController();
+    const checkpoints: number[] = [];
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+    const promise = runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      { batchSize: 1 },
+      undefined,
+      new Map(),
+      {
+        signal: controller.signal,
+        checkpointEveryNodes: 1,
+        onCheckpoint: async ({ nodesProcessed }) => {
+          checkpoints.push(nodesProcessed);
+          controller.abort();
+        },
+      },
+    );
+
+    await expect(promise).rejects.toThrow(/abort/i);
+    const insertedIds = stmtCalls
+      .filter((call) => call.cypher.includes('CREATE'))
+      .flatMap((call) => call.params.map((param) => param.nodeId));
+    expect(insertedIds).toEqual([first.id]);
+    expect(checkpoints).toEqual([1]);
+  });
+
+  it('resumes idempotently from the hashes persisted before an interrupted checkpoint', async () => {
+    mockEmbedderSetup();
+    const first = makeNode({ id: 'Function:first:src/first.ts', name: 'first' });
+    const second = makeNode({ id: 'Function:second:src/second.ts', name: 'second' });
+    const executeQuery = mockExecuteQuery([first, second]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await expect(
+      runEmbeddingPipeline(
+        executeQuery,
+        executeWithReusedStatement,
+        onProgress,
+        { batchSize: 1 },
+        undefined,
+        new Map(),
+        {
+          checkpointEveryNodes: 1,
+          onCheckpoint: async ({ nodesProcessed }) => {
+            if (nodesProcessed === 1) throw new Error('simulated interruption after checkpoint');
+          },
+        },
+      ),
+    ).rejects.toThrow('simulated interruption');
+
+    const firstInsert = stmtCalls.find(
+      (call) => call.cypher.includes('CREATE') && call.params.some((p) => p.nodeId === first.id),
+    );
+    expect(firstInsert).toBeDefined();
+    const firstParam = firstInsert?.params.find((param) => param.nodeId === first.id);
+    if (!firstParam) throw new Error('expected first checkpoint insert');
+    const firstHash = firstParam.contentHash;
+
+    stmtCalls = [];
+    progressUpdates = [];
+    await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      { batchSize: 1 },
+      undefined,
+      new Map([[first.id, firstHash]]),
+      { checkpointEveryNodes: 1, onCheckpoint: async () => {} },
+    );
+
+    const resumedIds = stmtCalls
+      .filter((call) => call.cypher.includes('CREATE'))
+      .flatMap((call) => call.params.map((param) => param.nodeId));
+    expect(resumedIds).toEqual([second.id]);
+  });
+
   it('deletes only stale nodes — new and unchanged nodes are never deleted (#2333 U6)', async () => {
     mockEmbedderSetup();
 

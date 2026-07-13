@@ -200,6 +200,20 @@ export interface RepoMeta {
     droppedImporterChunks?: number;
   };
   /**
+   * Durable marker written after a completed embedding batch and LadybugDB
+   * checkpoint. The graph is valid, but embedding generation has not reached
+   * final metadata registration. A matching runtime resumes from persisted
+   * content hashes; a model or dimension mismatch fails before mutation.
+   */
+  embeddingCheckpoint?: {
+    at: string;
+    nodesProcessed: number;
+    totalNodes: number;
+    chunksProcessed: number;
+    model: string;
+    dimensions: number;
+  };
+  /**
    * Name of the git branch this index represents (#2106). Absent for the
    * default/legacy single-branch case so the flat metadata file stays
    * byte-identical to pre-multi-branch output. When present in the FLAT

@@ -1,7 +1,7 @@
 import { execSync } from 'child_process';
 import fs from 'fs/promises';
 import path from 'path';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   deriveEmbeddingMode,
   deriveEmbeddingCap,
@@ -73,6 +73,117 @@ describe('run-analyze module', () => {
       await tmpRepo.cleanup();
     }
   });
+
+  it('resumes a matching embedding checkpoint instead of taking the clean fast path', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-embedding-checkpoint-');
+    const tmpHome = await createTempDir('gitnexus-run-analyze-embedding-checkpoint-home-');
+    const saved = {
+      home: process.env.GITNEXUS_HOME,
+      url: process.env.GITNEXUS_EMBEDDING_URL,
+      model: process.env.GITNEXUS_EMBEDDING_MODEL,
+      dims: process.env.GITNEXUS_EMBEDDING_DIMS,
+      extension: process.env.GITNEXUS_LBUG_EXTENSION_INSTALL,
+    };
+    try {
+      process.env.GITNEXUS_HOME = tmpHome.dbPath;
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '384';
+      process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = 'never';
+      const vector = Array.from({ length: 384 }, (_, i) => i / 384);
+      const fetchMock = vi.fn().mockImplementation(async (_input, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { input?: unknown[] };
+        const count = Array.isArray(body.input) ? body.input.length : 1;
+        return {
+          ok: true,
+          json: async () => ({
+            data: Array.from({ length: count }, () => ({ embedding: vector })),
+          }),
+        };
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      await fs.writeFile(
+        path.join(tmpRepo.dbPath, 'index.ts'),
+        'export function checkpointResume() { return "ready"; }\n',
+      );
+      execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git add index.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit -m init', {
+        cwd: tmpRepo.dbPath,
+        stdio: 'pipe',
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { embeddings: true, skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const completed = await loadMeta(storagePath);
+      expect(completed).not.toBeNull();
+      if (!completed) throw new Error('expected completed metadata');
+      await saveMeta(storagePath, {
+        ...completed,
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 1,
+          totalNodes: 1,
+          chunksProcessed: 1,
+          model: 'test-model',
+          dimensions: 384,
+        },
+      } as RepoMeta);
+      fetchMock.mockClear();
+      const logs: string[] = [];
+
+      const resumed = await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {}, onLog: (message) => logs.push(message) },
+      );
+
+      expect(resumed.alreadyUpToDate).not.toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(logs.some((message) => message.includes('embedding checkpoint'))).toBe(true);
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toBeUndefined();
+
+      const finalized = await loadMeta(storagePath);
+      if (!finalized) throw new Error('expected finalized metadata');
+      await saveMeta(storagePath, {
+        ...finalized,
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 1,
+          totalNodes: 2,
+          chunksProcessed: 1,
+          model: 'different-model',
+          dimensions: 384,
+        },
+      });
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          { skipAgentsMd: true, skipSkills: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow('Cannot resume embedding checkpoint');
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      const restore = (key: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      restore('GITNEXUS_HOME', saved.home);
+      restore('GITNEXUS_EMBEDDING_URL', saved.url);
+      restore('GITNEXUS_EMBEDDING_MODEL', saved.model);
+      restore('GITNEXUS_EMBEDDING_DIMS', saved.dims);
+      restore('GITNEXUS_LBUG_EXTENSION_INSTALL', saved.extension);
+      await tmpRepo.cleanup();
+      await tmpHome.cleanup();
+    }
+  }, 120_000);
 
   it('plain analyze on another branch adopts the flat workspace slot (#2354)', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-workspace-');

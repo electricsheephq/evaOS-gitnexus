@@ -305,6 +305,18 @@ export interface EmbeddingPipelineResult {
   semanticMode: 'vector-index' | 'exact-scan';
 }
 
+export interface EmbeddingPipelineCheckpoint {
+  nodesProcessed: number;
+  totalNodes: number;
+  chunksProcessed: number;
+}
+
+export interface EmbeddingPipelineOptions {
+  signal?: AbortSignal;
+  checkpointEveryNodes?: number;
+  onCheckpoint?: (checkpoint: EmbeddingPipelineCheckpoint) => Promise<void>;
+}
+
 /**
  * DELETE stale embedding rows for the given nodeIds so they can be re-inserted.
  *
@@ -363,12 +375,20 @@ export const runEmbeddingPipeline = async (
   config: Partial<EmbeddingConfig> = {},
   skipNodeIds?: Set<string>,
   existingEmbeddings?: Map<string, string>,
+  pipelineOptions: EmbeddingPipelineOptions = {},
 ): Promise<EmbeddingPipelineResult> => {
   const finalConfig = resolveEmbeddingConfig(config);
   let totalChunks = 0;
+  const checkpointEveryNodes = pipelineOptions.checkpointEveryNodes ?? 5_000;
+  if (!Number.isSafeInteger(checkpointEveryNodes) || checkpointEveryNodes <= 0) {
+    throw new Error('checkpointEveryNodes must be a positive integer');
+  }
+  const throwIfCancelled = (): void => pipelineOptions.signal?.throwIfAborted();
 
   try {
+    throwIfCancelled();
     const vectorAvailable = await ensureVectorExtensionAvailable();
+    throwIfCancelled();
     if (!vectorAvailable) {
       logger.warn(vectorUnavailableMessage);
     }
@@ -389,6 +409,7 @@ export const runEmbeddingPipeline = async (
           modelDownloadPercent: downloadPercent,
         });
       }, finalConfig);
+      throwIfCancelled();
     }
 
     onProgress({
@@ -403,6 +424,7 @@ export const runEmbeddingPipeline = async (
 
     // Phase 2: Query embeddable nodes
     let nodes = await queryEmbeddableNodes(executeQuery);
+    throwIfCancelled();
 
     // Incremental mode: compare content hashes, delete stale rows, skip fresh ones.
     // Computed hashes for stale nodes are cached so batchInsertEmbeddings can reuse them
@@ -445,6 +467,7 @@ export const runEmbeddingPipeline = async (
     }
 
     if (totalNodes === 0) {
+      throwIfCancelled();
       // Ensure the vector index exists even when no new nodes need embedding.
       // A prior crash or first-time incremental run may have left CodeEmbedding
       // rows without ever reaching index creation.
@@ -469,6 +492,7 @@ export const runEmbeddingPipeline = async (
     const chunkSize = finalConfig.chunkSize;
     const overlap = finalConfig.overlap;
     let processedNodes = 0;
+    let lastCheckpointAt = 0;
 
     onProgress({
       phase: 'embedding',
@@ -481,6 +505,7 @@ export const runEmbeddingPipeline = async (
 
     // Process in batches of nodes
     for (let batchIndex = 0; batchIndex < totalNodes; batchIndex += batchSize) {
+      throwIfCancelled();
       const batch = nodes.slice(batchIndex, batchIndex + batchSize);
 
       // Chunk each node and generate text
@@ -563,6 +588,7 @@ export const runEmbeddingPipeline = async (
       // Preserves Kuzu's required DELETE-before-INSERT for vector-indexed rows.
       const batchStaleIds = batch.filter((n) => staleNodeIds.has(n.id)).map((n) => n.id);
       await deleteStaleEmbeddingRows(executeWithReusedStatement, batchStaleIds);
+      throwIfCancelled();
 
       // Embed chunk texts in sub-batches to control memory
       const EMBED_SUB_BATCH = finalConfig.subBatchSize;
@@ -572,7 +598,7 @@ export const runEmbeddingPipeline = async (
 
         let embeddings: Float32Array[];
         try {
-          embeddings = await embedBatch(subTexts);
+          embeddings = await embedBatch(subTexts, { signal: pipelineOptions.signal });
         } catch (embedErr) {
           logger.error(
             { embedErr },
@@ -587,6 +613,7 @@ export const runEmbeddingPipeline = async (
         }));
 
         await batchInsertEmbeddings(executeWithReusedStatement, dbUpdates);
+        throwIfCancelled();
       }
 
       processedNodes += batch.length;
@@ -601,9 +628,23 @@ export const runEmbeddingPipeline = async (
         currentBatch: Math.floor(batchIndex / batchSize) + 1,
         totalBatches: Math.ceil(totalNodes / batchSize),
       });
+
+      if (
+        pipelineOptions.onCheckpoint &&
+        (processedNodes - lastCheckpointAt >= checkpointEveryNodes || processedNodes === totalNodes)
+      ) {
+        await pipelineOptions.onCheckpoint({
+          nodesProcessed: processedNodes,
+          totalNodes,
+          chunksProcessed: totalChunks,
+        });
+        lastCheckpointAt = processedNodes;
+        throwIfCancelled();
+      }
     }
 
     // Phase 4: Create vector index
+    throwIfCancelled();
     onProgress({
       phase: 'indexing',
       percent: 90,
