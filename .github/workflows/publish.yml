@@ -584,6 +584,21 @@ jobs:
           npm version "${{ steps.rc-version.outputs.rc_version }}" \
             --no-git-tag-version --allow-same-version
 
+      - name: Synchronize rc plugin manifest versions
+        if: needs.route.outputs.mode == 'rc'
+        shell: bash
+        working-directory: gitnexus
+        run: node scripts/sync-plugin-versions.mjs
+
+      - name: Verify rc plugin manifest versions
+        if: needs.route.outputs.mode == 'rc'
+        shell: bash
+        working-directory: gitnexus
+        run: >-
+          npx vitest run --project default
+          test/unit/sync-plugin-versions.test.ts
+          test/unit/cli-commands.test.ts
+
       - name: Build gitnexus
         run: npm run build
         working-directory: gitnexus
@@ -668,7 +683,13 @@ jobs:
           # Detached release commit with the version bump — main stays
           # pristine, but the v-tag's tree matches the published package
           # exactly (release-integrity).
-          git add package.json package-lock.json 2>/dev/null || git add package.json
+          git add \
+            package.json \
+            package-lock.json \
+            ../gitnexus-claude-plugin/.claude-plugin/plugin.json \
+            ../.claude-plugin/marketplace.json \
+            ../gitnexus-claude-plugin/.codex-plugin/plugin.json \
+            ../.agents/plugins/marketplace.json
           git commit -m "release: ${VTAG}" --allow-empty
           RELEASE_SHA="$(git rev-parse HEAD)"
           echo "Detached release commit: $RELEASE_SHA"
