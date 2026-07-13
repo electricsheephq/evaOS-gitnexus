@@ -12,12 +12,13 @@ const bm25IndexUrl = pathToFileURL(path.join(packageRoot, 'dist/core/search/bm25
 const [repoPath, ...args] = process.argv.slice(2);
 if (!repoPath) {
   throw new Error(
-    'usage: large-incremental-child.mjs <repo> [--force] [--embeddings] [--pause-at <boundary> --pause-ready <file>] [--fts-query <text>]',
+    'usage: large-incremental-child.mjs <repo> [--force] [--embeddings] [--drop-embeddings] [--pause-at <boundary> --pause-ready <file>] [--fts-query <text>]',
   );
 }
 
 const force = args.includes('--force');
 const embeddings = args.includes('--embeddings');
+const dropEmbeddings = args.includes('--drop-embeddings');
 const pauseAtIndex = args.indexOf('--pause-at');
 const pauseAt = pauseAtIndex >= 0 ? args[pauseAtIndex + 1] : undefined;
 const pauseReadyIndex = args.indexOf('--pause-ready');
@@ -65,6 +66,7 @@ try {
       skipSkills: true,
       force,
       embeddings,
+      dropEmbeddings,
       embeddingsNodeLimit: embeddings ? 0 : undefined,
     },
     { onProgress: () => {}, onLog, onRecoveryBoundary },
