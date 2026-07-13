@@ -301,6 +301,15 @@ export async function cypherCommand(
     }
   }
   output(result);
+  if (
+    result &&
+    typeof result === 'object' &&
+    'error' in result &&
+    typeof result.error === 'string' &&
+    result.error.trim().length > 0
+  ) {
+    process.exitCode = 1;
+  }
 }
 
 export async function detectChangesCommand(options?: {
