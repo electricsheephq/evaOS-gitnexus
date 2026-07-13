@@ -7,6 +7,8 @@ import http from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { createSanitizedEnvironment } from './canary-environment.mjs';
+
 const REQUIRED_ARGS = [
   'source',
   'source-sha',
@@ -54,6 +56,7 @@ const home = path.join(evidence, 'home');
 const commandDir = path.join(evidence, 'commands');
 const snapshotDir = path.join(evidence, 'snapshots');
 const failurePath = path.join(evidence, 'failure.json');
+const baseEnv = createSanitizedEnvironment(process.env, { home });
 
 if (!Number.isInteger(dimensions) || dimensions <= 0) {
   throw new Error('--embedding-dims must be a positive integer');
@@ -129,7 +132,7 @@ const run = async (name, command, commandArgs, options = {}) => {
   process.stdout.write(`[${runId}] ${name}\n`);
   const child = spawn(command, commandArgs, {
     cwd: options.cwd ?? worktree,
-    env: options.env ?? process.env,
+    env: options.env ?? baseEnv,
     stdio: ['ignore', stdout, stderr],
   });
   const result = await new Promise((resolve, reject) => {
@@ -163,7 +166,7 @@ const runText = async (name, command, commandArgs, options = {}) => {
   const chunks = [];
   const child = spawn(command, commandArgs, {
     cwd: options.cwd ?? worktree,
-    env: options.env ?? process.env,
+    env: options.env ?? baseEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout.on('data', (chunk) => chunks.push(chunk));
@@ -229,9 +232,7 @@ const address = embeddingServer.address();
 if (!address || typeof address === 'string') throw new Error('embedding server has no TCP address');
 
 const canaryEnv = {
-  ...process.env,
-  HOME: home,
-  USERPROFILE: home,
+  ...baseEnv,
   GITNEXUS_HOME: path.join(home, '.gitnexus'),
   CI: '1',
   NODE_OPTIONS: '--max-old-space-size=6144',
@@ -652,7 +653,7 @@ try {
     } else {
       await run('clone', 'git', ['clone', '--shared', '--no-checkout', source, worktree], {
         cwd: path.dirname(worktree),
-        env: process.env,
+        env: baseEnv,
       });
       await run('checkout-source-sha', 'git', ['checkout', '--detach', sourceSha]);
       await run('set-public-origin', 'git', ['remote', 'set-url', 'origin', publicOrigin]);
