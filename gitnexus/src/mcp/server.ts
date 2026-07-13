@@ -27,6 +27,7 @@ import { GITNEXUS_TOOLS } from './tools.js';
 import { installGlobalStdoutSentinel } from './stdio-context.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
+import { applyMcpMaxTokens, resolveMcpMaxTokens, withoutMcpBudgetArg } from './output-budget.js';
 
 /**
  * Next-step hints appended to tool responses.
@@ -165,9 +166,12 @@ export function createMCPServer(backend: LocalBackend): Server {
   // Handle tool calls — append next-step hints to guide agent workflow
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    let maxTokens: number | undefined;
 
     try {
-      const result = await backend.callTool(name, args);
+      const typedArgs = args as Record<string, unknown> | undefined;
+      maxTokens = resolveMcpMaxTokens(name, typedArgs);
+      const result = await backend.callTool(name, withoutMcpBudgetArg(typedArgs));
       const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
       const hint = getNextStepHint(name, args as Record<string, any> | undefined);
 
@@ -175,7 +179,7 @@ export function createMCPServer(backend: LocalBackend): Server {
         content: [
           {
             type: 'text',
-            text: resultText + hint,
+            text: applyMcpMaxTokens(resultText + hint, maxTokens),
           },
         ],
       };
@@ -185,7 +189,7 @@ export function createMCPServer(backend: LocalBackend): Server {
         content: [
           {
             type: 'text',
-            text: `Error: ${message}`,
+            text: applyMcpMaxTokens(`Error: ${message}`, maxTokens),
           },
         ],
         isError: true,

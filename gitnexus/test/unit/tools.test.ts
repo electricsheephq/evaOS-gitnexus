@@ -185,6 +185,16 @@ describe('GITNEXUS_TOOLS', () => {
     expect(impactTool.description).toContain('truncatedBy');
   });
 
+  it.each(['query', 'context', 'impact'])(
+    '%s advertises an optional positive maxTokens budget',
+    (name) => {
+      const tool = GITNEXUS_TOOLS.find((definition) => definition.name === name)!;
+      const maxTokens = tool.inputSchema.properties.maxTokens;
+      expect(maxTokens).toMatchObject({ type: 'integer', minimum: 1 });
+      expect(tool.inputSchema.required).not.toContain('maxTokens');
+    },
+  );
+
   it('rename tool requires new_name', () => {
     const renameTool = GITNEXUS_TOOLS.find((t) => t.name === 'rename')!;
     expect(renameTool.inputSchema.required).toContain('new_name');

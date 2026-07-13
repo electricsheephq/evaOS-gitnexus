@@ -182,6 +182,12 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
           description: 'Include full symbol source code (default: false)',
           default: false,
         },
+        maxTokens: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Maximum estimated tokens in the complete formatted MCP response. Explicit request overrides GITNEXUS_MCP_DEFAULT_MAX_TOKENS.',
+        },
         repo: {
           type: 'string',
           description:
@@ -310,6 +316,12 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           type: 'boolean',
           description: 'Include full symbol source code (default: false)',
           default: false,
+        },
+        maxTokens: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Maximum estimated tokens in the complete formatted MCP response. Explicit request overrides GITNEXUS_MCP_DEFAULT_MAX_TOKENS.',
         },
         repo: {
           type: 'string',
@@ -575,6 +587,12 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           description:
             'When true, returns target, summary, risk, byDepthCounts, affected_processes, and affected_modules — omits byDepth. Single-repo only; ignored in group mode (@groupName). Use for hub symbols to get actionable signal without output explosion.',
           default: false,
+        },
+        maxTokens: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Maximum estimated tokens in the complete formatted MCP response. Explicit request overrides GITNEXUS_MCP_DEFAULT_MAX_TOKENS.',
         },
         timeoutMs: {
           type: 'number',
