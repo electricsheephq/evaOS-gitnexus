@@ -268,11 +268,19 @@ describe('CLI help surface', () => {
     expect(result.stdout).toContain('UNDERSTAND_QUICKLY_TOKEN');
   });
 
-  it('analyze help includes the FTS repair option', () => {
+  it('analyze help includes the FTS repair and preservation options', () => {
     const result = runHelp('analyze');
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('--repair-fts');
+    expect(result.stdout).toContain('--incremental-only');
+  });
+
+  it('doctor help includes the read-only recovery plan option', () => {
+    const result = runHelp('doctor');
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('--recovery-plan');
   });
 
   it('localizes commander-generated option metadata labels', () => {

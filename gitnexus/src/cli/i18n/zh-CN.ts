@@ -164,6 +164,7 @@ export const zhCN = {
   'help.command.group.contracts.description': '查看 Contract Registry',
   'help.option.setup.codingAgent': '仅配置这些编码代理（逗号分隔或重复传入）',
   'help.option.analyze.force': '即使已是最新也强制完整重建索引',
+  'help.option.analyze.incrementalOnly': '拒绝任何需要完整重建的恢复、迁移或规模升级路径',
   'help.option.analyze.repairFts': '修复/重建搜索 FTS 索引，不执行完整重新分析',
   'help.option.analyze.embeddings':
     '启用语义搜索的嵌入生成（默认关闭）。可选 [limit] 覆盖 50,000 节点安全上限；传 0 可完全禁用上限。',
@@ -193,6 +194,7 @@ export const zhCN = {
   'help.option.analyze.embeddingBatchSize': '每个嵌入批次的节点数',
   'help.option.analyze.embeddingSubBatchSize': '每次嵌入模型调用的分块数',
   'help.option.analyze.embeddingDevice': '嵌入设备：auto、cpu、dml、cuda 或 wasm',
+  'help.option.doctor.recoveryPlan': '打印只读的中断分析恢复计划并退出',
   'help.option.index.force': '即使缺少索引元数据也注册（统计为空）',
   'help.option.index.allowNonGit': '允许注册非 Git 仓库文件夹',
   'help.option.port': '端口号',

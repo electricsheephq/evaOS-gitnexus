@@ -54,6 +54,10 @@ program
   .command('analyze [path]')
   .description('Index a repository (full analysis)')
   .option('-f, --force', 'Force full re-index even if up to date')
+  .option(
+    '--incremental-only',
+    'Refuse recovery, migration, or scale escalation that would require a full rebuild',
+  )
   .option('--repair-fts', 'Repair/rebuild search FTS indexes without full re-analysis')
   .option(
     '--embeddings [limit]',
@@ -236,8 +240,9 @@ program
   .action(createLazyAction(() => import('./status.js'), 'statusCommand'));
 
 program
-  .command('doctor')
+  .command('doctor [path]')
   .description('Show runtime platform capabilities and embedding configuration')
+  .option('--recovery-plan', 'Print a read-only interrupted-analysis recovery plan and exit')
   .action(createLazyAction(() => import('./doctor.js'), 'doctorCommand'));
 
 program

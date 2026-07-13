@@ -178,6 +178,8 @@ export interface RepoMeta {
     /** Number of files in the writable set, for diagnostic logs.
      *  `0` on the full-rebuild path (no incremental write set exists). */
     toWriteCount: number;
+    /** Git commit the interrupted run attempted to index. */
+    targetCommit?: string;
     /** Last completed writeback phase before the process stopped. */
     phase?: string;
     /** Directly changed/added files before importer expansion. */

@@ -53,6 +53,18 @@ describe('flushWAL / safeClose — consolidation guard (#1376)', () => {
     expect(safeCloseBody).toMatch(/await flushWAL\(\)/);
   });
 
+  it('safeClose never issues CHECKPOINT on a read-only connection', () => {
+    const safeCloseBody = adapterSource.slice(adapterSource.indexOf('export const safeClose'));
+    expect(safeCloseBody).toMatch(/if \(!closingReadOnly\) \{\s*await flushWAL\(\)/);
+  });
+
+  it('safeClose never finalizes sidecars after a read-only connection', () => {
+    const safeCloseBody = adapterSource.slice(adapterSource.indexOf('export const safeClose'));
+    expect(safeCloseBody).toMatch(
+      /if \(closingDbPath && !closingReadOnly\) \{\s*await finalizeLbugSidecarsAfterClose/,
+    );
+  });
+
   it('closeLbug delegates to safeClose instead of inlining conn.close/db.close', () => {
     // Match `closeLbug =` precisely so we don't prefix-match `closeLbugBeforeExit`.
     const closeLbugBody = adapterSource.slice(adapterSource.indexOf('export const closeLbug ='));

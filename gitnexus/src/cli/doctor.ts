@@ -1,4 +1,6 @@
+import path from 'node:path';
 import { getRuntimeCapabilities, getRuntimeFingerprint } from '../core/platform/capabilities.js';
+import { buildRecoveryPlan, formatRecoveryPlan } from '../core/incremental/recovery-plan.js';
 import { resolveEmbeddingConfig } from '../core/embeddings/config.js';
 import { isHttpMode } from '../core/embeddings/http-client.js';
 import {
@@ -16,6 +18,7 @@ import { checkLbugNative, probeFtsExtensionLoad } from '../core/lbug/native-chec
 import { getOsPageSize, isPageSizeAwareLadybug } from '../core/lbug/lbug-config.js';
 import { diagnoseExtensionLoad } from '../core/lbug/extension-load-error.js';
 import { getExtensionInstallPolicy } from '../core/lbug/extension-loader.js';
+import { getGitRoot } from '../storage/git.js';
 import { t } from './i18n/index.js';
 
 function isCombiningMark(codePoint: number): boolean {
@@ -146,7 +149,18 @@ export function pageSizeDoctorLines(
   return lines;
 }
 
-export const doctorCommand = async () => {
+export const doctorCommand = async (
+  inputPath?: string,
+  options: { recoveryPlan?: boolean } = {},
+) => {
+  if (options.recoveryPlan) {
+    const repoPath = inputPath
+      ? path.resolve(inputPath)
+      : (getGitRoot(process.cwd()) ?? process.cwd());
+    console.log(formatRecoveryPlan(await buildRecoveryPlan(repoPath)));
+    return;
+  }
+
   const fingerprint = getRuntimeFingerprint();
   const capabilities = getRuntimeCapabilities();
   const embeddingConfig = resolveEmbeddingConfig();

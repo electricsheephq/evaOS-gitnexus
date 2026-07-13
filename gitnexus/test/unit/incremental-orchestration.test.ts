@@ -21,7 +21,7 @@
  */
 
 import { execSync } from 'child_process';
-import { writeFile, readFile, rm } from 'fs/promises';
+import { writeFile, readFile, readdir, rm } from 'fs/promises';
 import path from 'path';
 import { afterEach, beforeAll, beforeEach, describe, it, expect, vi } from 'vitest';
 import {
@@ -250,6 +250,40 @@ describe('runFullAnalysis — incremental orchestration', () => {
     }
   }, 600_000);
 
+  it('incremental-only completes a bounded surgical update and clears its dirty marker', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(repo.dbPath, { skipAgentsMd: true }, { onProgress: () => {} });
+      const { storagePath } = getStoragePaths(repo.dbPath);
+      const before = await loadMeta(storagePath);
+
+      const target = path.join(repo.dbPath, 'src', 'logger.ts');
+      await writeFile(
+        target,
+        (await readFile(target, 'utf-8')) + '\n// bounded incremental-only update\n',
+        'utf-8',
+      );
+
+      const result = await runFullAnalysis(
+        repo.dbPath,
+        { skipAgentsMd: true, incrementalOnly: true },
+        { onProgress: () => {} },
+      );
+      const after = await loadMeta(storagePath);
+
+      expect(result.alreadyUpToDate).toBeUndefined();
+      expect(after?.incrementalInProgress).toBeUndefined();
+      expect(after?.fileHashes?.['src/logger.ts']).not.toBe(before?.fileHashes?.['src/logger.ts']);
+      expect(after?.stats).toEqual(before?.stats);
+      expect(
+        (await readdir(storagePath)).filter((name) => name.includes('.missing-shadow.')),
+      ).toEqual([]);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
   // #2409: a large-fraction effective write set must escalate to the full DB
   // write plan (wipe + bulk COPY of the already-built graph) instead of the
   // surgical per-file writeback — at that size the surgical plan measured
@@ -316,6 +350,49 @@ describe('runFullAnalysis — incremental orchestration', () => {
       expect(escalatedMeta!.stats?.edges).toBe(forcedMeta!.stats?.edges);
       expect(escalatedMeta!.stats?.communities).toBe(forcedMeta!.stats?.communities);
       expect(escalatedMeta!.stats?.processes).toBe(forcedMeta!.stats?.processes);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 600_000);
+
+  it('incremental-only refuses a large-write escalation before graph or metadata mutation', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      const src = path.join(repo.dbPath, 'src');
+      await writeFile(
+        path.join(src, 'hub.ts'),
+        'export function hubValue(x: number): number {\n  return x + 1;\n}\n',
+        'utf-8',
+      );
+      for (let i = 0; i < 60; i++) {
+        await writeFile(
+          path.join(src, `spoke-${String(i).padStart(3, '0')}.ts`),
+          `import { hubValue } from './hub';\nexport function spoke${i}(): number { return hubValue(${i}); }\n`,
+          'utf-8',
+        );
+      }
+      gitCommitAll(repo.dbPath, 'add incremental-only escalation fixture');
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(repo.dbPath, { skipAgentsMd: true }, { onProgress: () => {} });
+      const { metaPath, lbugPath } = getStoragePaths(repo.dbPath);
+      const metadataBefore = await readFile(metaPath);
+      const graphBefore = await readFile(lbugPath);
+
+      const hub = path.join(src, 'hub.ts');
+      await writeFile(hub, (await readFile(hub, 'utf-8')) + '// refuse escalation\n', 'utf-8');
+
+      await expect(
+        runFullAnalysis(
+          repo.dbPath,
+          { skipAgentsMd: true, incrementalOnly: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/incremental-only safety stop.*escalation threshold/i);
+
+      expect(await readFile(metaPath)).toEqual(metadataBefore);
+      expect(await readFile(lbugPath)).toEqual(graphBefore);
+      expect((await loadMeta(path.dirname(metaPath)))?.incrementalInProgress).toBeUndefined();
     } finally {
       await repo.cleanup();
     }
@@ -461,6 +538,73 @@ describe('runFullAnalysis — incremental orchestration', () => {
       expect(logs.join('\n')).toContain(
         'last dirty state: phase=load-graph, toWrite=3, importerExpansion=153, effectiveWrite=167, deleteCount=169',
       );
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
+  it('incremental-only refuses dirty recovery before metadata or sidecar mutation', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(repo.dbPath, { skipAgentsMd: true }, { onProgress: () => {} });
+
+      const { storagePath, metaPath, lbugPath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      await saveMeta(storagePath, {
+        ...meta!,
+        incrementalInProgress: {
+          startedAt: Date.now() - 60_000,
+          updatedAt: Date.now() - 30_000,
+          toWriteCount: 12,
+          phase: 'delete-nodes',
+          effectiveWriteCount: 17,
+          deleteCount: 19,
+        },
+      });
+      const sidecarPath = `${lbugPath}.wal`;
+      await writeFile(sidecarPath, 'preserve-this-sidecar', 'utf8');
+      const metadataBefore = await readFile(metaPath, 'utf8');
+      const sidecarBefore = await readFile(sidecarPath, 'utf8');
+
+      await expect(
+        runFullAnalysis(
+          repo.dbPath,
+          { skipAgentsMd: true, incrementalOnly: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/incremental-only safety stop.*doctor --recovery-plan/i);
+
+      expect(await readFile(metaPath, 'utf8')).toBe(metadataBefore);
+      expect(await readFile(sidecarPath, 'utf8')).toBe(sidecarBefore);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
+  it('incremental-only refuses a clean index with sidecars before read-only open', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(repo.dbPath, { skipAgentsMd: true }, { onProgress: () => {} });
+
+      const { metaPath, lbugPath } = getStoragePaths(repo.dbPath);
+      const sidecarPath = `${lbugPath}.wal`;
+      await writeFile(sidecarPath, 'preserve-clean-index-sidecar', 'utf8');
+      const metadataBefore = await readFile(metaPath, 'utf8');
+      const sidecarBefore = await readFile(sidecarPath, 'utf8');
+
+      await expect(
+        runFullAnalysis(
+          repo.dbPath,
+          { skipAgentsMd: true, incrementalOnly: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/incremental-only safety stop.*sidecar/i);
+
+      expect(await readFile(metaPath, 'utf8')).toBe(metadataBefore);
+      expect(await readFile(sidecarPath, 'utf8')).toBe(sidecarBefore);
     } finally {
       await repo.cleanup();
     }

@@ -172,6 +172,8 @@ export const en = {
   'help.option.setup.codingAgent':
     'Configure only these coding agents (comma-separated or repeatable)',
   'help.option.analyze.force': 'Force full re-index even if up to date',
+  'help.option.analyze.incrementalOnly':
+    'Refuse recovery, migration, or scale escalation that would require a full rebuild',
   'help.option.analyze.repairFts': 'Repair/rebuild search FTS indexes without full re-analysis',
   'help.option.analyze.embeddings':
     'Enable embedding generation for semantic search (off by default). Optional [limit] overrides the 50,000-node safety cap; pass 0 to disable the cap entirely.',
@@ -205,6 +207,8 @@ export const en = {
   'help.option.analyze.embeddingBatchSize': 'Number of nodes per embedding batch',
   'help.option.analyze.embeddingSubBatchSize': 'Number of chunks per embedding model call',
   'help.option.analyze.embeddingDevice': 'Embedding device: auto, cpu, dml, cuda, or wasm',
+  'help.option.doctor.recoveryPlan':
+    'Print a read-only interrupted-analysis recovery plan and exit',
   'help.option.index.force': 'Register even if index metadata is missing (stats will be empty)',
   'help.option.index.allowNonGit': 'Allow registering folders that are not Git repositories',
   'help.option.port': 'Port number',

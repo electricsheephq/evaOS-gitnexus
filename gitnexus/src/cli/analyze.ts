@@ -609,6 +609,8 @@ const restoreAnalyzeEnv = (snap: AnalyzeEnvSnapshot): void => {
 
 export interface AnalyzeOptions {
   force?: boolean;
+  /** Refuse any analyze path that would require a full DB rebuild. */
+  incrementalOnly?: boolean;
   repairFts?: boolean;
   /**
    * Embedding generation toggle. Commander parses `--embeddings [limit]` as:
@@ -1172,6 +1174,15 @@ const analyzeCommandImpl = async (
     return;
   }
 
+  if (options.incrementalOnly && (options.force || options.repairFts || options.skills)) {
+    cliError(
+      '  Cannot combine `--incremental-only` with `--force`, `--repair-fts`, or `--skills`. ' +
+        'The preservation contract refuses every option that can require a full rebuild.\n',
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   // `--index-only` is the stronger contract — it suppresses every form of file
   // injection, including community skill writes that `--skills` would normally
   // produce. Surface the override explicitly so users don't wonder why a
@@ -1330,6 +1341,7 @@ const analyzeCommandImpl = async (
         // needs a fresh pipelineResult. Has no bearing on the registry
         // collision guard (see allowDuplicateName below).
         force: options.force || options.skills,
+        incrementalOnly: options.incrementalOnly,
         repairFts: options.repairFts,
         embeddings: embeddingsEnabled,
         embeddingsNodeLimit,

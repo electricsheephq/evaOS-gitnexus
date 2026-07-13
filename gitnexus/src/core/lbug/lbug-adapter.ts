@@ -1909,7 +1909,13 @@ export const tryFlushWAL = async (): Promise<boolean> => {
  * @see closeLbug — safeClose + module state reset (full teardown)
  */
 export const safeClose = async (): Promise<void> => {
-  await flushWAL();
+  const closingReadOnly = currentDbReadOnly;
+  // CHECKPOINT is a write command. Issuing it on a read-only connection can
+  // leave LadybugDB with a WAL-without-shadow condition that the next writable
+  // open quarantines. Read-only callers have no pending writes to flush.
+  if (!closingReadOnly) {
+    await flushWAL();
+  }
   // Capture before close — currentDbPath stays set so the Windows post-close
   // probe below knows which file to wait on.
   const closingDbPath = currentDbPath;
@@ -1949,7 +1955,7 @@ export const safeClose = async (): Promise<void> => {
       );
     }
   }
-  if (closingDbPath) {
+  if (closingDbPath && !closingReadOnly) {
     await finalizeLbugSidecarsAfterClose(closingDbPath, { logger });
   }
 };

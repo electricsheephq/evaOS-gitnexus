@@ -20,6 +20,7 @@ import {
   getLbugStats,
   executeQuery,
   executeWithReusedStatement,
+  withLbugDb,
   closeLbug,
   closeLbugBeforeExit,
   loadCachedEmbeddings,
@@ -135,6 +136,12 @@ export interface AnalyzeOptions {
    * bypass. See `allowDuplicateName` below.
    */
   force?: boolean;
+  /**
+   * Refuse every path that would require a full DB rebuild. The preflight is
+   * intentionally stricter than normal analyze: it runs before migration
+   * cleanup, metadata reconciliation, sidecar recovery, or any DB open.
+   */
+  incrementalOnly?: boolean;
   /** Repair only search indexes without re-running full parsing/indexing. */
   repairFts?: boolean;
   /** Emit per-index FTS create logs. */
@@ -580,16 +587,18 @@ export async function runFullAnalysis(
   // worker-side reset is needed (see safe-parse.ts ParseTimeoutError contract).
   resetDegradedParseCounter();
 
+  const incrementalOnlyStop = (reason: string): never => {
+    throw new Error(
+      `Incremental-only safety stop: ${reason}. ` +
+        'No recovery or full-rebuild mutation was started. ' +
+        'Run `gitnexus doctor --recovery-plan` to inspect the existing index.',
+    );
+  };
+
   // `storagePath` is ALWAYS the flat `.gitnexus` — content-addressed caches
   // (parse-cache, parsedfile-store) and the kuzu-migration cleanup live there
   // and are shared across branches (#2106 KTD7).
   const { storagePath } = getStoragePaths(repoPath);
-
-  // Clean up stale KuzuDB files from before the LadybugDB migration.
-  const kuzuResult = await cleanupOldKuzuFiles(storagePath);
-  if (kuzuResult.found && kuzuResult.needsReindex) {
-    log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
-  }
 
   const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
@@ -629,19 +638,89 @@ export async function runFullAnalysis(
   // metaDir is the directory containing the metadata file (and branch-specific DBs).
   const metaDir = path.dirname(metaPath);
 
-  // Keep gitnexus.json and the legacy meta.json mirror in sync (fresher
-  // indexedAt wins; nothing is deleted). Best-effort: loadMeta has its own
-  // legacy fallback, so a reconciliation failure (read-only mount, full disk)
-  // must never abort the analyze run — a repo that indexed fine read-only
-  // before the rename must keep doing so.
-  try {
-    await reconcileMetadataFiles(repoPath);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException)?.code;
-    log(`Metadata reconciliation failed (non-critical${code ? `, ${code}` : ''}); continuing.`);
+  if (options.incrementalOnly && (options.force || options.repairFts)) {
+    incrementalOnlyStop('it cannot be combined with --force or --repair-fts');
   }
 
-  const existingMeta = await loadMeta(metaDir);
+  // Preservation preflight: load only. Do not reconcile metadata, clean old
+  // stores, inspect via LadybugDB, or touch sidecars until every invariant
+  // needed for a surgical incremental write is established.
+  let existingMeta = await loadMeta(metaDir);
+  if (options.incrementalOnly) {
+    if (!existingMeta) {
+      incrementalOnlyStop('no existing index metadata is available');
+    }
+    if (!repoHasGit) {
+      incrementalOnlyStop('the repository has no Git history for incremental comparison');
+    }
+    if (existingMeta.incrementalInProgress) {
+      incrementalOnlyStop('the existing index has an interrupted-analysis dirty marker');
+    }
+    if (pdgModeMismatch(existingMeta.pdg, options)) {
+      incrementalOnlyStop('the requested PDG mode differs from the indexed mode');
+    }
+    if (existingMeta.schemaVersion !== INCREMENTAL_SCHEMA_VERSION) {
+      incrementalOnlyStop(
+        `the index schema is ${existingMeta.schemaVersion ?? 'pre-versioning'}, not ${INCREMENTAL_SCHEMA_VERSION}`,
+      );
+    }
+    if (cjkSegmentationModeMismatch(existingMeta.cjkSegmentation, getSearchFTSCjkSegmentation())) {
+      incrementalOnlyStop('the requested CJK segmentation mode differs from the indexed mode');
+    }
+    if (!existingMeta.fileHashes || Object.keys(existingMeta.fileHashes).length === 0) {
+      incrementalOnlyStop('the existing metadata has no file-hash baseline');
+    }
+    if (!placement.branch && branchLabel && existingMeta.branch !== branchLabel) {
+      incrementalOnlyStop('the flat index branch label requires a metadata restamp');
+    }
+    try {
+      const graphStat = await fs.lstat(lbugPath);
+      if (!graphStat.isFile()) {
+        incrementalOnlyStop('the graph store is not a regular file');
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith('Incremental-only safety stop:')) {
+        throw err;
+      }
+      incrementalOnlyStop('the graph store is missing or inaccessible');
+    }
+    for (const sidecarPath of [
+      `${lbugPath}.wal`,
+      `${lbugPath}.shadow`,
+      `${lbugPath}.wal.checkpoint`,
+    ]) {
+      try {
+        await fs.lstat(sidecarPath);
+        incrementalOnlyStop('LadybugDB sidecar state requires recovery');
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith('Incremental-only safety stop:')) {
+          throw err;
+        }
+        if (!isMissingFilesystemError(err)) {
+          incrementalOnlyStop('LadybugDB sidecar state is inaccessible');
+        }
+      }
+    }
+  } else {
+    // Normal analyze retains its established self-healing behavior.
+    const kuzuResult = await cleanupOldKuzuFiles(storagePath);
+    if (kuzuResult.found && kuzuResult.needsReindex) {
+      log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
+    }
+
+    // Keep gitnexus.json and the legacy meta.json mirror in sync (fresher
+    // indexedAt wins; nothing is deleted). Best-effort: loadMeta has its own
+    // legacy fallback, so a reconciliation failure (read-only mount, full disk)
+    // must never abort the analyze run — a repo that indexed fine read-only
+    // before the rename must keep doing so.
+    try {
+      await reconcileMetadataFiles(repoPath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      log(`Metadata reconciliation failed (non-critical${code ? `, ${code}` : ''}); continuing.`);
+    }
+    existingMeta = await loadMeta(metaDir);
+  }
 
   // ── FTS-only repair path ────────────────────────────────────────────
   if (options.repairFts) {
@@ -765,6 +844,9 @@ export async function runFullAnalysis(
   // clear it, the on-disk index may be in a half-state. Cheapest path
   // back to a known-good index is to wipe + rebuild from scratch.
   if (existingMeta?.incrementalInProgress) {
+    if (options.incrementalOnly) {
+      incrementalOnlyStop('the existing index has an interrupted-analysis dirty marker');
+    }
     const dirty = existingMeta.incrementalInProgress;
     const dirtyDetails =
       typeof dirty === 'object'
@@ -848,6 +930,9 @@ export async function runFullAnalysis(
   // options.force: --skills implies force with no message of its own, and a
   // mode change deserves a diagnostic regardless of why a rebuild happens.
   if (existingMeta && pdgModeMismatch(existingMeta.pdg, options)) {
+    if (options.incrementalOnly) {
+      incrementalOnlyStop('the requested PDG mode differs from the indexed mode');
+    }
     const pdgOn = options.pdg === true;
     const capsOnly = !!existingMeta.pdg && pdgOn; // both-on can only mismatch via caps
     const was = existingMeta.pdg ? 'with --pdg' : 'without --pdg';
@@ -877,6 +962,9 @@ export async function runFullAnalysis(
   // force here is harmless; the friendlier `'pre-versioning'` log avoids a
   // user-visible "stamped vundefined" line in that edge case.
   if (existingMeta && existingMeta.schemaVersion !== INCREMENTAL_SCHEMA_VERSION) {
+    if (options.incrementalOnly) {
+      incrementalOnlyStop('the index schema requires a full rebuild');
+    }
     const stampedVersion = existingMeta.schemaVersion ?? 'pre-versioning';
     log(
       `index schema changed (stamped v${stampedVersion}, this build is v${INCREMENTAL_SCHEMA_VERSION}); ` +
@@ -889,6 +977,9 @@ export async function runFullAnalysis(
     existingMeta &&
     cjkSegmentationModeMismatch(existingMeta.cjkSegmentation, getSearchFTSCjkSegmentation())
   ) {
+    if (options.incrementalOnly) {
+      incrementalOnlyStop('the requested CJK segmentation mode differs from the indexed mode');
+    }
     log(
       `CJK segmentation mode changed (index built with '${existingMeta.cjkSegmentation ?? 'none'}', ` +
         `this run resolves '${getSearchFTSCjkSegmentation()}'); forcing a full rebuild so indexed ` +
@@ -966,6 +1057,9 @@ export async function runFullAnalysis(
         // Detached HEAD / non-git (branchLabel === null) keeps the existing
         // stamp, mirroring the end-of-run meta write.
         if (!placement.branch && branchLabel && existingMeta.branch !== branchLabel) {
+          if (options.incrementalOnly) {
+            incrementalOnlyStop('the flat index branch label requires a metadata restamp');
+          }
           // Adopt first, stamp last (#2364 review F3): this block's retry
           // guard is `existingMeta.branch !== branchLabel`, so stamping the
           // meta before the registry/shadow cleanup would flip the guard and
@@ -991,7 +1085,9 @@ export async function runFullAnalysis(
             );
           }
         }
-        await ensureGitNexusIgnored(repoPath);
+        if (!options.incrementalOnly) {
+          await ensureGitNexusIgnored(repoPath);
+        }
         return {
           // `resolveRepoIdentityRoot` collapses worktree roots to the
           // canonical repo basename (#1259) but leaves arbitrary subdirs
@@ -1071,8 +1167,12 @@ export async function runFullAnalysis(
   if (shouldLoadCache && existingMeta) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
-      await initLbug(lbugPath);
-      const cached = await loadCachedEmbeddings();
+      const cached = options.incrementalOnly
+        ? await withLbugDb(lbugPath, loadCachedEmbeddings, { readOnly: true })
+        : await (async () => {
+            await initLbug(lbugPath);
+            return loadCachedEmbeddings();
+          })();
       cachedEmbeddingNodeIds = cached.embeddingNodeIds;
       cachedEmbeddings = cached.embeddings;
       await closeLbug();
@@ -1167,6 +1267,10 @@ export async function runFullAnalysis(
     repoHasGit &&
     allFilePaths.length > 0;
 
+  if (options.incrementalOnly && !isIncremental) {
+    incrementalOnlyStop('the analyzed repository is not eligible for a surgical incremental write');
+  }
+
   const hashDiff = isIncremental
     ? diffFileHashes(newFileHashes, existingMeta!.fileHashes)
     : undefined;
@@ -1182,17 +1286,20 @@ export async function runFullAnalysis(
     );
     // Set the dirty flag BEFORE any destructive DB mutation. Cleared on
     // success at the meta-save step. Scoped to this branch's meta.json.
-    const now = Date.now();
-    await saveMeta(metaDir, {
-      ...existingMeta!,
-      incrementalInProgress: {
-        startedAt: now,
-        updatedAt: now,
-        phase: 'pre-write',
-        toWriteCount: hashDiff.toWrite.length,
-        directWriteCount: hashDiff.toWrite.length,
-      },
-    });
+    if (!options.incrementalOnly) {
+      const now = Date.now();
+      await saveMeta(metaDir, {
+        ...existingMeta!,
+        incrementalInProgress: {
+          startedAt: now,
+          updatedAt: now,
+          targetCommit: currentCommit,
+          phase: 'pre-write',
+          toWriteCount: hashDiff.toWrite.length,
+          directWriteCount: hashDiff.toWrite.length,
+        },
+      });
+    }
   } else {
     // Full rebuild path: wipe DB files first.
     // Set the dirty flag BEFORE the wipe whenever a prior meta exists,
@@ -1209,6 +1316,7 @@ export async function runFullAnalysis(
         incrementalInProgress: {
           startedAt: now,
           updatedAt: now,
+          targetCommit: currentCommit,
           phase: 'full-rebuild',
           toWriteCount: 0,
         },
@@ -1225,7 +1333,11 @@ export async function runFullAnalysis(
     await wipeLbugDbFiles(lbugPath);
   }
 
-  await initLbug(lbugPath);
+  if (options.incrementalOnly) {
+    await withLbugDb(lbugPath, async () => undefined, { readOnly: true });
+  } else {
+    await initLbug(lbugPath);
+  }
 
   // Manual WAL checkpoint driver (#1741): periodically drain the WAL
   // from JS so the un-retriable native auto-checkpoint almost never
@@ -1237,7 +1349,9 @@ export async function runFullAnalysis(
   // paths continue to rely on the close-time CHECKPOINT in `safeClose`.
   // `let`: the incremental branch's escalation valve (#2409) stops this driver
   // around its close→wipe→reopen strategy switch and starts a fresh one.
-  let walCheckpointDriver: WalCheckpointDriver = startWalCheckpointDriver();
+  let walCheckpointDriver: WalCheckpointDriver = options.incrementalOnly
+    ? { stop: async () => undefined }
+    : startWalCheckpointDriver();
   try {
     // All work after initLbug is wrapped in try/finally to ensure closeLbug()
     // is called even if an error occurs — the module-level singleton DB handle
@@ -1295,6 +1409,7 @@ export async function runFullAnalysis(
       const writableFiles = new Set<string>(hashDiff.toWrite);
       const directlyChangedCount = writableFiles.size;
       const dirtyStartedAt = existingMeta!.incrementalInProgress?.startedAt ?? Date.now();
+      let incrementalMutationAuthorized = !options.incrementalOnly;
       // Dropped-chunk observability (tri-review 4669518496 P2-5): counts
       // importer-BFS chunks whose IMPORTS query failed across ALL depths
       // (degrade-don't-fail — the expansion shrinks instead of the run
@@ -1311,11 +1426,13 @@ export async function runFullAnalysis(
         phase: string,
         extra: Partial<NonNullable<RepoMeta['incrementalInProgress']>> = {},
       ): Promise<void> => {
+        if (!incrementalMutationAuthorized) return;
         await saveMeta(metaDir, {
           ...existingMeta!,
           incrementalInProgress: {
             startedAt: dirtyStartedAt,
             updatedAt: Date.now(),
+            targetCommit: currentCommit,
             phase,
             toWriteCount: writableFiles.size,
             directWriteCount: directlyChangedCount,
@@ -1427,6 +1544,12 @@ export async function runFullAnalysis(
           allFilePaths.length,
         )
       ) {
+        if (options.incrementalOnly) {
+          incrementalOnlyStop(
+            `the effective write set (${effectiveWriteSet.size}/${allFilePaths.length} files, ` +
+              `${filesToDelete.length} deletions) crossed the full-rebuild escalation threshold`,
+          );
+        }
         escalatedFullWrite = true;
         log(
           `Incremental: effective write set covers ${effectiveWriteSet.size}/${allFilePaths.length} ` +
@@ -1465,6 +1588,25 @@ export async function runFullAnalysis(
           progress('lbug', pct, msg);
         });
       } else {
+        // The surgical plan is now final. Only at this point may
+        // --incremental-only write its crash marker, immediately before the
+        // first destructive DB operation.
+        if (options.incrementalOnly) {
+          incrementalMutationAuthorized = true;
+          await saveIncrementalDirtyState('effective-write-set', {
+            importerExpansion,
+            shadowSeedCount: shadowSeed.length,
+            effectiveWriteCount: effectiveWriteSet.size,
+            deleteCount: filesToDelete.length,
+          });
+          // Importer closure was inspected through a read-only connection so a
+          // refusal cannot rewrite graph bytes. Upgrade only after the crash
+          // marker is durable and the surgical plan is final.
+          await walCheckpointDriver.stop();
+          await closeLbug();
+          await initLbug(lbugPath);
+          walCheckpointDriver = startWalCheckpointDriver();
+        }
         // 1a. Remove the write set's existing rows — batched (#2409): one
         //     DETACH DELETE per table per 200-file chunk. The former per-file
         //     loop issued a count + delete per table per FILE — ~13k

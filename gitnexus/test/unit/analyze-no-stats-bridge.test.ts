@@ -128,6 +128,15 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     expect(opts.repairFts).toBe(true);
   });
 
+  it('passes --incremental-only through to runFullAnalysis', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { incrementalOnly: true });
+
+    const opts = runFullAnalysisMock.mock.calls[0][1];
+    expect(opts.incrementalOnly).toBe(true);
+  });
+
   it('rejects combining --repair-fts with --force', async () => {
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
@@ -136,6 +145,22 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     expect(process.exitCode).toBe(1);
     expect(cliErrorMock).toHaveBeenCalledWith(
       expect.stringMatching(/cannot combine `--repair-fts` with `--force`/i),
+    );
+    expect(runFullAnalysisMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['--force', { force: true }],
+    ['--repair-fts', { repairFts: true }],
+    ['--skills', { skills: true }],
+  ])('rejects combining --incremental-only with %s', async (_label, conflicting) => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { incrementalOnly: true, ...conflicting });
+
+    expect(process.exitCode).toBe(1);
+    expect(cliErrorMock).toHaveBeenCalledWith(
+      expect.stringMatching(/cannot combine `--incremental-only`/i),
     );
     expect(runFullAnalysisMock).not.toHaveBeenCalled();
   });
