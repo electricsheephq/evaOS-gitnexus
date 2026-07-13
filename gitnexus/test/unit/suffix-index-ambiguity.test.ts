@@ -178,11 +178,15 @@ describe('resolvePythonImport — namespace packages (no __init__.py)', () => {
 
 describe('buildSuffixIndex determinism', () => {
   it('selects the same ambiguous suffix target regardless of input order', () => {
-    const first = makeCtx(['packages/zeta/user.ts', 'packages/alpha/user.ts']);
-    const reversed = makeCtx(['packages/alpha/user.ts', 'packages/zeta/user.ts']);
+    const firstInput = ['packages/zeta/user.ts', 'packages/alpha/user.ts'];
+    const reversedInput = [...firstInput].reverse();
+    const first = makeCtx(firstInput);
+    const reversed = makeCtx(reversedInput);
 
     expect(first.index.get('user.ts')).toBe('packages/alpha/user.ts');
     expect(reversed.index.get('user.ts')).toBe('packages/alpha/user.ts');
+    expect(first.files).toEqual(firstInput);
+    expect(reversed.files).toEqual(reversedInput);
   });
 });
 

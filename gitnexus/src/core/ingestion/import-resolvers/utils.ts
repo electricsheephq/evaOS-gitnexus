@@ -114,7 +114,7 @@ export function buildSuffixIndex(normalizedFileList: string[], allFileList: stri
     // Index all suffixes: "a/b/c.java" -> ["c.java", "b/c.java", "a/b/c.java"]
     for (let j = parts.length - 1; j >= 0; j--) {
       const suffix = parts.slice(j).join('/');
-      // Only store first match (longest path wins for ambiguous suffixes)
+      // Only store the canonical first match for ambiguous suffixes.
       if (!exactMap.has(suffix)) {
         exactMap.set(suffix, original);
       }
