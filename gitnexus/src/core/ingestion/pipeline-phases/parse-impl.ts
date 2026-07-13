@@ -33,6 +33,7 @@ import {
   persistParsedFileChunk,
   getDurableParsedFileDir,
   loadDurableParsedFileIndex,
+  prepareDurableParsedFileChunk,
   restoreDurableParsedFileShard,
 } from '../../../storage/parsedfile-store.js';
 import type { ParseWorkerResult } from '../workers/parse-worker.js';
@@ -984,6 +985,9 @@ export async function runChunkedParseAndResolve(
         // Cache miss: dispatch to workers, capture the raw results, store
         // them under the chunk hash for the next run.
         chunkCacheMisses++;
+        if (durableParsedFileDir !== undefined && chunkHash !== null) {
+          await prepareDurableParsedFileChunk(durableParsedFileDir, chunkHash);
+        }
         const progressForChunk = (current: number, _total: number, filePath: string) => {
           const globalCurrent = filesParsedSoFar + current;
           // Parse phase covers 20-70 (M2). Deferred extraction handles 70-95.
