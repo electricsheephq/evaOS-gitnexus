@@ -13,7 +13,8 @@
  * close. Zero vectors need no VECTOR extension: the CodeEmbedding TABLE is
  * plain schema; only the HNSW index is extension-gated.
  */
-import { expect } from 'vitest';
+import { createHash } from 'node:crypto';
+
 import {
   getStoragePaths,
   loadMeta,
@@ -105,11 +106,57 @@ export async function readEmbeddingNodeIds(repoPath: string): Promise<string[]> 
   }
 }
 
+export interface EmbeddingRowFingerprint {
+  nodeId: string;
+  chunkIndex: number;
+  startLine: number;
+  endLine: number;
+  contentHash: string;
+  dimensions: number;
+  vectorSha256: string;
+}
+
+/** Read a compact, deterministic fingerprint of every persisted embedding row. */
+export async function readEmbeddingRowFingerprints(
+  repoPath: string,
+): Promise<EmbeddingRowFingerprint[]> {
+  const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+  const { lbugPath } = getStoragePaths(repoPath);
+  await adapter.initLbug(lbugPath);
+  try {
+    const rows = (await adapter.executeQuery(
+      `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, e.contentHash AS contentHash, e.embedding AS embedding`,
+    )) as Array<Record<string, unknown>>;
+    return rows
+      .map((row) => {
+        const rawVector = row.embedding ?? row[5];
+        const vector = Array.isArray(rawVector)
+          ? rawVector.map(Number)
+          : Array.from(rawVector as Iterable<unknown>).map(Number);
+        return {
+          nodeId: String(row.nodeId ?? row[0] ?? ''),
+          chunkIndex: Number(row.chunkIndex ?? row[1] ?? 0),
+          startLine: Number(row.startLine ?? row[2] ?? 0),
+          endLine: Number(row.endLine ?? row[3] ?? 0),
+          contentHash: String(row.contentHash ?? row[4] ?? ''),
+          dimensions: vector.length,
+          vectorSha256: createHash('sha256').update(JSON.stringify(vector)).digest('hex'),
+        };
+      })
+      .sort(
+        (left, right) =>
+          left.nodeId.localeCompare(right.nodeId) || left.chunkIndex - right.chunkIndex,
+      );
+  } finally {
+    await adapter.closeLbug();
+  }
+}
+
 /** Tamper meta.stats.embeddings so deriveEmbeddingMode sees an embedded repo
  *  (loadMeta → spread → saveMeta, same pattern as the dirty-flag tests). */
 export async function stampEmbeddingCount(storagePath: string, embeddings: number): Promise<void> {
   const meta = await loadMeta(storagePath);
-  expect(meta).not.toBeNull();
-  const tampered: RepoMeta = { ...meta!, stats: { ...meta!.stats, embeddings } };
+  if (!meta) throw new Error(`missing repository metadata at ${storagePath}`);
+  const tampered: RepoMeta = { ...meta, stats: { ...meta.stats, embeddings } };
   await saveMeta(storagePath, tampered);
 }
