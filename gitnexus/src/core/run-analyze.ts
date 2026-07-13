@@ -856,6 +856,7 @@ export async function runFullAnalysis(
   }
 
   let resumeEmbeddingCheckpoint = false;
+  let pendingEmbeddingNodeIds = new Set<string>();
   let embeddingIdentityForRun: EmbeddingIdentity | undefined;
   if (existingMeta?.embeddingCheckpoint) {
     if (options.dropEmbeddings) {
@@ -876,9 +877,11 @@ export async function runFullAnalysis(
         );
       }
       resumeEmbeddingCheckpoint = true;
+      pendingEmbeddingNodeIds = new Set(checkpoint.pendingNodeIds ?? []);
       log(
         `Previous analyze ended at an embedding checkpoint ` +
-          `(${checkpoint.nodesProcessed}/${checkpoint.totalNodes} nodes); resuming from persisted hashes.`,
+          `(${checkpoint.nodesProcessed}/${checkpoint.totalNodes} nodes); resuming from persisted hashes` +
+          `${pendingEmbeddingNodeIds.size > 0 ? ` and regenerating ${pendingEmbeddingNodeIds.size} pending node(s)` : ''}.`,
       );
     }
   }
@@ -2005,6 +2008,48 @@ export async function runFullAnalysis(
         }
       }
 
+      const saveEmbeddingCheckpoint = async (
+        checkpoint: {
+          nodesProcessed: number;
+          totalNodes: number;
+          chunksProcessed: number;
+        },
+        pendingNodeIds: string[],
+        embeddings: number | undefined,
+      ): Promise<void> => {
+        const fileHashes: Record<string, string> = {};
+        for (const [key, value] of newFileHashes) fileHashes[key] = value;
+        await saveMeta(metaDir, {
+          ...(existingMeta ?? {}),
+          repoPath,
+          lastCommit: currentCommit,
+          indexedAt: new Date().toISOString(),
+          branch: branchLabel ?? existingMeta?.branch,
+          remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+          stats: {
+            files: pipelineResult.totalFileCount,
+            nodes: stats.nodes,
+            edges: stats.edges,
+            communities: pipelineResult.communityResult?.stats.totalCommunities,
+            processes: pipelineResult.processResult?.stats.totalProcesses,
+            embeddings,
+          },
+          schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
+          cjkSegmentation: getSearchFTSCjkSegmentation(),
+          fileHashes: hasGitDir(repoPath) ? fileHashes : undefined,
+          cacheKeys: [...parseCache.usedKeys],
+          incrementalInProgress: undefined,
+          embeddingCheckpoint: {
+            at: new Date().toISOString(),
+            ...checkpoint,
+            model: embeddingIdentity.model,
+            dimensions: embeddingIdentity.dimensions,
+            pendingNodeIds,
+          },
+          pdg: resolvePdgConfig(options),
+        });
+      };
+
       const embeddingResult = await runEmbeddingPipeline(
         executeQuery,
         executeWithReusedStatement,
@@ -2022,6 +2067,10 @@ export async function runFullAnalysis(
         cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
         existingEmbeddings,
         {
+          forceReembedNodeIds: pendingEmbeddingNodeIds,
+          onCheckpointWindowStart: async ({ nodeIds, ...checkpoint }) => {
+            await saveEmbeddingCheckpoint(checkpoint, nodeIds, existingMeta?.stats?.embeddings);
+          },
           onCheckpoint: async (checkpoint) => {
             await checkpointOnce();
             const countResult = await executeQuery(
@@ -2029,36 +2078,7 @@ export async function runFullAnalysis(
             );
             const countRow = countResult?.[0];
             const embeddings = Number(countRow?.cnt ?? countRow?.[0] ?? 0);
-            const fileHashes: Record<string, string> = {};
-            for (const [key, value] of newFileHashes) fileHashes[key] = value;
-            await saveMeta(metaDir, {
-              ...(existingMeta ?? {}),
-              repoPath,
-              lastCommit: currentCommit,
-              indexedAt: new Date().toISOString(),
-              branch: branchLabel ?? existingMeta?.branch,
-              remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
-              stats: {
-                files: pipelineResult.totalFileCount,
-                nodes: stats.nodes,
-                edges: stats.edges,
-                communities: pipelineResult.communityResult?.stats.totalCommunities,
-                processes: pipelineResult.processResult?.stats.totalProcesses,
-                embeddings,
-              },
-              schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
-              cjkSegmentation: getSearchFTSCjkSegmentation(),
-              fileHashes: hasGitDir(repoPath) ? fileHashes : undefined,
-              cacheKeys: [...parseCache.usedKeys],
-              incrementalInProgress: undefined,
-              embeddingCheckpoint: {
-                at: new Date().toISOString(),
-                ...checkpoint,
-                model: embeddingIdentity.model,
-                dimensions: embeddingIdentity.dimensions,
-              },
-              pdg: resolvePdgConfig(options),
-            });
+            await saveEmbeddingCheckpoint(checkpoint, [], embeddings);
           },
         },
       );
