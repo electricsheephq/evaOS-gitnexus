@@ -2294,6 +2294,11 @@ export const deleteNodesForFiles = async (
   if (!conn) {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
   }
+  // A persisted HNSW index makes even ordinary CodeEmbedding DELETEs depend
+  // on VECTOR in every new connection. Keep this mutation path offline-only:
+  // if VECTOR is unavailable, the delete below still works for an unindexed
+  // table and surfaces LadybugDB's real error for an indexed one.
+  await loadVectorExtension(undefined, { policy: 'load-only' });
   const targetConn = conn;
   let warnedMissingEmbeddingTable = false;
   for (let i = 0; i < filePaths.length; i += DELETE_FILES_CHUNK_SIZE) {

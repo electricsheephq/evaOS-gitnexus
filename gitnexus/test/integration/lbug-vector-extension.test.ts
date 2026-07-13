@@ -154,6 +154,37 @@ withTestLbugDB('vector-index-creation', (handle) => {
       const rows = await adapter.executeQuery('CALL SHOW_INDEXES() RETURN *');
       expect(rows.filter((row: any) => row.index_name === 'code_embedding_idx')).toHaveLength(1);
     });
+
+    it('deletes embedding rows from a persisted HNSW index after close and re-open', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
+      const { EMBEDDING_DIMS } = await import('../../src/core/lbug/schema.js');
+      const filePath = 'src/vector-reopen-delete.ts';
+      const nodeId = `Function:${filePath}:target:1`;
+
+      await adapter.executeQuery(
+        `CREATE (:Function {id: '${nodeId}', name: 'target', filePath: '${filePath}', startLine: 1, endLine: 3, isExported: true, content: '', description: ''})`,
+      );
+      await batchInsertEmbeddings(adapter.executeWithReusedStatement, [
+        {
+          nodeId,
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 3,
+          embedding: new Array(EMBEDDING_DIMS).fill(0),
+        },
+      ]);
+      await adapter.createVectorIndex();
+      await adapter.closeLbug();
+      await adapter.initLbug(handle.dbPath);
+
+      await expect(adapter.deleteNodesForFiles([filePath])).resolves.toBeUndefined();
+      const rows = (await adapter.executeQuery(
+        `MATCH (e:CodeEmbedding) WHERE e.nodeId = '${nodeId}' RETURN count(e) AS count`,
+      )) as Array<{ count: number | bigint }>;
+      expect(Number(rows[0]?.count ?? 0)).toBe(0);
+    });
   });
 });
 
