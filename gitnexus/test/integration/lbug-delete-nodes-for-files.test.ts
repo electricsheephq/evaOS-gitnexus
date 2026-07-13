@@ -237,3 +237,29 @@ withTestLbugDB('delete-nodes-missing-embedding-table', () => {
     }, 120_000);
   });
 });
+
+/**
+ * Error propagation contract for #37: zero matched rows are a valid no-op,
+ * but a native/schema failure while deleting a required node table must
+ * reject the whole writeback. A dedicated database keeps the intentional
+ * schema damage isolated from the successful-delete coverage above.
+ */
+withTestLbugDB('delete-nodes-required-table-failure', () => {
+  describe('deleteNodesForFiles native deletion failures (#37)', () => {
+    it('surfaces a required node-table failure instead of reporting success', async () => {
+      const { deleteNodesForFiles, executeQuery } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+
+      await executeQuery(
+        `CREATE (:Function {id: 'Function:src/a.ts:fnA:1', name: 'fnA', filePath: 'src/a.ts', startLine: 1, endLine: 3, isExported: true, content: '', description: ''})`,
+      );
+
+      // File is not part of the embedding join. Removing the property used
+      // by its delete predicate therefore reaches the actual node-table
+      // loop before LadybugDB raises the binder failure.
+      await executeQuery('ALTER TABLE File DROP filePath');
+
+      await expect(deleteNodesForFiles(['src/a.ts'])).rejects.toThrow(/File|filePath|property/i);
+    }, 120_000);
+  });
+});
