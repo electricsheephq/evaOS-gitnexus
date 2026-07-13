@@ -12,11 +12,12 @@ const bm25IndexUrl = pathToFileURL(path.join(packageRoot, 'dist/core/search/bm25
 const [repoPath, ...args] = process.argv.slice(2);
 if (!repoPath) {
   throw new Error(
-    'usage: large-incremental-child.mjs <repo> [--force] [--pause-on-escalation <file>] [--fts-query <text>]',
+    'usage: large-incremental-child.mjs <repo> [--force] [--embeddings] [--pause-on-escalation <file>] [--fts-query <text>]',
   );
 }
 
 const force = args.includes('--force');
+const embeddings = args.includes('--embeddings');
 const pauseIndex = args.indexOf('--pause-on-escalation');
 const pauseReadyFile = pauseIndex >= 0 ? args[pauseIndex + 1] : undefined;
 if (pauseIndex >= 0 && !pauseReadyFile) {
@@ -53,7 +54,17 @@ const onLog = (message) => {
 };
 
 try {
-  await runFullAnalysis(repoPath, { skipAgentsMd: true, force }, { onProgress: () => {}, onLog });
+  await runFullAnalysis(
+    repoPath,
+    {
+      skipAgentsMd: true,
+      skipSkills: true,
+      force,
+      embeddings,
+      embeddingsNodeLimit: embeddings ? 0 : undefined,
+    },
+    { onProgress: () => {}, onLog },
+  );
 
   const meta = await loadMeta(storagePath);
   const lbugStat = fs.statSync(lbugPath);
