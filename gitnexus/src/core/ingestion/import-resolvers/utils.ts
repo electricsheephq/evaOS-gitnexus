@@ -95,9 +95,20 @@ export function buildSuffixIndex(normalizedFileList: string[], allFileList: stri
   // Map: directory suffix -> list of file paths in that directory
   const dirMap = new Map<string, string[]>();
 
-  for (let i = 0; i < normalizedFileList.length; i++) {
-    const normalized = normalizedFileList[i];
-    const original = allFileList[i];
+  // First-wins suffixes must not inherit filesystem or parser insertion order.
+  // Sort a paired copy so callers keep their phase-specific file order.
+  const orderedFiles = normalizedFileList.map((normalized, index) => ({
+    normalized,
+    original: allFileList[index],
+  }));
+  orderedFiles.sort((left, right) => {
+    if (left.normalized !== right.normalized) {
+      return left.normalized < right.normalized ? -1 : 1;
+    }
+    return left.original < right.original ? -1 : left.original > right.original ? 1 : 0;
+  });
+
+  for (const { normalized, original } of orderedFiles) {
     const parts = normalized.split('/');
 
     // Index all suffixes: "a/b/c.java" -> ["c.java", "b/c.java", "a/b/c.java"]
