@@ -16,7 +16,7 @@
  * Usage:
  *   gitnexus eval-server                        # default port 4848, binds 127.0.0.1
  *   gitnexus eval-server --port 4848            # explicit port
- *   gitnexus eval-server --host 0.0.0.0         # reachable from other VMs / containers
+ *   GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0
  *   gitnexus eval-server --idle-timeout 300     # auto-shutdown after 300s idle
  *
  * READY signal format: GITNEXUS_EVAL_SERVER_READY:<host>:<port>
@@ -60,6 +60,40 @@ export function validateHost(raw: string): string | null {
   if (raw === 'localhost') return raw;
   if (isIPv4(raw) || isIPv6(raw)) return raw;
   return null;
+}
+
+/** Resolve the eval-server bearer token without retaining surrounding shell whitespace. */
+export function resolveEvalServerAuthToken(env: NodeJS.ProcessEnv): string | undefined {
+  return env.GITNEXUS_AUTH_TOKEN?.trim() || undefined;
+}
+
+/** True only for bind hosts that are local to this machine. */
+export function isEvalServerLoopbackHost(host: string): boolean {
+  return host === 'localhost' || host === '::1' || (isIPv4(host) && host.startsWith('127.'));
+}
+
+/** Refuse exposure of the eval-server query surface without authentication. */
+export function assertSecureEvalServerBinding(host: string, authToken: string | undefined): void {
+  if (!authToken && !isEvalServerLoopbackHost(host)) {
+    throw new Error(
+      `Refusing to start eval-server on non-loopback host ${host} without authentication. ` +
+        'Set GITNEXUS_AUTH_TOKEN or bind to 127.0.0.1, localhost, or ::1.',
+    );
+  }
+}
+
+/** Validate the exact Bearer header while keeping token comparison constant-time. */
+export function isEvalServerBearerAuthorized(
+  authorization: string | string[] | undefined,
+  authToken: string | undefined,
+): boolean {
+  if (!authToken) return true;
+
+  const expected = Buffer.from(`Bearer ${authToken}`, 'utf8');
+  const supplied = typeof authorization === 'string' ? Buffer.from(authorization, 'utf8') : null;
+  const sameLength = supplied?.length === expected.length;
+  const candidate = sameLength && supplied ? supplied : Buffer.alloc(expected.length);
+  return crypto.timingSafeEqual(candidate, expected) && sameLength;
 }
 
 // ─── Text Formatters ──────────────────────────────────────────────────
@@ -657,11 +691,21 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
         `  Must be an IP address or "localhost".\n\n` +
         `  Examples:\n` +
         `    gitnexus eval-server --host 127.0.0.1    (loopback only, default)\n` +
-        `    gitnexus eval-server --host 0.0.0.0      (all network interfaces)\n` +
-        `    gitnexus eval-server --host 192.168.1.5  (specific interface)\n` +
+        `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0\n` +
+        `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 192.168.1.5\n` +
         `    gitnexus eval-server --host localhost     (OS-resolved loopback)\n`,
       { flag: '--host', value: rawHost },
     );
+    process.exit(1);
+  }
+
+  const authToken = resolveEvalServerAuthToken(process.env);
+  try {
+    assertSecureEvalServerBinding(host, authToken);
+  } catch (error) {
+    cliError(error instanceof Error ? error.message : 'Refusing insecure eval-server binding.', {
+      host,
+    });
     process.exit(1);
   }
 
@@ -705,6 +749,14 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
   const shutdownToken = crypto.randomBytes(24).toString('hex');
 
   const server = http.createServer(async (req, res) => {
+    if (!isEvalServerBearerAuthorized(req.headers.authorization, authToken)) {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('WWW-Authenticate', 'Bearer');
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
     resetIdleTimer();
 
     try {
@@ -807,7 +859,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
               `  Run \`ip addr\` (Linux) or \`ipconfig\` (Windows) to list available addresses.\n\n`) +
           `  Common fixes:\n` +
           `    gitnexus eval-server --host 127.0.0.1  (loopback, this machine only)\n` +
-          `    gitnexus eval-server --host 0.0.0.0    (all interfaces, reachable from other VMs)\n`,
+          `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0\n`,
         { code: err.code, port, host },
       );
     } else if (err.code === 'EACCES') {
@@ -856,6 +908,9 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       `  GET  /health        — health check`,
       `  POST /shutdown      — graceful shutdown`,
     ];
+    if (authToken) {
+      bannerLines.push('  Bearer authentication enabled');
+    }
     if (idleTimeoutSec > 0) {
       bannerLines.push(`  Auto-shutdown after ${idleTimeoutSec}s idle`);
     }
@@ -863,6 +918,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       port: boundPort,
       host,
       idleTimeoutSec: idleTimeoutSec > 0 ? idleTimeoutSec : undefined,
+      authEnabled: Boolean(authToken),
       endpoints: [
         'POST /tool/query',
         'POST /tool/context',
