@@ -730,6 +730,10 @@ export class LocalBackend {
    */
   private warnedVectorUnsupported = false;
 
+  /** One-shot diagnostics for a broken/missing HNSW path and bounded fallback. */
+  private warnedVectorQueryFailure = false;
+  private warnedExactScanLimit = false;
+
   /**
    * One-shot warning when a pruned or Node-unloadable optional embedding stack
    * (#2370/#2372) forces semantic search to fall back to BM25 — so the
@@ -2512,8 +2516,15 @@ export class LocalBackend {
               distance: row.distance ?? row[4],
             }));
           });
-        } catch {
+        } catch (error) {
           bestChunks = new Map();
+          if (!this.warnedVectorQueryFailure) {
+            this.warnedVectorQueryFailure = true;
+            logger.warn(
+              { err: error },
+              'GitNexus [query:vector]: VECTOR index query failed; using exact scan fallback',
+            );
+          }
         }
       } else if (!this.warnedVectorUnsupported) {
         // Rare diagnostic: surface why we fell back to the exact scan path so
@@ -2529,7 +2540,15 @@ export class LocalBackend {
       if (bestChunks.size === 0) {
         const embeddingCount = Number(tableCheck[0].cnt ?? tableCheck[0][0] ?? 0);
         const exactLimit = getExactScanLimit();
-        if (embeddingCount > exactLimit) return [];
+        if (embeddingCount > exactLimit) {
+          if (!this.warnedExactScanLimit) {
+            this.warnedExactScanLimit = true;
+            logger.warn(
+              `GitNexus [query:vector]: exact scan refused; ${embeddingCount} chunks exceed the configured safety limit of ${exactLimit}. Restore the VECTOR index or deliberately raise GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT after reviewing memory cost.`,
+            );
+          }
+          return [];
+        }
 
         const rows = await executeQuery(
           repo.lbugPath,

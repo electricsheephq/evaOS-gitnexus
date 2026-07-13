@@ -5,7 +5,9 @@ import {
   localEmbeddingDoctorStatus,
   padDisplayEnd,
   pageSizeDoctorLines,
+  repoVectorDoctorStatus,
 } from '../../src/cli/doctor.js';
+import type { RepoMeta } from '../../src/storage/repo-manager.js';
 
 describe('doctor output formatting', () => {
   it('keeps ASCII padding equivalent to String.padEnd', () => {
@@ -161,6 +163,73 @@ describe('doctor page-size lines (#1231, #2424 review)', () => {
     expect(lines[1]).toContain('an unknown @ladybugdb/core version (may predate 0.18.0)');
     expect(lines[1]).not.toContain('with @ladybugdb/core < 0.18.0');
     expect(lines[1]).toContain('npm install -g gitnexus@latest');
+  });
+});
+
+describe('doctor current-repository VECTOR status', () => {
+  it('distinguishes a persisted HNSW index from platform support', () => {
+    expect(
+      repoVectorDoctorStatus({
+        stats: { embeddings: 25 },
+        capabilities: {
+          graph: { provider: 'ladybugdb', status: 'available' },
+          fts: { provider: 'ladybugdb-fts', status: 'available' },
+          vectorSearch: {
+            provider: 'ladybugdb-vector',
+            status: 'vector-index',
+            exactScanLimit: 10_000,
+          },
+        },
+      } as RepoMeta),
+    ).toEqual({ status: 'vector-index (25 chunks)', detail: null });
+  });
+
+  it('makes an exact-scan fallback and its current safety limit explicit', () => {
+    const result = repoVectorDoctorStatus({
+      stats: { embeddings: 25 },
+      capabilities: {
+        graph: { provider: 'ladybugdb', status: 'available' },
+        fts: { provider: 'ladybugdb-fts', status: 'available' },
+        vectorSearch: {
+          provider: 'exact-scan',
+          status: 'exact-scan',
+          exactScanLimit: 100,
+          reason: 'VECTOR extension unavailable',
+        },
+      },
+    } as RepoMeta);
+
+    expect(result.status).toBe('exact-scan (25 chunks)');
+    expect(result.detail).toContain('VECTOR extension unavailable');
+    expect(result.detail).toContain('limit is 100 chunks');
+  });
+
+  it('reports when exact scan will refuse an oversized repository', () => {
+    const result = repoVectorDoctorStatus({
+      stats: { embeddings: 101 },
+      capabilities: {
+        graph: { provider: 'ladybugdb', status: 'available' },
+        fts: { provider: 'ladybugdb-fts', status: 'available' },
+        vectorSearch: {
+          provider: 'exact-scan',
+          status: 'exact-scan',
+          exactScanLimit: 100,
+        },
+      },
+    } as RepoMeta);
+
+    expect(result.status).toBe('exact-scan refused (101 chunks)');
+    expect(result.detail).toMatch(/exceed.*100.*semantic vector results are skipped/i);
+  });
+
+  it('does not guess when current-repository metadata is absent or legacy', () => {
+    expect(repoVectorDoctorStatus(null)).toEqual({
+      status: 'not indexed at this path',
+      detail: null,
+    });
+    expect(repoVectorDoctorStatus({ stats: { embeddings: 2 } } as RepoMeta).status).toBe(
+      'unknown (refresh index metadata)',
+    );
   });
 });
 

@@ -96,7 +96,7 @@ export interface FtsProbeResult {
   reason?: string;
 }
 
-const DEFAULT_FTS_PROBE_TIMEOUT_MS = 10_000;
+const DEFAULT_EXTENSION_PROBE_TIMEOUT_MS = 10_000;
 
 /** A LadybugDB query result exposes a synchronous `close()`. */
 interface CloseableResult {
@@ -133,8 +133,9 @@ const closeProbeResults = (result: unknown): void => {
  * cannot cancel an in-flight native call, so a future thread-blocking case
  * would need an out-of-process probe.
  */
-export async function probeFtsExtensionLoad(
-  timeoutMs: number = DEFAULT_FTS_PROBE_TIMEOUT_MS,
+async function probeExtensionLoad(
+  extensionName: 'fts' | 'VECTOR',
+  timeoutMs: number,
 ): Promise<FtsProbeResult> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<FtsProbeResult>((resolve) => {
@@ -156,7 +157,7 @@ export async function probeFtsExtensionLoad(
       try {
         const conn = new lbug.Connection(db);
         try {
-          const result = await conn.query('LOAD EXTENSION fts');
+          const result = await conn.query(`LOAD EXTENSION ${extensionName}`);
           closeProbeResults(result);
           return { loaded: true };
         } finally {
@@ -172,4 +173,23 @@ export async function probeFtsExtensionLoad(
   })();
 
   return await Promise.race([probe, timeout]).finally(() => clearTimeout(timer));
+}
+
+export async function probeFtsExtensionLoad(
+  timeoutMs: number = DEFAULT_EXTENSION_PROBE_TIMEOUT_MS,
+): Promise<FtsProbeResult> {
+  return probeExtensionLoad('fts', timeoutMs);
+}
+
+/** Live, load-only VECTOR probe for doctor. Never attempts a network install. */
+export async function probeVectorExtensionLoad(
+  timeoutMs: number = DEFAULT_EXTENSION_PROBE_TIMEOUT_MS,
+): Promise<FtsProbeResult> {
+  if (process.platform === 'win32') {
+    return {
+      loaded: false,
+      reason: 'VECTOR is disabled on Windows because loading/installing the extension can crash',
+    };
+  }
+  return probeExtensionLoad('VECTOR', timeoutMs);
 }

@@ -87,7 +87,7 @@ withTestLbugDB('vector-extension', (handle) => {
  * `createFTSIndex`). These tests exercise the real adapter against a real
  * LadybugDB so a revert to the prepared path fails loudly.
  */
-withTestLbugDB('vector-index-creation', () => {
+withTestLbugDB('vector-index-creation', (handle) => {
   // VECTOR is platform-sensitive (skipped on win32 / unsupported platforms,
   // and when it cannot be installed offline). Probe once, skip the suite if
   // unavailable — mirrors the FTS-skip convention in withTestLbugDB.
@@ -138,6 +138,21 @@ withTestLbugDB('vector-index-creation', () => {
       const rows = await adapter.executeQuery('CALL SHOW_INDEXES() RETURN *');
       const matches = rows.filter((r: any) => r.index_name === 'code_embedding_idx');
       expect(matches).toHaveLength(1);
+    });
+
+    it('treats a pre-existing index as ready after the connection cache is reset', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+
+      await adapter.createVectorIndex();
+      await adapter.closeLbug();
+      await adapter.initLbug(handle.dbPath);
+
+      // This reaches LadybugDB again after vectorIndexEnsured was cleared. The
+      // engine's "already exists" response is a ready state, not a downgrade.
+      await expect(adapter.createVectorIndex()).resolves.toBe(true);
+
+      const rows = await adapter.executeQuery('CALL SHOW_INDEXES() RETURN *');
+      expect(rows.filter((row: any) => row.index_name === 'code_embedding_idx')).toHaveLength(1);
     });
   });
 });

@@ -14,11 +14,16 @@ import {
   type EmbeddingRuntimeResolution,
 } from '../core/embeddings/runtime-install.js';
 import { cudaRedirectDoctorStatus } from '../core/embeddings/onnxruntime-node-resolver.js';
-import { checkLbugNative, probeFtsExtensionLoad } from '../core/lbug/native-check.js';
+import {
+  checkLbugNative,
+  probeFtsExtensionLoad,
+  probeVectorExtensionLoad,
+} from '../core/lbug/native-check.js';
 import { getOsPageSize, isPageSizeAwareLadybug } from '../core/lbug/lbug-config.js';
 import { diagnoseExtensionLoad } from '../core/lbug/extension-load-error.js';
 import { getExtensionInstallPolicy } from '../core/lbug/extension-loader.js';
 import { getGitRoot } from '../storage/git.js';
+import { getStoragePaths, loadMeta, type RepoMeta } from '../storage/repo-manager.js';
 import { t } from './i18n/index.js';
 
 function isCombiningMark(codePoint: number): boolean {
@@ -149,6 +154,54 @@ export function pageSizeDoctorLines(
   return lines;
 }
 
+export function repoVectorDoctorStatus(meta: RepoMeta | null | undefined): {
+  status: string;
+  detail: string | null;
+} {
+  if (!meta) return { status: 'not indexed at this path', detail: null };
+
+  const rawEmbeddingCount = Number(meta.stats?.embeddings ?? 0);
+  const embeddingCount =
+    Number.isFinite(rawEmbeddingCount) && rawEmbeddingCount > 0
+      ? Math.floor(rawEmbeddingCount)
+      : 0;
+  if (embeddingCount <= 0) return { status: 'no embeddings', detail: null };
+
+  const vector = meta.capabilities?.vectorSearch;
+  if (!vector) {
+    return {
+      status: 'unknown (refresh index metadata)',
+      detail: 'Run gitnexus analyze --embeddings to record the current VECTOR index state.',
+    };
+  }
+
+  if (vector.status === 'vector-index') {
+    return { status: `vector-index (${embeddingCount} chunks)`, detail: null };
+  }
+
+  if (vector.status === 'unavailable') {
+    return {
+      status: `unavailable (${embeddingCount} chunks)`,
+      detail: vector.reason ?? 'Semantic vector search is unavailable for this index.',
+    };
+  }
+
+  const reason = vector.reason ? `${vector.reason} ` : '';
+  if (vector.status === 'exact-scan' && embeddingCount > vector.exactScanLimit) {
+    return {
+      status: `exact-scan refused (${embeddingCount} chunks)`,
+      detail:
+        `${reason}${embeddingCount} embedding chunks exceed the exact-scan limit of ` +
+        `${vector.exactScanLimit}; semantic vector results are skipped until the VECTOR index is restored or the limit is deliberately raised.`,
+    };
+  }
+
+  return {
+    status: `${vector.status} (${embeddingCount} chunks)`,
+    detail: `${reason}Exact-scan limit is ${vector.exactScanLimit} chunks.`.trim(),
+  };
+}
+
 export const doctorCommand = async (
   inputPath?: string,
   options: { recoveryPlan?: boolean } = {},
@@ -209,7 +262,15 @@ export const doctorCommand = async (
       console.log(`  ${padDisplayEnd('', 18)}${remedy}`);
     }
   }
-  console.log(`  ${label('doctor.labels.vectorIndex', 18)}${capabilities.vector}`);
+  const vectorProbe = nativeCheck.ok
+    ? await probeVectorExtensionLoad()
+    : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
+  console.log(
+    `  ${label('doctor.labels.vectorIndex', 18)}${vectorProbe.loaded ? 'available' : 'unavailable'}`,
+  );
+  if (!vectorProbe.loaded && vectorProbe.reason) {
+    console.log(`  ${padDisplayEnd('', 18)}${vectorProbe.reason}`);
+  }
   console.log(`  ${label('doctor.labels.semanticMode', 18)}${capabilities.semanticMode}`);
   // Surface the optional-extension install policy so offline users can see
   // whether analyze/query will reach the network (extension.ladybugdb.com).
@@ -227,6 +288,14 @@ export const doctorCommand = async (
   );
   if (capabilities.reason)
     console.log(`  ${label('doctor.labels.note', 18)}${capabilities.reason}`);
+  const requestedPath = inputPath ? path.resolve(inputPath) : process.cwd();
+  const repoRoot = getGitRoot(requestedPath) ?? requestedPath;
+  const repoMeta = await loadMeta(getStoragePaths(repoRoot).storagePath).catch(() => null);
+  const repoVector = repoVectorDoctorStatus(repoMeta);
+  console.log(`  ${padDisplayEnd('Repo VECTOR:', 18)}${repoVector.status}`);
+  if (repoVector.detail) {
+    console.log(`  ${padDisplayEnd('', 18)}${repoVector.detail}`);
+  }
   console.log('');
   console.log(t('doctor.embeddings'));
   console.log(`  ${label('doctor.labels.backend', 12)}${isHttpMode() ? 'http' : 'local'}`);

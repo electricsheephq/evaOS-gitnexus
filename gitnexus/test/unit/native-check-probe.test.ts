@@ -29,7 +29,10 @@ vi.mock('@ladybugdb/core', () => {
   return { default: { Database, Connection } };
 });
 
-import { probeFtsExtensionLoad } from '../../src/core/lbug/native-check.js';
+import {
+  probeFtsExtensionLoad,
+  probeVectorExtensionLoad,
+} from '../../src/core/lbug/native-check.js';
 
 const closeable = () => ({ close: vi.fn() });
 
@@ -88,5 +91,26 @@ describe('probeFtsExtensionLoad (#2374)', () => {
       },
     });
     await expect(probeFtsExtensionLoad()).resolves.toEqual({ loaded: true });
+  });
+});
+
+describe('probeVectorExtensionLoad', () => {
+  it('live-probes VECTOR with the same bounded, close-safe path', async () => {
+    h.query.mockResolvedValue(closeable());
+
+    await expect(probeVectorExtensionLoad()).resolves.toEqual({ loaded: true });
+
+    expect(h.query).toHaveBeenCalledWith('LOAD EXTENSION VECTOR');
+    expect(h.connClose).toHaveBeenCalled();
+    expect(h.dbClose).toHaveBeenCalled();
+  });
+
+  it('reports a collapsed VECTOR load failure', async () => {
+    h.query.mockRejectedValue(new Error('Binder exception:\n extension missing'));
+
+    await expect(probeVectorExtensionLoad()).resolves.toEqual({
+      loaded: false,
+      reason: 'Binder exception: extension missing',
+    });
   });
 });

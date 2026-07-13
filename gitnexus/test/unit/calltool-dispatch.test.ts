@@ -671,6 +671,60 @@ describe('LocalBackend.callTool', () => {
     expect(queries.some((cypher: string) => cypher.includes('distance < 0.6'))).toBe(true);
   });
 
+  it('warns once when VECTOR query failure falls back to exact scan', async () => {
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 1 }];
+      if (cypher.includes('QUERY_VECTOR_INDEX')) throw new Error('HNSW index unavailable');
+      return [];
+    });
+    (executeParameterized as any).mockResolvedValue([]);
+    const cap = _captureLogger();
+
+    try {
+      await backend.callTool('query', { query: 'auth' });
+      await backend.callTool('query', { query: 'auth' });
+
+      const warnings = cap
+        .records()
+        .filter((record) => String(record.msg).includes('using exact scan fallback'));
+      expect(warnings).toHaveLength(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('warns and refuses an exact scan above the configured safety limit', async () => {
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 2 }];
+      if (cypher.includes('QUERY_VECTOR_INDEX')) throw new Error('HNSW index unavailable');
+      return [];
+    });
+    (executeParameterized as any).mockResolvedValue([]);
+    const previous = process.env.GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT;
+    process.env.GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT = '1';
+    const cap = _captureLogger();
+
+    try {
+      await backend.callTool('query', { query: 'auth' });
+
+      expect(
+        cap
+          .records()
+          .some((record) => /exact scan refused.*2 chunks exceed.*limit of 1/i.test(String(record.msg))),
+      ).toBe(true);
+      const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
+      expect(queries.some((cypher: string) => cypher.includes('e.embedding AS embedding'))).toBe(
+        false,
+      );
+    } finally {
+      cap.restore();
+      if (previous === undefined) delete process.env.GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT;
+      else process.env.GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT = previous;
+    }
+  });
+
   it('threads GITNEXUS_VECTOR_MAX_DISTANCE into the vector index WHERE clause', async () => {
     platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
     vi.mocked(executeQuery).mockImplementation(async (_repoId: string, cypher: string) => {

@@ -741,8 +741,12 @@ export const semanticSearch = async (
           distance: row.distance ?? row[4],
         }));
       });
-    } catch {
+    } catch (error) {
       bestChunks = new Map();
+      logger.warn(
+        { err: error },
+        'VECTOR index query failed; semantic search is using exact-scan fallback',
+      );
     }
   }
 
@@ -776,6 +780,10 @@ export const semanticSearch = async (
             endLine: row.endLine,
           },
         ]),
+      );
+    } else if (embeddingCount > exactLimit) {
+      logger.warn(
+        `Semantic exact scan refused: ${embeddingCount} chunks exceed the configured safety limit of ${exactLimit}. Restore the VECTOR index or deliberately raise GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT after reviewing memory cost.`,
       );
     }
   }
