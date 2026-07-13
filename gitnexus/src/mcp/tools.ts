@@ -297,6 +297,10 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           description: 'Direct symbol UID from prior tool results (zero-ambiguity lookup)',
         },
         file_path: { type: 'string', description: 'File path to disambiguate common names' },
+        file: {
+          type: 'string',
+          description: 'Compatibility alias for file_path; values must agree when both are present',
+        },
         kind: {
           type: 'string',
           description:
@@ -461,6 +465,14 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
       type: 'object',
       properties: {
         target: { type: 'string', description: 'Name of function, class, or file to analyze' },
+        name: {
+          type: 'string',
+          description: 'Compatibility alias for target; all supplied target aliases must agree',
+        },
+        symbol: {
+          type: 'string',
+          description: 'Compatibility alias for target; all supplied target aliases must agree',
+        },
         target_uid: {
           type: 'string',
           description:
@@ -578,7 +590,8 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           maximum: 3600000,
         },
       },
-      required: ['target', 'direction'],
+      required: ['direction'],
+      anyOf: [{ required: ['target'] }, { required: ['name'] }, { required: ['symbol'] }],
     },
   },
   {
