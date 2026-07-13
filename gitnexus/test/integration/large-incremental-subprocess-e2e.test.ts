@@ -7,9 +7,17 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   readEmbeddingNodeIds,
+  readEmbeddingRowFingerprints,
   seedEmbeddingsForFiles,
   stampEmbeddingCount,
 } from '../helpers/embedding-seed.js';
+import {
+  createHermeticProcessEnv,
+  RECOVERY_BOUNDARY_CASES,
+  selectRecoveryBoundaries,
+  startReadyProcess,
+  terminateChild,
+} from '../helpers/large-incremental-contract.js';
 import { getStoragePaths, loadMeta } from '../../src/storage/repo-manager.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -33,12 +41,7 @@ type HarnessResult = {
 };
 
 const childEnv = (gitnexusHome: string, embeddingUrl: string): NodeJS.ProcessEnv => {
-  const env = { ...process.env };
-  for (const key of Object.keys(env)) {
-    if (key.startsWith('GITNEXUS_EMBEDDING_')) delete env[key];
-  }
-  return {
-    ...env,
+  return createHermeticProcessEnv(process.env, gitnexusHome, {
     CI: '1',
     NODE_ENV: 'test',
     GITNEXUS_HOME: gitnexusHome,
@@ -57,7 +60,7 @@ const childEnv = (gitnexusHome: string, embeddingUrl: string): NodeJS.ProcessEnv
     GITNEXUS_EMBEDDING_MAX_ATTEMPTS: '1',
     GITNEXUS_EMBEDDING_RETRY_CAP_MS: '1',
     GITNEXUS_EMBEDDING_MIN_INTERVAL_MS: '0',
-  };
+  });
 };
 
 const commitAll = (repoPath: string, message: string): void => {
@@ -83,12 +86,21 @@ const commitAll = (repoPath: string, message: string): void => {
 };
 
 const setupLargeRepo = (): { root: string; repoPath: string; gitnexusHome: string } => {
+  const installedExtensions = path.join(os.homedir(), '.lbdb', 'extension');
+  if (!fs.existsSync(installedExtensions)) {
+    throw new Error(
+      `large incremental test requires preinstalled extensions: ${installedExtensions}`,
+    );
+  }
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-large-incremental-'));
   const repoPath = path.join(root, 'repo');
   const gitnexusHome = path.join(root, 'home');
   const src = path.join(repoPath, 'src');
   fs.mkdirSync(src, { recursive: true });
   fs.mkdirSync(gitnexusHome, { recursive: true });
+  fs.cpSync(installedExtensions, path.join(gitnexusHome, '.lbdb', 'extension'), {
+    recursive: true,
+  });
 
   fs.writeFileSync(
     path.join(src, 'hub.ts'),
@@ -133,40 +145,16 @@ const runChild = (
   return parseHarnessResult(result.stdout);
 };
 
-const startEmbeddingServer = async (): Promise<{ child: ChildProcess; url: string }> => {
-  const child = spawn(process.execPath, [embeddingServerRunner], {
-    env: { ...process.env, NODE_ENV: 'test' },
-    stdio: ['ignore', 'pipe', 'pipe'],
+const startEmbeddingServer = async (
+  isolatedHome: string,
+): Promise<{ child: ChildProcess; url: string }> => {
+  const ready = await startReadyProcess({
+    command: process.execPath,
+    args: [embeddingServerRunner],
+    env: createHermeticProcessEnv(process.env, isolatedHome, { NODE_ENV: 'test' }),
+    readyPrefix: 'EMBEDDING_SERVER=',
   });
-  const url = await new Promise<string>((resolve, reject) => {
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => reject(new Error('embedding server did not start')), 30_000);
-    child.stdout?.on('data', (chunk) => {
-      stdout += chunk.toString();
-      const line = stdout
-        .split(/\r?\n/u)
-        .find((candidate) => candidate.startsWith('EMBEDDING_SERVER='));
-      if (line) {
-        clearTimeout(timer);
-        resolve(line.slice('EMBEDDING_SERVER='.length));
-      }
-    });
-    child.stderr?.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.once('error', (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.once('exit', (code, signal) => {
-      clearTimeout(timer);
-      reject(
-        new Error(`embedding server exited before ready: code=${code} signal=${signal} ${stderr}`),
-      );
-    });
-  });
-  return { child, url };
+  return { child: ready.child, url: ready.value };
 };
 
 const waitForFile = async (filePath: string, child: ChildProcess): Promise<void> => {
@@ -180,21 +168,6 @@ const waitForFile = async (filePath: string, child: ChildProcess): Promise<void>
   }
   throw new Error('timed out waiting for the incremental pause point');
 };
-
-const stopChild = async (
-  child: ChildProcess,
-): Promise<{ code: number | null; signal: string | null }> =>
-  new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error('child did not terminate after SIGTERM')),
-      30_000,
-    );
-    child.once('exit', (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal });
-    });
-    child.kill('SIGTERM');
-  });
 
 const readEmbeddingDimensions = async (repoPath: string): Promise<number[]> => {
   const adapter = await import('../../src/core/lbug/lbug-adapter.js');
@@ -218,8 +191,9 @@ describe('large incremental analysis subprocess contract', () => {
       `missing embedding server: ${embeddingServerRunner}`,
     ).toBe(true);
     const fixture = setupLargeRepo();
-    const embeddingServer = await startEmbeddingServer();
+    let embeddingServer: Awaited<ReturnType<typeof startEmbeddingServer>> | undefined;
     try {
+      embeddingServer = await startEmbeddingServer(fixture.gitnexusHome);
       const initial = runChild(fixture.repoPath, fixture.gitnexusHome, embeddingServer.url);
       expect(initial.stats.files).toBe(61);
       expect(initial.stats.nodes).toBeGreaterThan(61);
@@ -273,12 +247,12 @@ describe('large incremental analysis subprocess contract', () => {
       );
       commitAll(fixture.repoPath, 'exercise incremental write set');
 
-      const boundaries = [
-        ['before-delete', 'escalated-full-write'],
-        ['during-delete', 'escalated-full-write'],
-        ['during-insert', 'escalated-load-graph'],
-        ['before-finalize', 'escalated-load-graph'],
-      ] as const;
+      const selectedBoundaries = new Set(
+        selectRecoveryBoundaries(process.env.GITNEXUS_RECOVERY_BOUNDARIES),
+      );
+      const boundaries = RECOVERY_BOUNDARY_CASES.filter(([boundary]) =>
+        selectedBoundaries.has(boundary),
+      );
       let recovered: HarnessResult | undefined;
       for (const [index, [boundary, expectedDirtyPhase]] of boundaries.entries()) {
         if (index > 0) {
@@ -312,13 +286,14 @@ describe('large incremental analysis subprocess contract', () => {
           expect(pauseState.details.table).toBeTruthy();
         }
 
-        const stopped = await stopChild(interrupted);
+        const stopped = await terminateChild(interrupted);
         expect(stopped.code).not.toBe(0);
         expect(stopped.signal).toBe('SIGTERM');
         const dirtyMeta = await loadMeta(storagePath);
         expect(dirtyMeta?.incrementalInProgress?.phase).toBe(expectedDirtyPhase);
 
         recovered = runChild(fixture.repoPath, fixture.gitnexusHome, embeddingServer.url, [
+          '--embeddings',
           '--fts-query',
           'r09FtsNeedle',
         ]);
@@ -333,8 +308,11 @@ describe('large incremental analysis subprocess contract', () => {
           `${boundary} recovery silently lost every preserved or regenerated embedding`,
         ).toBeGreaterThanOrEqual(4);
         expect(recovered.stats.embeddings).toBe(recoveredEmbeddingIds.length);
+        const recoveredEmbeddingRows = await readEmbeddingRowFingerprints(fixture.repoPath);
         const forced = runChild(fixture.repoPath, fixture.gitnexusHome, embeddingServer.url, [
           '--force',
+          '--embeddings',
+          '--drop-embeddings',
           '--fts-query',
           'r09FtsNeedle',
         ]);
@@ -342,6 +320,9 @@ describe('large incremental analysis subprocess contract', () => {
         expect(forced.ftsSearch).toEqual(recovered.ftsSearch);
         expect((await readEmbeddingNodeIds(fixture.repoPath)).toSorted()).toEqual(
           recoveredEmbeddingIds.toSorted(),
+        );
+        expect(await readEmbeddingRowFingerprints(fixture.repoPath)).toEqual(
+          recoveredEmbeddingRows,
         );
       }
       if (!recovered) throw new Error('recovery matrix produced no successful run');
@@ -365,10 +346,17 @@ describe('large incremental analysis subprocess contract', () => {
       expect(survivingEmbeddingIds).not.toContain(seeded.get('src/spoke-002.ts')?.[0]);
       expect(await readEmbeddingDimensions(fixture.repoPath)).toEqual([384]);
     } finally {
-      if (embeddingServer.child.exitCode === null && embeddingServer.child.signalCode === null) {
-        await stopChild(embeddingServer.child);
+      try {
+        if (
+          embeddingServer &&
+          embeddingServer.child.exitCode === null &&
+          embeddingServer.child.signalCode === null
+        ) {
+          await terminateChild(embeddingServer.child);
+        }
+      } finally {
+        fs.rmSync(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       }
-      fs.rmSync(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   }, 2_400_000);
 });

@@ -204,6 +204,10 @@ jobs:
     env:
       GITNEXUS_REQUIRE_FTS: '1'
       GITNEXUS_E2E_CLI: dist
+      # Ubuntu coverage proves all four durable recovery boundaries. The OS
+      # matrix keeps the most destructive native filesystem boundary inside
+      # its 15-minute per-shard watchdog.
+      GITNEXUS_RECOVERY_BOUNDARIES: during-delete
     steps:
       # persist-credentials: false — runs tests only, never pushes (zizmor
       # credential-persistence / artipacked audit).
