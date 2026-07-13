@@ -1,8 +1,4 @@
-import {
-  CircuitOpenError,
-  ResilientFetchExhaustedError,
-  resilientFetch,
-} from 'gitnexus-shared';
+import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from 'gitnexus-shared';
 
 import {
   type RerankFailurePolicy,
@@ -135,7 +131,9 @@ export class VoyageRerankProvider implements RerankProvider {
         error instanceof DOMException &&
         (error.name === 'TimeoutError' || error.name === 'AbortError')
       ) {
-        const action = request.signal?.aborted ? 'cancelled' : `timed out after ${this.config.timeoutMs}ms`;
+        const action = request.signal?.aborted
+          ? 'cancelled'
+          : `timed out after ${this.config.timeoutMs}ms`;
         throw new Error(`Rerank request ${action} (${safeUrl(url)})`);
       }
       if (error instanceof ResilientFetchExhaustedError) {
@@ -163,7 +161,8 @@ export class VoyageRerankProvider implements RerankProvider {
     if (!payload || typeof payload !== 'object') {
       throw new Error(`Rerank endpoint returned an unexpected response shape (${safeUrl(url)})`);
     }
-    const source = (payload as { data?: unknown; results?: unknown }).data ??
+    const source =
+      (payload as { data?: unknown; results?: unknown }).data ??
       (payload as { results?: unknown }).results;
     if (!Array.isArray(source)) {
       throw new Error(`Rerank endpoint returned an unexpected response shape (${safeUrl(url)})`);
