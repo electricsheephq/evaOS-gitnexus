@@ -1,0 +1,4 @@
+GitNexus pristine-floor CI evidence trigger
+source: v1.6.10-rc.19
+peeled-commit: d43c479ac58c18d397958f48a99465d6c3110b1d
+scope: scheduling only; no product, package, manifest, or runtime change
