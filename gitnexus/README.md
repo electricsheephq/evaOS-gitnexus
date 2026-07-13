@@ -291,6 +291,22 @@ gitnexus analyze . --embeddings
 
 Works with Infinity, vLLM, TEI, llama.cpp, Ollama, LM Studio, or OpenAI. Retry and pacing settings are provider-neutral; provider-specific limits should be supplied through configuration. When unset, local embeddings are used unchanged.
 
+## Optional Query Reranking (Fork Only)
+
+The internal fork can rerank the hybrid search candidates before process grouping. The feature is off unless both a provider and repository allowlist are configured, so an unconfigured installation preserves the upstream ranking path unchanged.
+
+```bash
+export GITNEXUS_RERANK_PROVIDER=voyage
+export GITNEXUS_RERANK_ALLOWED_REPOS=repo-one,repo-two
+export GITNEXUS_RERANK_API_KEY=your-key
+export GITNEXUS_RERANK_FAILURE_POLICY=fallback  # fallback or error
+export GITNEXUS_RERANK_CANDIDATES=40
+export GITNEXUS_RERANK_MAX_DOC_CHARS=3000
+export GITNEXUS_RERANK_TIMEOUT_MS=30000
+```
+
+`GITNEXUS_RERANK_ALLOWED_REPOS=*` permits every registered repository and should be used deliberately because candidate metadata and source excerpts are sent to the external provider. A request can set `rerank: false` to bypass the configured provider. Tests use an in-memory provider and do not require network credentials.
+
 ## Multi-Repo Support
 
 GitNexus supports indexing multiple repositories. Each `gitnexus analyze` registers the repo in a global registry (`~/.gitnexus/registry.json`). The MCP server serves all indexed repos automatically.

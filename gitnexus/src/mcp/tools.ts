@@ -182,6 +182,12 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
           description: 'Include full symbol source code (default: false)',
           default: false,
         },
+        rerank: {
+          type: 'boolean',
+          description:
+            'Use the configured optional reranking provider when one is enabled for this repository (default: true).',
+          default: true,
+        },
         maxTokens: {
           type: 'integer',
           minimum: 1,

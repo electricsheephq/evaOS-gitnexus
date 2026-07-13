@@ -127,6 +127,7 @@ import {
   isLbugReady,
   closeLbug,
 } from '../../src/mcp/core/lbug-adapter.js';
+import type { RerankRuntime } from '../../src/core/rerank/provider.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -411,6 +412,125 @@ describe('LocalBackend.callTool', () => {
     const result = await backend.callTool('query', { query: 'auth' });
     expect(result).toHaveProperty('processes');
     expect(result).toHaveProperty('definitions');
+  });
+
+  it('applies a deterministic optional reranker to query candidates', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      results: [
+        { filePath: 'src/a.ts', name: 'A', type: 'File' },
+        { filePath: 'src/b.ts', name: 'B', type: 'File' },
+      ],
+      ftsAvailable: true,
+    });
+    const runtime: RerankRuntime = {
+      provider: {
+        id: 'deterministic-test',
+        rerank: vi.fn().mockResolvedValue([
+          { index: 1, score: 0.9 },
+          { index: 0, score: 0.1 },
+        ]),
+      },
+      candidates: 2,
+      maxDocChars: 1000,
+      failurePolicy: 'fallback',
+    };
+    const rerankingBackend = new LocalBackend(() => runtime);
+    await rerankingBackend.init();
+
+    const result = await rerankingBackend.callTool('query', { search_query: 'needle' });
+
+    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual([
+      'b.ts',
+      'a.ts',
+    ]);
+    expect(runtime.provider.rerank).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not invoke or expose reranking when the request disables it', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      results: [
+        { filePath: 'src/a.ts', name: 'A', type: 'File' },
+        { filePath: 'src/b.ts', name: 'B', type: 'File' },
+      ],
+      ftsAvailable: true,
+    });
+    const resolver = vi.fn((): RerankRuntime => ({
+      provider: { id: 'unused-test', rerank: vi.fn() },
+      candidates: 2,
+      maxDocChars: 1000,
+      failurePolicy: 'fallback',
+    }));
+    const bypassBackend = new LocalBackend(resolver);
+    await bypassBackend.init();
+
+    const result = await bypassBackend.callTool('query', {
+      search_query: 'needle',
+      rerank: false,
+    });
+
+    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual([
+      'a.ts',
+      'b.ts',
+    ]);
+    expect(resolver).not.toHaveBeenCalled();
+    expect(result.timing).not.toHaveProperty('rerank');
+    expect(result.warning).toBeUndefined();
+  });
+
+  it('falls back explicitly to the original ordering when provider policy permits it', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      results: [
+        { filePath: 'src/a.ts', name: 'A', type: 'File' },
+        { filePath: 'src/b.ts', name: 'B', type: 'File' },
+      ],
+      ftsAvailable: true,
+    });
+    const fallbackBackend = new LocalBackend(() => ({
+      provider: {
+        id: 'failing-test',
+        rerank: vi.fn().mockRejectedValue(new Error('provider unavailable')),
+      },
+      candidates: 2,
+      maxDocChars: 1000,
+      failurePolicy: 'fallback',
+    }));
+    await fallbackBackend.init();
+
+    const result = await fallbackBackend.callTool('query', { search_query: 'needle' });
+
+    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual([
+      'a.ts',
+      'b.ts',
+    ]);
+    expect(result.warning).toMatch(/rerank unavailable.*existing bm25\/vector ranking/i);
+  });
+
+  it('propagates provider failure when policy is error', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      results: [
+        { filePath: 'src/a.ts', name: 'A', type: 'File' },
+        { filePath: 'src/b.ts', name: 'B', type: 'File' },
+      ],
+      ftsAvailable: true,
+    });
+    const strictBackend = new LocalBackend(() => ({
+      provider: {
+        id: 'failing-test',
+        rerank: vi.fn().mockRejectedValue(new Error('provider unavailable')),
+      },
+      candidates: 2,
+      maxDocChars: 1000,
+      failurePolicy: 'error',
+    }));
+    await strictBackend.init();
+
+    await expect(strictBackend.callTool('query', { search_query: 'needle' })).rejects.toThrow(
+      'provider unavailable',
+    );
   });
 
   it('checks cycles using only non-synthetic import edges', async () => {

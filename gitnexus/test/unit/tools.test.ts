@@ -111,6 +111,16 @@ describe('GITNEXUS_TOOLS', () => {
     expect(queryTool.inputSchema.properties.search_query.type).toBe('string');
   });
 
+  it('query advertises an optional provider-neutral rerank switch', () => {
+    const queryTool = GITNEXUS_TOOLS.find((t) => t.name === 'query')!;
+    expect(queryTool.inputSchema.properties.rerank).toMatchObject({
+      type: 'boolean',
+      default: true,
+    });
+    expect(queryTool.inputSchema.required).not.toContain('rerank');
+    expect(queryTool.inputSchema.properties.rerank.description).not.toMatch(/voyage|premium/i);
+  });
+
   it('cypher tool requires "statement" parameter (renamed from "query" for #2175)', () => {
     const cypherTool = GITNEXUS_TOOLS.find((t) => t.name === 'cypher')!;
     expect(cypherTool.inputSchema.required).toContain('statement');

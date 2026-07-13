@@ -63,6 +63,11 @@ import {
   isVectorExtensionSupportedByPlatform,
 } from '../../core/platform/capabilities.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
+import {
+  rerankDocuments,
+  type RerankRuntime,
+} from '../../core/rerank/provider.js';
+import { resolveRerankRuntime } from '../../core/rerank/voyage-provider.js';
 import { ftsDegradedWarning } from '../../core/search/fts-indexes.js';
 import {
   cjkSegmentationModeMismatch,
@@ -731,6 +736,11 @@ export class LocalBackend {
    * degradation is visible once instead of silent.
    */
   private warnedMissingEmbeddingStack = false;
+
+  constructor(
+    private readonly rerankRuntimeResolver: (repoName: string) => RerankRuntime | null =
+      resolveRerankRuntime,
+  ) {}
 
   /**
    * Cross-repo group tools (CLI). Shares logic with MCP `group_*` handlers.
@@ -1833,6 +1843,7 @@ export class LocalBackend {
       limit?: number;
       max_symbols?: number;
       include_content?: boolean;
+      rerank?: boolean;
     },
   ): Promise<any> {
     // #2175: each consumer resolves the search_query/query alias itself (there is no
@@ -1902,10 +1913,30 @@ export class LocalBackend {
       }
     }
 
-    const merged = Array.from(scoreMap.entries())
+    let merged = Array.from(scoreMap.entries())
       .sort((a, b) => b[1].score - a[1].score)
       .slice(0, searchLimit);
     timer.stop(); // merge
+
+    let rerankWarning: string | undefined;
+    if (params.rerank !== false) {
+      // Configuration errors are deliberate operator errors and stay fatal.
+      // Only an actual provider call follows the runtime's fallback/error policy.
+      const runtime = this.rerankRuntimeResolver(repo.name);
+      if (runtime) {
+        try {
+          merged = await timer.time(
+            'rerank',
+            this.rerankMergedCandidates(repo, searchQuery, merged, runtime),
+          );
+        } catch (error) {
+          if (runtime.failurePolicy === 'error') throw error;
+          rerankWarning =
+            'Rerank unavailable - using existing BM25/vector ranking. ' +
+            (error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
 
     // Step 2: For each match with a nodeId, trace to process(es)
     timer.start('symbol_lookup');
@@ -2228,6 +2259,7 @@ export class LocalBackend {
         'Symbol enrichment partially failed — some process/cohesion/content data may be missing from these results (see server logs).',
       );
     }
+    if (rerankWarning) warnings.push(rerankWarning);
 
     return {
       processes,
@@ -2237,6 +2269,89 @@ export class LocalBackend {
       ...(warnings.length > 0 && { warning: warnings.join(' ') }),
       ...(enrichmentDegraded && { partial: true }),
     };
+  }
+
+  private async rerankMergedCandidates(
+    repo: RepoHandle,
+    query: string,
+    merged: Array<[string, { score: number; data: any }]>,
+    runtime: RerankRuntime,
+  ): Promise<Array<[string, { score: number; data: any }]>> {
+    const candidateCount = Math.min(runtime.candidates, merged.length);
+    if (candidateCount <= 1) return merged;
+
+    const candidates = merged.slice(0, candidateCount);
+    const contents = new Map<string, string>();
+    const nodeIds = candidates
+      .map(([, item]) => item.data?.nodeId)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+
+    if (nodeIds.length > 0) {
+      try {
+        const rows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (n)
+          WHERE n.id IN $nodeIds
+          RETURN n.id AS nodeId, n.content AS content
+        `,
+          { nodeIds },
+        );
+        for (const row of rows) {
+          const nodeId = row.nodeId ?? row[0];
+          const content = row.content ?? row[1];
+          if (typeof nodeId === 'string' && typeof content === 'string' && content.trim()) {
+            contents.set(nodeId, content);
+          }
+        }
+      } catch (error) {
+        // Source content is enrichment, not a prerequisite: providers still get
+        // stable symbol identity and file metadata when the fetch is unavailable.
+        logQueryError('query:rerank-content-fetch', error);
+      }
+    }
+
+    const documents = candidates.map(([, item]) => {
+      const symbol = item.data ?? {};
+      const rawContent =
+        typeof symbol.nodeId === 'string' ? contents.get(symbol.nodeId) : undefined;
+      const content = rawContent?.slice(0, runtime.maxDocChars);
+      return [
+        `name: ${symbol.name ?? ''}`,
+        `type: ${symbol.type ?? 'Unknown'}`,
+        `file: ${symbol.filePath ?? ''}`,
+        symbol.startLine || symbol.endLine
+          ? `lines: ${symbol.startLine ?? '?'}-${symbol.endLine ?? '?'}`
+          : '',
+        content ? `content:\n${content}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    });
+
+    const ranked = await rerankDocuments(runtime.provider, { query, documents });
+    if (ranked.length === 0) return merged;
+
+    const used = new Set<number>();
+    const reordered: Array<[string, { score: number; data: any }]> = [];
+    for (let rank = 0; rank < ranked.length; rank++) {
+      const result = ranked[rank]!;
+      const candidate = candidates[result.index]!;
+      used.add(result.index);
+      reordered.push([
+        candidate[0],
+        {
+          ...candidate[1],
+          // Keep provider-ranked candidates above the RRF score band so the
+          // existing downstream process aggregation observes the same order.
+          score: 1 + Math.max(0, result.score) + (candidateCount - rank) / (candidateCount * 1000),
+        },
+      ]);
+    }
+    for (let index = 0; index < candidates.length; index++) {
+      if (!used.has(index)) reordered.push(candidates[index]!);
+    }
+    return [...reordered, ...merged.slice(candidateCount)];
   }
 
   /**
