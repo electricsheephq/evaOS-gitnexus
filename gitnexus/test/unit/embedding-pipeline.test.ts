@@ -709,6 +709,101 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(resumedIds).toEqual([second.id]);
   });
 
+  it('re-embeds a pending-window node even when its persisted content hash matches', async () => {
+    mockEmbedderSetup();
+    const node = makeNode({
+      id: 'Function:pending:src/pending.ts',
+      name: 'pending',
+      filePath: 'src/pending.ts',
+    });
+    const currentHash = contentHashForNode(node, DEFAULT_EMBEDDING_CONFIG);
+    const executeQuery = mockExecuteQuery([node]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      {},
+      undefined,
+      new Map([[node.id, currentHash]]),
+      { forceReembedNodeIds: new Set([node.id]) },
+    );
+
+    const deletedIds = stmtCalls
+      .filter((call) => call.cypher.includes('DELETE'))
+      .flatMap((call) => call.params.map((param) => param.nodeId));
+    const insertedIds = stmtCalls
+      .filter((call) => call.cypher.includes('CREATE'))
+      .flatMap((call) => call.params.map((param) => param.nodeId));
+    expect(deletedIds).toContain(node.id);
+    expect(insertedIds).toContain(node.id);
+  });
+
+  it('announces each checkpoint window before mutating any node in that window', async () => {
+    mockEmbedderSetup();
+    const first = makeNode({ id: 'Function:first:src/first.ts', name: 'first' });
+    const second = makeNode({ id: 'Function:second:src/second.ts', name: 'second' });
+    const third = makeNode({ id: 'Function:third:src/third.ts', name: 'third' });
+    const executeQuery = mockExecuteQuery([first, second, third]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+    const windows: string[][] = [];
+    const mutationCountsAtWindowStart: number[] = [];
+    const checkpoints: number[] = [];
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      { batchSize: 1 },
+      undefined,
+      new Map(),
+      {
+        checkpointEveryNodes: 2,
+        onCheckpointWindowStart: async ({ nodeIds }) => {
+          windows.push(nodeIds);
+          mutationCountsAtWindowStart.push(stmtCalls.length);
+        },
+        onCheckpoint: async ({ nodesProcessed }) => {
+          checkpoints.push(nodesProcessed);
+        },
+      },
+    );
+
+    expect(windows).toEqual([[first.id, second.id], [third.id]]);
+    expect(mutationCountsAtWindowStart).toEqual([0, 2]);
+    expect(checkpoints).toEqual([2, 3]);
+  });
+
+  it('deletes pending-window rows whose node is no longer embeddable', async () => {
+    mockEmbedderSetup();
+    const live = makeNode({ id: 'Function:live:src/live.ts', name: 'live' });
+    const removedNodeId = 'Function:removed:src/removed.ts';
+    const executeQuery = mockExecuteQuery([live]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      {},
+      undefined,
+      new Map([[removedNodeId, 'persisted-partial-hash']]),
+      { forceReembedNodeIds: new Set([removedNodeId]) },
+    );
+
+    const deletedIds = stmtCalls
+      .filter((call) => call.cypher.includes('DELETE'))
+      .flatMap((call) => call.params.map((param) => param.nodeId));
+    expect(deletedIds).toContain(removedNodeId);
+  });
+
   it('deletes only stale nodes — new and unchanged nodes are never deleted (#2333 U6)', async () => {
     mockEmbedderSetup();
 

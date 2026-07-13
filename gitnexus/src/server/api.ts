@@ -17,6 +17,7 @@ import {
   canonicalizePath,
   cloneDirBelongsToEntry,
   loadMeta,
+  saveMeta,
   listRegisteredRepos,
   getStoragePath,
   registryPathEquals,
@@ -1784,7 +1785,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         const embedTimeout = setTimeout(() => {
           const current = embedJobManager.getJob(job.id);
           if (current && current.status !== 'complete' && current.status !== 'failed') {
-            releaseRepoLock(repoLockPath);
             embedJobManager.cancelJob(job.id, 'Embedding timed out (30 minute limit)');
           }
         }, EMBED_TIMEOUT_MS);
@@ -1796,6 +1796,50 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             await withLbugDb(lbugPath, async () => {
               const { runEmbeddingPipeline } =
                 await import('../core/embeddings/embedding-pipeline.js');
+              const [{ getEmbeddingDimensions }, { resolveEmbeddingConfig }] = await Promise.all([
+                import('../core/embeddings/embedder.js'),
+                import('../core/embeddings/config.js'),
+              ]);
+              const embeddingIdentity = {
+                model: process.env.GITNEXUS_EMBEDDING_MODEL ?? resolveEmbeddingConfig().modelId,
+                dimensions: getEmbeddingDimensions(),
+              };
+              let embeddingMeta = await loadMeta(entry.storagePath);
+              if (!embeddingMeta) {
+                throw new Error('Repository metadata is missing; run gitnexus analyze first');
+              }
+              const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
+              if (
+                priorCheckpoint &&
+                (priorCheckpoint.model !== embeddingIdentity.model ||
+                  priorCheckpoint.dimensions !== embeddingIdentity.dimensions)
+              ) {
+                throw new Error(
+                  `Cannot resume embedding checkpoint: it uses ${priorCheckpoint.model} at ` +
+                    `${priorCheckpoint.dimensions} dimensions, but this run resolves ` +
+                    `${embeddingIdentity.model} at ${embeddingIdentity.dimensions}.`,
+                );
+              }
+              const forceReembedNodeIds = new Set(priorCheckpoint?.pendingNodeIds ?? []);
+              const saveEmbeddingCheckpoint = async (
+                checkpoint: {
+                  nodesProcessed: number;
+                  totalNodes: number;
+                  chunksProcessed: number;
+                },
+                pendingNodeIds: string[],
+              ): Promise<void> => {
+                embeddingMeta = {
+                  ...embeddingMeta,
+                  embeddingCheckpoint: {
+                    at: new Date().toISOString(),
+                    ...checkpoint,
+                    ...embeddingIdentity,
+                    pendingNodeIds,
+                  },
+                };
+                await saveMeta(entry.storagePath, embeddingMeta);
+              };
               // Fetch existing content hashes for incremental embedding.
               // Delegated to lbug-adapter which owns the DB query logic and legacy-fallback handling.
               const { fetchExistingEmbeddingHashes } = await import('../core/lbug/lbug-adapter.js');
@@ -1832,11 +1876,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 existingEmbeddings,
                 {
                   signal: embedController.signal,
-                  onCheckpoint: async () => {
-                    // Make each reported pipeline checkpoint durable before the
-                    // next batch starts. A cancelled/restarted job then resumes
-                    // from content hashes already present in LadybugDB.
+                  forceReembedNodeIds,
+                  onCheckpointWindowStart: async ({ nodeIds, ...checkpoint }) => {
+                    await saveEmbeddingCheckpoint(checkpoint, nodeIds);
+                  },
+                  onCheckpoint: async (checkpoint) => {
                     await flushWAL();
+                    await saveEmbeddingCheckpoint(checkpoint, []);
                   },
                 },
               );
@@ -1846,18 +1892,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               // handles this during process exit, but the server keeps the
               // connection open for other routes — a CHECKPOINT is enough.
               await flushWAL();
+              embeddingMeta = { ...embeddingMeta, embeddingCheckpoint: undefined };
+              await saveMeta(entry.storagePath, embeddingMeta);
             });
 
-            clearTimeout(embedTimeout);
-            releaseRepoLock(repoLockPath);
             // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
               embedJobManager.updateJob(job.id, { status: 'complete' });
             }
           } catch (err: any) {
-            clearTimeout(embedTimeout);
-            releaseRepoLock(repoLockPath);
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
               embedJobManager.updateJob(job.id, {
@@ -1865,6 +1909,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 error: err.message || 'Embedding generation failed',
               });
             }
+          } finally {
+            clearTimeout(embedTimeout);
+            releaseRepoLock(repoLockPath);
           }
         })();
 

@@ -200,10 +200,11 @@ export interface RepoMeta {
     droppedImporterChunks?: number;
   };
   /**
-   * Durable marker written after a completed embedding batch and LadybugDB
-   * checkpoint. The graph is valid, but embedding generation has not reached
-   * final metadata registration. A matching runtime resumes from persisted
-   * content hashes; a model or dimension mismatch fails before mutation.
+   * Durable embedding-resume marker. Before a bounded write window begins,
+   * `pendingNodeIds` records every node that could become partially persisted;
+   * after the LadybugDB checkpoint it is cleared while progress is retained.
+   * A matching runtime resumes from persisted hashes and regenerates pending
+   * nodes; a model or dimension mismatch fails before mutation.
    */
   embeddingCheckpoint?: {
     at: string;
@@ -212,6 +213,13 @@ export interface RepoMeta {
     chunksProcessed: number;
     model: string;
     dimensions: number;
+    /**
+     * Nodes in the current checkpoint window. Any of these may have only a
+     * subset of their chunks persisted after an abrupt process termination,
+     * so resume must delete and regenerate them even when a persisted row has
+     * the current content hash.
+     */
+    pendingNodeIds?: string[];
   };
   /**
    * Name of the git branch this index represents (#2106). Absent for the
