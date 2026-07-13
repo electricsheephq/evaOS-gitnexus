@@ -125,7 +125,7 @@ const commandLedger =
     ? JSON.parse(fs.readFileSync(commandLedgerPath, 'utf8'))
     : [];
 const embeddingStats = { requests: 0, items: 0 };
-const childSupervisor = new ChildSupervisor();
+const childSupervisor = new ChildSupervisor({ terminationEnv: baseEnv });
 
 const run = async (name, command, commandArgs, options = {}) => {
   const { stdoutPath, stderrPath, stdout, stderr } = openArtifactLogs(commandDir, name);
