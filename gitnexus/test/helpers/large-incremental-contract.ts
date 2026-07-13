@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const PORTABLE_ENV_KEYS = [
   'PATH',
@@ -26,6 +28,91 @@ export type RecoveryBoundary = (typeof RECOVERY_BOUNDARY_CASES)[number][0];
 export const ALL_RECOVERY_BOUNDARIES: readonly RecoveryBoundary[] = RECOVERY_BOUNDARY_CASES.map(
   ([boundary]) => boundary,
 );
+
+export function setupDisposableRoot<T>(prefix: string, setup: (root: string) => T): T {
+  const root = fs.mkdtempSync(prefix);
+  try {
+    return setup(root);
+  } catch (error) {
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    throw error;
+  }
+}
+
+type RegularTreeEntry = { relativePath: string; directory: boolean; mode: number };
+
+const collectRegularTree = (sourceRoot: string): RegularTreeEntry[] => {
+  const rootStat = fs.lstatSync(sourceRoot);
+  if (rootStat.isSymbolicLink()) {
+    throw new Error(`regular file tree source is a symbolic link: ${sourceRoot}`);
+  }
+  if (!rootStat.isDirectory()) {
+    throw new Error(`regular file tree source is not a directory: ${sourceRoot}`);
+  }
+
+  const entries: RegularTreeEntry[] = [];
+  const visit = (directory: string, relativeDirectory: string): void => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const sourcePath = path.join(directory, name);
+      const relativePath = path.join(relativeDirectory, name);
+      const stat = fs.lstatSync(sourcePath);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`regular file tree contains a symbolic link: ${sourcePath}`);
+      }
+      if (stat.isDirectory()) {
+        entries.push({ relativePath, directory: true, mode: stat.mode });
+        visit(sourcePath, relativePath);
+      } else if (stat.isFile()) {
+        entries.push({ relativePath, directory: false, mode: stat.mode });
+      } else {
+        throw new Error(`regular file tree contains a non-regular entry: ${sourcePath}`);
+      }
+    }
+  };
+  visit(sourceRoot, '');
+  return entries;
+};
+
+const assertContainedRealPath = (root: string, candidate: string): void => {
+  const realRoot = fs.realpathSync.native(root);
+  const realCandidate = fs.realpathSync.native(candidate);
+  if (realCandidate !== realRoot && !realCandidate.startsWith(`${realRoot}${path.sep}`)) {
+    throw new Error(`staged path escaped its destination root: ${candidate}`);
+  }
+};
+
+export function stageRegularFileTree(sourceRoot: string, destinationRoot: string): void {
+  if (fs.existsSync(destinationRoot)) {
+    throw new Error(`regular file tree destination already exists: ${destinationRoot}`);
+  }
+  const entries = collectRegularTree(sourceRoot);
+  try {
+    fs.mkdirSync(destinationRoot, { recursive: true, mode: 0o700 });
+    assertContainedRealPath(destinationRoot, destinationRoot);
+    for (const entry of entries) {
+      const sourcePath = path.join(sourceRoot, entry.relativePath);
+      const destinationPath = path.join(destinationRoot, entry.relativePath);
+      if (entry.directory) {
+        fs.mkdirSync(destinationPath, { mode: entry.mode & 0o777 });
+      } else {
+        const sourceStat = fs.lstatSync(sourcePath);
+        if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+          throw new Error(`regular file changed type during staging: ${sourcePath}`);
+        }
+        fs.mkdirSync(path.dirname(destinationPath), { recursive: true, mode: 0o700 });
+        fs.copyFileSync(sourcePath, destinationPath, fs.constants.COPYFILE_EXCL);
+        fs.chmodSync(destinationPath, entry.mode & 0o777);
+        if (!fs.lstatSync(destinationPath).isFile()) {
+          throw new Error(`staged extension is not a regular file: ${destinationPath}`);
+        }
+      }
+      assertContainedRealPath(destinationRoot, destinationPath);
+    }
+  } catch (error) {
+    fs.rmSync(destinationRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    throw error;
+  }
+}
 
 export function createHermeticProcessEnv(
   source: NodeJS.ProcessEnv,

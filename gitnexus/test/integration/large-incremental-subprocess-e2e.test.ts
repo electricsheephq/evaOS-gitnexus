@@ -14,7 +14,9 @@ import {
 import {
   createHermeticProcessEnv,
   RECOVERY_BOUNDARY_CASES,
+  setupDisposableRoot,
   selectRecoveryBoundaries,
+  stageRegularFileTree,
   startReadyProcess,
   terminateChild,
 } from '../helpers/large-incremental-contract.js';
@@ -92,31 +94,30 @@ const setupLargeRepo = (): { root: string; repoPath: string; gitnexusHome: strin
       `large incremental test requires preinstalled extensions: ${installedExtensions}`,
     );
   }
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-large-incremental-'));
-  const repoPath = path.join(root, 'repo');
-  const gitnexusHome = path.join(root, 'home');
-  const src = path.join(repoPath, 'src');
-  fs.mkdirSync(src, { recursive: true });
-  fs.mkdirSync(gitnexusHome, { recursive: true });
-  fs.cpSync(installedExtensions, path.join(gitnexusHome, '.lbdb', 'extension'), {
-    recursive: true,
-  });
+  return setupDisposableRoot(path.join(os.tmpdir(), 'gitnexus-large-incremental-'), (root) => {
+    const repoPath = path.join(root, 'repo');
+    const gitnexusHome = path.join(root, 'home');
+    const src = path.join(repoPath, 'src');
+    fs.mkdirSync(src, { recursive: true });
+    fs.mkdirSync(gitnexusHome, { recursive: true });
+    stageRegularFileTree(installedExtensions, path.join(gitnexusHome, '.lbdb', 'extension'));
 
-  fs.writeFileSync(
-    path.join(src, 'hub.ts'),
-    'export function hubValue(value: number): number {\n  return value + 1;\n}\n',
-  );
-  for (let index = 0; index < 60; index++) {
-    const suffix = String(index).padStart(3, '0');
     fs.writeFileSync(
-      path.join(src, `spoke-${suffix}.ts`),
-      `import { hubValue } from './hub';\n\nexport function spoke${index}(): number {\n  return hubValue(${index});\n}\n`,
+      path.join(src, 'hub.ts'),
+      'export function hubValue(value: number): number {\n  return value + 1;\n}\n',
     );
-  }
+    for (let index = 0; index < 60; index++) {
+      const suffix = String(index).padStart(3, '0');
+      fs.writeFileSync(
+        path.join(src, `spoke-${suffix}.ts`),
+        `import { hubValue } from './hub';\n\nexport function spoke${index}(): number {\n  return hubValue(${index});\n}\n`,
+      );
+    }
 
-  expect(spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: repoPath }).status).toBe(0);
-  commitAll(repoPath, 'initial large fixture');
-  return { root, repoPath, gitnexusHome };
+    expect(spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: repoPath }).status).toBe(0);
+    commitAll(repoPath, 'initial large fixture');
+    return { root, repoPath, gitnexusHome };
+  });
 };
 
 const parseHarnessResult = (stdout: string): HarnessResult => {

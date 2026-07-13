@@ -7,7 +7,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   ALL_RECOVERY_BOUNDARIES,
   createHermeticProcessEnv,
+  setupDisposableRoot,
   selectRecoveryBoundaries,
+  stageRegularFileTree,
   startReadyProcess,
   terminateChild,
 } from '../helpers/large-incremental-contract.js';
@@ -109,6 +111,55 @@ describe('large incremental subprocess isolation', () => {
       expect(() => process.kill(pid, 0)).toThrow();
     },
   );
+
+  it.skipIf(process.platform === 'win32')(
+    'rejects extension symlinks before creating the isolated destination',
+    () => {
+      const root = makeTemporaryRoot();
+      const source = path.join(root, 'source');
+      const destination = path.join(root, 'destination');
+      const outside = path.join(root, 'outside.bin');
+      fs.mkdirSync(path.join(source, '0.18.0', 'osx_arm64', 'fts'), { recursive: true });
+      fs.writeFileSync(outside, 'outside\n');
+      fs.symlinkSync(
+        outside,
+        path.join(source, '0.18.0', 'osx_arm64', 'fts', 'libfts.lbug_extension'),
+      );
+
+      expect(() => stageRegularFileTree(source, destination)).toThrow('symbolic link');
+      expect(fs.existsSync(destination)).toBe(false);
+    },
+  );
+
+  it('copies only validated regular extension files', () => {
+    const root = makeTemporaryRoot();
+    const source = path.join(root, 'source');
+    const destination = path.join(root, 'destination');
+    const relative = path.join('0.18.0', 'platform', 'fts', 'libfts.lbug_extension');
+    fs.mkdirSync(path.dirname(path.join(source, relative)), { recursive: true });
+    fs.writeFileSync(path.join(source, relative), 'extension-bytes\n');
+
+    stageRegularFileTree(source, destination);
+
+    expect(fs.readFileSync(path.join(destination, relative), 'utf8')).toBe('extension-bytes\n');
+    expect(fs.lstatSync(path.join(destination, relative)).isFile()).toBe(true);
+  });
+
+  it('removes an allocated disposable root when setup fails', () => {
+    const parent = makeTemporaryRoot();
+    let allocated = '';
+
+    expect(() =>
+      setupDisposableRoot(path.join(parent, 'fixture-'), (root) => {
+        allocated = root;
+        fs.writeFileSync(path.join(root, 'partial.txt'), 'partial\n');
+        throw new Error('injected setup failure');
+      }),
+    ).toThrow('injected setup failure');
+
+    expect(allocated).not.toBe('');
+    expect(fs.existsSync(allocated)).toBe(false);
+  });
 });
 
 describe('large incremental recovery boundary selection', () => {
