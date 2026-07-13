@@ -319,16 +319,34 @@ describe('runFullAnalysis — incremental orchestration', () => {
       await writeFile(hub, (await readFile(hub, 'utf-8')) + '// escalation touch\n', 'utf-8');
 
       const logs: string[] = [];
+      const recoveryBoundaries: Array<{
+        boundary: string;
+        details: Readonly<Record<string, unknown>>;
+      }> = [];
       const incremental = await runFullAnalysis(
         repo.dbPath,
         { skipAgentsMd: true },
-        { onProgress: () => {}, onLog: (m) => logs.push(m) },
+        {
+          onProgress: () => {},
+          onLog: (m) => logs.push(m),
+          onRecoveryBoundary: (boundary, details) => recoveryBoundaries.push({ boundary, details }),
+        },
       );
       expect(incremental.alreadyUpToDate).toBeUndefined();
       const joined = logs.join('\n');
       // The importer expansion fired AND the valve rerouted the write plan.
       expect(joined).toContain('importer(s) added to writable set');
       expect(joined).toContain('switching to a full DB write');
+      expect(recoveryBoundaries.map(({ boundary }) => boundary)).toEqual([
+        'before-delete',
+        'during-delete',
+        'during-insert',
+        'before-finalize',
+      ]);
+      expect(recoveryBoundaries[0]?.details.phase).toBe('escalated-full-write');
+      expect(recoveryBoundaries[1]?.details.phase).toBe('escalated-full-write');
+      expect(recoveryBoundaries[2]?.details.phase).toBe('escalated-load-graph');
+      expect(recoveryBoundaries[3]?.details.phase).toBe('escalated-load-graph');
 
       const { storagePath } = getStoragePaths(repo.dbPath);
       const escalatedMeta = await loadMeta(storagePath);

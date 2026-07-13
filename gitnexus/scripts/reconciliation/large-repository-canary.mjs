@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -8,6 +7,15 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { createSanitizedEnvironment } from './canary-environment.mjs';
+import {
+  ChildSupervisor,
+  createSafeContainedDirectory,
+  openArtifactLogs,
+  prepareEvidenceLayout,
+  selectSafeTrackedFiles,
+  writeJsonArtifact,
+  writeJsonAtomic,
+} from './canary-safety.mjs';
 
 const REQUIRED_ARGS = [
   'source',
@@ -77,9 +85,7 @@ for (const requiredPath of [source, cli, incrementalChild, extensionSource]) {
   if (!fs.existsSync(requiredPath))
     throw new Error(`required path does not exist: ${requiredPath}`);
 }
-fs.mkdirSync(commandDir, { recursive: true });
-fs.mkdirSync(snapshotDir, { recursive: true });
-fs.mkdirSync(home, { recursive: true });
+prepareEvidenceLayout({ evidence, commandDir, snapshotDir, home });
 if (resumeFrom && fs.existsSync(failurePath)) {
   let archiveIndex = 1;
   let archivedFailurePath;
@@ -94,9 +100,7 @@ if (resumeFrom && fs.existsSync(failurePath)) {
 }
 fs.cpSync(extensionSource, path.join(home, '.lbdb', 'extension'), { recursive: true });
 
-const writeJson = (filePath, value) => {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-};
+const writeJson = writeJsonAtomic;
 
 const extensionFiles = [];
 const collectExtensionFiles = (dir) => {
@@ -121,26 +125,31 @@ const commandLedger =
     ? JSON.parse(fs.readFileSync(commandLedgerPath, 'utf8'))
     : [];
 const embeddingStats = { requests: 0, items: 0 };
+const childSupervisor = new ChildSupervisor();
 
 const run = async (name, command, commandArgs, options = {}) => {
-  const stdoutPath = path.join(commandDir, `${name}.stdout.log`);
-  const stderrPath = path.join(commandDir, `${name}.stderr.log`);
-  const stdout = fs.openSync(stdoutPath, 'w');
-  const stderr = fs.openSync(stderrPath, 'w');
+  const { stdoutPath, stderrPath, stdout, stderr } = openArtifactLogs(commandDir, name);
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   process.stdout.write(`[${runId}] ${name}\n`);
-  const child = spawn(command, commandArgs, {
+  const child = childSupervisor.spawn(command, commandArgs, {
     cwd: options.cwd ?? worktree,
     env: options.env ?? baseEnv,
     stdio: ['ignore', stdout, stderr],
   });
-  const result = await new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', (code, signal) => resolve({ code, signal }));
-  });
-  fs.closeSync(stdout);
-  fs.closeSync(stderr);
+  let childError;
+  let result = { code: null, signal: null };
+  try {
+    result = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    });
+  } catch (error) {
+    childError = error;
+  } finally {
+    fs.closeSync(stdout);
+    fs.closeSync(stderr);
+  }
   const entry = {
     name,
     command,
@@ -151,11 +160,13 @@ const run = async (name, command, commandArgs, options = {}) => {
     durationMs: Date.now() - startedMs,
     code: result.code,
     signal: result.signal,
+    error: childError instanceof Error ? childError.message : undefined,
     stdout: path.basename(stdoutPath),
     stderr: path.basename(stderrPath),
   };
   commandLedger.push(entry);
   writeJson(path.join(evidence, 'command-ledger.json'), commandLedger);
+  if (childError) throw childError;
   if (!options.allowFailure && (result.code !== 0 || result.signal !== null)) {
     throw new Error(`${name} failed with code=${result.code} signal=${result.signal}`);
   }
@@ -164,7 +175,7 @@ const run = async (name, command, commandArgs, options = {}) => {
 
 const runText = async (name, command, commandArgs, options = {}) => {
   const chunks = [];
-  const child = spawn(command, commandArgs, {
+  const child = childSupervisor.spawn(command, commandArgs, {
     cwd: options.cwd ?? worktree,
     env: options.env ?? baseEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -230,6 +241,7 @@ await new Promise((resolve, reject) => {
 });
 const address = embeddingServer.address();
 if (!address || typeof address === 'string') throw new Error('embedding server has no TCP address');
+childSupervisor.installSignalHandlers(process, () => embeddingServer.close());
 
 const canaryEnv = {
   ...baseEnv,
@@ -413,16 +425,22 @@ const snapshot = async (name, { fingerprint = false } = {}) => {
     index: { path: storagePath, sizeKb: indexKb, files },
     disk: disk.split(/\r?\n/).slice(-1)[0],
   };
-  writeJson(path.join(snapshotDir, `${name}.json`), result);
+  const snapshotPath = writeJsonArtifact(snapshotDir, name, result);
+  result.artifact = path.basename(snapshotPath);
   return result;
 };
 
 const waitForPauseAndTerminate = async (child, readyFile, timeoutMs) => {
   const deadline = Date.now() + timeoutMs;
+  let childError;
+  child.once('error', (error) => {
+    childError = error;
+  });
   while (Date.now() < deadline) {
+    if (childError) throw childError;
     if (fs.existsSync(readyFile)) {
       const dirty = JSON.parse(fs.readFileSync(readyFile, 'utf8'));
-      child.kill('SIGTERM');
+      childSupervisor.terminate(child, 'SIGTERM');
       const result = await new Promise((resolve) => {
         child.once('close', (code, signal) => resolve({ code, signal }));
       });
@@ -433,21 +451,18 @@ const waitForPauseAndTerminate = async (child, readyFile, timeoutMs) => {
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  child.kill('SIGKILL');
+  childSupervisor.terminate(child, 'SIGKILL');
   await new Promise((resolve) => child.once('close', resolve));
   throw new Error('timed out waiting for the escalation pause point');
 };
 
-const interruptAtEscalation = async () => {
-  const name = 'wide-interrupted';
-  const readyFile = path.join(evidence, 'pause-ready.json');
+const interruptAtRecoveryBoundary = async (boundary) => {
+  const name = `wide-interrupted-${boundary}`;
+  const readyFile = path.join(evidence, `pause-ready-${boundary}.json`);
   if (fs.existsSync(readyFile)) {
     throw new Error(`refusing stale escalation ready file: ${readyFile}`);
   }
-  const stdoutPath = path.join(commandDir, `${name}.stdout.log`);
-  const stderrPath = path.join(commandDir, `${name}.stderr.log`);
-  const stdout = fs.openSync(stdoutPath, 'w');
-  const stderr = fs.openSync(stderrPath, 'w');
+  const { stdoutPath, stderrPath, stdout, stderr } = openArtifactLogs(commandDir, name);
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   process.stdout.write(`[${runId}] ${name}\n`);
@@ -455,10 +470,12 @@ const interruptAtEscalation = async () => {
     incrementalChild,
     worktree,
     '--embeddings',
-    '--pause-on-escalation',
+    '--pause-at',
+    boundary,
+    '--pause-ready',
     readyFile,
   ];
-  const child = spawn(process.execPath, childArgs, {
+  const child = childSupervisor.spawn(process.execPath, childArgs, {
     cwd: packageRoot,
     env: canaryEnv,
     stdio: ['ignore', stdout, stderr],
@@ -488,7 +505,9 @@ const interruptAtEscalation = async () => {
   commandLedger.push(entry);
   writeJson(path.join(evidence, 'command-ledger.json'), commandLedger);
   if (result.code === 0 || result.signal !== 'SIGTERM') {
-    throw new Error(`interrupted child did not fail by SIGTERM: ${JSON.stringify(result)}`);
+    throw new Error(
+      `child interrupted at ${boundary} did not fail by SIGTERM: ${JSON.stringify(result)}`,
+    );
   }
   return entry;
 };
@@ -606,11 +625,11 @@ try {
     const repeated = await snapshot('forced-repeat', { fingerprint: true });
     assertSnapshot(repeated, wideHead);
     const comparison = compareSnapshots(preflight, repeated);
-    writeJson(path.join(evidence, 'forced-repeat-comparison.json'), comparison);
+    writeJsonArtifact(evidence, 'forced-repeat-comparison', comparison);
     if (!comparison.equal) {
       throw new Error('consecutive forced rebuilds produced different graph fingerprints');
     }
-    writeJson(path.join(evidence, 'forced-repeat-summary.json'), {
+    writeJsonArtifact(evidence, 'forced-repeat-summary', {
       runId,
       result: 'passed',
       sourceSha,
@@ -683,8 +702,7 @@ try {
         },
       );
 
-      const fixtureRoot = path.join(worktree, 'src/r19-canary');
-      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const fixtureRoot = createSafeContainedDirectory(worktree, 'src/r19-canary');
       fs.writeFileSync(
         path.join(fixtureRoot, 'hub.ts'),
         'export function r19CanaryHub(value: number): number {\n  return value + 19;\n}\n',
@@ -756,12 +774,10 @@ try {
         },
       );
 
-      const tracked = (await runText('tracked-typescript', 'git', ['ls-files', '*.ts']))
-        .split(/\r?\n/)
-        .filter((file) => file && !file.startsWith('src/r19-canary/'))
-        .map((file) => ({ file, bytes: fs.statSync(path.join(worktree, file)).size }))
-        .sort((left, right) => left.bytes - right.bytes || left.file.localeCompare(right.file))
-        .slice(0, 51);
+      const trackedFiles = (await runText('tracked-typescript', 'git', ['ls-files', '-z', '*.ts']))
+        .split('\0')
+        .filter((file) => file && !file.startsWith('src/r19-canary/'));
+      const tracked = selectSafeTrackedFiles(worktree, trackedFiles, 51);
       if (tracked.length !== 51)
         throw new Error(`expected 51 TypeScript files, found ${tracked.length}`);
       tracked.forEach(({ file }, index) => {
@@ -772,8 +788,11 @@ try {
       wideHead = await runText('wide-head', 'git', ['rev-parse', 'HEAD']);
     }
 
-    const interrupted = await interruptAtEscalation();
-    if (interrupted.dirty?.dirty?.phase !== 'effective-write-set') {
+    const interrupted = await interruptAtRecoveryBoundary('during-delete');
+    if (interrupted.dirty?.boundary !== 'during-delete') {
+      throw new Error(`unexpected recovery boundary: ${JSON.stringify(interrupted.dirty)}`);
+    }
+    if (interrupted.dirty?.dirty?.phase !== 'escalated-full-write') {
       throw new Error(`unexpected dirty phase: ${JSON.stringify(interrupted.dirty)}`);
     }
     if (Number(interrupted.dirty?.dirty?.effectiveWriteCount ?? 0) < 50) {
@@ -802,7 +821,7 @@ try {
     const forced = await snapshot('forced', { fingerprint: true });
     assertSnapshot(forced, wideHead);
     const recoveredForcedComparison = compareSnapshots(recovered, forced);
-    writeJson(path.join(evidence, 'recovered-forced-comparison.json'), recoveredForcedComparison);
+    writeJsonArtifact(evidence, 'recovered-forced-comparison', recoveredForcedComparison);
     if (!recoveredForcedComparison.equal) {
       throw new Error('recovered and forced graphs produced different fingerprints');
     }
@@ -849,7 +868,8 @@ try {
   process.stderr.write(
     `${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
   );
-  process.exitCode = 1;
+  if (!process.exitCode) process.exitCode = 1;
 } finally {
+  childSupervisor.disposeSignalHandlers();
   await new Promise((resolve) => embeddingServer.close(resolve));
 }

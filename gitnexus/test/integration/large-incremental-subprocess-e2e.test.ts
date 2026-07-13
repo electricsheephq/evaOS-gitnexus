@@ -206,53 +206,77 @@ describe('large incremental analysis subprocess contract', () => {
       );
       commitAll(fixture.repoPath, 'exercise incremental write set');
 
-      const readyFile = path.join(fixture.root, 'pause-ready.json');
-      const interrupted = spawn(
-        process.execPath,
-        [childRunner, fixture.repoPath, '--pause-on-escalation', readyFile],
-        {
-          env: childEnv(fixture.gitnexusHome),
-          stdio: ['ignore', 'pipe', 'pipe'],
-        },
-      );
-      await waitForFile(readyFile, interrupted);
-      const pauseState = JSON.parse(fs.readFileSync(readyFile, 'utf8')) as {
-        message: string;
-        dirty: { phase?: string; effectiveWriteCount?: number; deleteCount?: number };
-      };
-      expect(pauseState.message).toContain('switching to a full DB write');
-      expect(pauseState.dirty.phase).toBe('effective-write-set');
-      expect(pauseState.dirty.effectiveWriteCount).toBeGreaterThanOrEqual(50);
-      expect(pauseState.dirty.deleteCount).toBeGreaterThanOrEqual(50);
+      const boundaries = [
+        ['before-delete', 'escalated-full-write'],
+        ['during-delete', 'escalated-full-write'],
+        ['during-insert', 'escalated-load-graph'],
+        ['before-finalize', 'escalated-load-graph'],
+      ] as const;
+      let recovered: HarnessResult | undefined;
+      for (const [index, [boundary, expectedDirtyPhase]] of boundaries.entries()) {
+        if (index > 0) {
+          fs.appendFileSync(path.join(src, 'hub.ts'), `\n// ${boundary} interruption\n`);
+          commitAll(fixture.repoPath, `prepare ${boundary} interruption`);
+        }
+        const readyFile = path.join(fixture.root, `pause-ready-${boundary}.json`);
+        const interrupted = spawn(
+          process.execPath,
+          [childRunner, fixture.repoPath, '--pause-at', boundary, '--pause-ready', readyFile],
+          {
+            env: childEnv(fixture.gitnexusHome),
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        );
+        await waitForFile(readyFile, interrupted);
+        const pauseState = JSON.parse(fs.readFileSync(readyFile, 'utf8')) as {
+          boundary: string;
+          details: { phase?: string; removedPath?: string; table?: string };
+          dirty: { phase?: string; effectiveWriteCount?: number; deleteCount?: number };
+        };
+        expect(pauseState.boundary).toBe(boundary);
+        expect(pauseState.details.phase).toBe(expectedDirtyPhase);
+        expect(pauseState.dirty.phase).toBe(expectedDirtyPhase);
+        expect(pauseState.dirty.effectiveWriteCount).toBeGreaterThanOrEqual(50);
+        expect(pauseState.dirty.deleteCount).toBeGreaterThanOrEqual(50);
+        if (boundary === 'during-delete') {
+          expect(pauseState.details.removedPath).toMatch(/lbug$/);
+        }
+        if (boundary === 'during-insert') {
+          expect(pauseState.details.table).toBeTruthy();
+        }
 
-      const stopped = await stopChild(interrupted);
-      expect(stopped.code).not.toBe(0);
-      expect(stopped.signal).toBe('SIGTERM');
-      const dirtyMeta = await loadMeta(storagePath);
-      expect(dirtyMeta?.incrementalInProgress).toBeDefined();
+        const stopped = await stopChild(interrupted);
+        expect(stopped.code).not.toBe(0);
+        expect(stopped.signal).toBe('SIGTERM');
+        const dirtyMeta = await loadMeta(storagePath);
+        expect(dirtyMeta?.incrementalInProgress?.phase).toBe(expectedDirtyPhase);
 
-      const recovered = runChild(fixture.repoPath, fixture.gitnexusHome, [
-        '--fts-query',
-        'r09FtsNeedle',
-      ]);
-      expect(recovered.logs.join('\n')).toContain(
-        'Previous analyze run did not complete cleanly (incrementalInProgress flag set)',
-      );
+        recovered = runChild(fixture.repoPath, fixture.gitnexusHome, [
+          '--fts-query',
+          'r09FtsNeedle',
+        ]);
+        expect(recovered.logs.join('\n')).toContain(
+          'Previous analyze run did not complete cleanly (incrementalInProgress flag set)',
+        );
+        expect((await loadMeta(storagePath))?.incrementalInProgress).toBeUndefined();
+      }
+      if (!recovered) throw new Error('recovery matrix produced no successful run');
+      const finalRecovered = recovered;
       const recoveredMeta = await loadMeta(storagePath);
       expect(recoveredMeta?.incrementalInProgress).toBeUndefined();
-      expect(recovered.stats.files).toBe(61);
-      expect(recovered.stats.nodes).toBeGreaterThan(61);
-      expect(recovered.capabilities).toHaveProperty('fts');
-      expect(recovered.capabilities).toHaveProperty('vectorSearch');
-      expect(Array.isArray(recovered.sidecars)).toBe(true);
-      expect(recovered.ftsSearch?.ftsAvailable).toBe(true);
-      expect(recovered.ftsSearch?.results.map((result) => result.filePath)).toContain(
+      expect(finalRecovered.stats.files).toBe(61);
+      expect(finalRecovered.stats.nodes).toBeGreaterThan(61);
+      expect(finalRecovered.capabilities).toHaveProperty('fts');
+      expect(finalRecovered.capabilities).toHaveProperty('vectorSearch');
+      expect(Array.isArray(finalRecovered.sidecars)).toBe(true);
+      expect(finalRecovered.ftsSearch?.ftsAvailable).toBe(true);
+      expect(finalRecovered.ftsSearch?.results.map((result) => result.filePath)).toContain(
         'src/added.ts',
       );
 
       const survivingEmbeddingIds = await readEmbeddingNodeIds(fixture.repoPath);
       expect(survivingEmbeddingIds.length).toBeGreaterThanOrEqual(4);
-      expect(recovered.stats.embeddings).toBe(survivingEmbeddingIds.length);
+      expect(finalRecovered.stats.embeddings).toBe(survivingEmbeddingIds.length);
       expect(survivingEmbeddingIds).not.toContain(seeded.get('src/spoke-001.ts')?.[0]);
       expect(survivingEmbeddingIds).not.toContain(seeded.get('src/spoke-002.ts')?.[0]);
       expect(await readEmbeddingDimensions(fixture.repoPath)).toEqual([384]);
@@ -262,11 +286,11 @@ describe('large incremental analysis subprocess contract', () => {
         '--fts-query',
         'r09FtsNeedle',
       ]);
-      expect(forced.stats).toEqual(recovered.stats);
-      expect(forced.ftsSearch).toEqual(recovered.ftsSearch);
+      expect(forced.stats).toEqual(finalRecovered.stats);
+      expect(forced.ftsSearch).toEqual(finalRecovered.ftsSearch);
       expect(await readEmbeddingNodeIds(fixture.repoPath)).toEqual(survivingEmbeddingIds);
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
-  }, 600_000);
+  }, 1_800_000);
 });
