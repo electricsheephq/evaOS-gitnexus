@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  ChildSupervisor,
   createSafeContainedDirectory,
   openArtifactLogs,
   selectSafeTrackedFiles,
@@ -29,6 +30,61 @@ afterEach(() => {
 });
 
 describe('reconciliation canary filesystem safety', () => {
+  it.skipIf(process.platform === 'win32')(
+    'refuses a symlinked command ledger before reading resume evidence',
+    () => {
+      const root = makeTemporaryRoot();
+      const source = path.join(root, 'source');
+      const evidence = path.join(root, 'evidence');
+      const extensionSource = path.join(root, 'extension');
+      const fakeCli = path.join(root, 'fake-cli.mjs');
+      const victim = path.join(root, 'private-ledger.json');
+      const worktree = path.join(root, 'worktree');
+
+      fs.mkdirSync(source);
+      fs.mkdirSync(evidence);
+      fs.mkdirSync(extensionSource);
+      fs.mkdirSync(worktree);
+      fs.writeFileSync(path.join(source, 'README.md'), 'fixture\n');
+      fs.writeFileSync(path.join(extensionSource, 'extension.bin'), 'fixture\n');
+      fs.writeFileSync(fakeCli, 'process.exit(1);\n');
+      fs.writeFileSync(victim, '[{"private":"preserve-me"}]\n');
+      fs.symlinkSync(victim, path.join(evidence, 'command-ledger.json'));
+
+      const result = spawnSync(
+        process.execPath,
+        [
+          'scripts/reconciliation/large-repository-canary.mjs',
+          '--source',
+          source,
+          '--source-sha',
+          '0123456789abcdef0123456789abcdef01234567',
+          '--public-origin',
+          'https://example.invalid/repository.git',
+          '--worktree',
+          worktree,
+          '--evidence',
+          evidence,
+          '--gitnexus-cli',
+          fakeCli,
+          '--incremental-child',
+          fakeCli,
+          '--extension-source',
+          extensionSource,
+          '--run-id',
+          'ledger-symlink-test',
+          '--resume-from',
+          'wide',
+        ],
+        { cwd: path.resolve(import.meta.dirname, '../..'), encoding: 'utf8' },
+      );
+
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toContain('symbolic link');
+      expect(fs.readFileSync(victim, 'utf8')).toBe('[{"private":"preserve-me"}]\n');
+    },
+  );
+
   it.skipIf(process.platform === 'win32')(
     'refuses a preexisting evidence symlink without truncating its target',
     () => {
@@ -161,7 +217,7 @@ describe('reconciliation canary filesystem safety', () => {
   );
 
   it.skipIf(process.platform === 'win32')(
-    'forwards an orchestrator signal to its owned child process tree',
+    'force-kills a signal-resistant grandchild after its direct child exits',
     async () => {
       const root = makeTemporaryRoot();
       const pidFile = path.join(root, 'pids.json');
@@ -175,8 +231,8 @@ describe('reconciliation canary filesystem safety', () => {
         childScript,
         `import { spawn } from 'node:child_process';\n` +
           `import fs from 'node:fs';\n` +
-          `const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);\n` +
-          `fs.writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({ child: process.pid, grandchild: grandchild.pid }));\n` +
+          `const grandchild = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); process.stdout.write("ready\\\\n"); setInterval(() => {}, 1000)'], { stdio: ['ignore', 'pipe', 'ignore'] });\n` +
+          `grandchild.stdout.once('data', () => fs.writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({ child: process.pid, grandchild: grandchild.pid })));\n` +
           `setInterval(() => {}, 1000);\n`,
       );
       fs.writeFileSync(
@@ -220,4 +276,37 @@ describe('reconciliation canary filesystem safety', () => {
       expect(isAlive(pids.grandchild)).toBe(false);
     },
   );
+
+  it('uses an absolute taskkill path and sanitized environment on Windows', () => {
+    const calls: Array<{ command: string; options: { env?: NodeJS.ProcessEnv } }> = [];
+    const terminationEnv = {
+      SystemRoot: 'C:\\Windows',
+      WINDIR: 'C:\\Windows',
+      PATH: 'C:\\Windows\\System32',
+      HOME: 'C:\\isolated',
+    };
+    const supervisor = new ChildSupervisor({
+      platform: 'win32',
+      terminationEnv,
+      spawnSyncImpl: (command: string, _args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+        calls.push({ command, options });
+        return { status: 0 };
+      },
+    });
+    const child = {
+      pid: 1234,
+      exitCode: null,
+      signalCode: null,
+      kill: () => {
+        throw new Error('taskkill fallback should not run');
+      },
+    };
+
+    supervisor.terminate(child);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.command).toBe('C:\\Windows\\System32\\taskkill.exe');
+    expect(calls[0]?.options.env).toEqual(terminationEnv);
+    expect(calls[0]?.options.env).not.toHaveProperty('GH_TOKEN');
+  });
 });

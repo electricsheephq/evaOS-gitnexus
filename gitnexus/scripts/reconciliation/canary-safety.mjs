@@ -35,9 +35,7 @@ export const prepareEvidenceLayout = ({ evidence, commandDir, snapshotDir, home 
     fs.mkdirSync(directory, { recursive: true });
     assertDirectory(directory);
   }
-  assertTreeHasNoSymlinks(commandDir);
-  assertTreeHasNoSymlinks(snapshotDir);
-  assertTreeHasNoSymlinks(home);
+  assertTreeHasNoSymlinks(evidence);
 };
 
 export const writeJsonAtomic = (filePath, value) => {
@@ -181,9 +179,23 @@ export const selectSafeTrackedFiles = (worktree, files, count) => {
 };
 
 export class ChildSupervisor {
-  constructor({ platform = process.platform, killTimeoutMs = 5_000 } = {}) {
+  constructor({
+    platform = process.platform,
+    killTimeoutMs = 5_000,
+    terminationEnv,
+    spawnSyncImpl = spawnSync,
+  } = {}) {
     this.platform = platform;
     this.killTimeoutMs = killTimeoutMs;
+    this.terminationEnv = terminationEnv ?? {
+      SystemRoot: process.env.SystemRoot,
+      WINDIR: process.env.WINDIR,
+      COMSPEC: process.env.COMSPEC,
+      PATHEXT: process.env.PATHEXT,
+      TEMP: process.env.TEMP,
+      TMP: process.env.TMP,
+    };
+    this.spawnSyncImpl = spawnSyncImpl;
     this.children = new Set();
     this.receivedSignal = undefined;
     this.signalHandlers = new Map();
@@ -204,18 +216,49 @@ export class ChildSupervisor {
 
   terminate(child, signal = 'SIGTERM') {
     if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+    this.terminateProcessGroup(child.pid, signal, child);
+  }
+
+  terminateProcessGroup(pid, signal, directChild) {
     if (this.platform === 'win32') {
-      const result = spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
-        stdio: 'ignore',
-        windowsHide: true,
-      });
-      if (result.error || result.status !== 0) child.kill(signal);
+      const systemRoot = this.terminationEnv.SystemRoot ?? this.terminationEnv.WINDIR;
+      let result;
+      if (systemRoot) {
+        try {
+          result = this.spawnSyncImpl(
+            path.win32.join(systemRoot, 'System32', 'taskkill.exe'),
+            ['/pid', String(pid), '/t', '/f'],
+            {
+              env: this.terminationEnv,
+              stdio: 'ignore',
+              windowsHide: true,
+            },
+          );
+        } catch (error) {
+          result = { error };
+        }
+      }
+      if (
+        (!result || result.error || result.status !== 0) &&
+        directChild &&
+        directChild.exitCode === null &&
+        directChild.signalCode === null
+      ) {
+        directChild.kill(signal);
+      }
       return;
     }
     try {
-      process.kill(-child.pid, signal);
+      process.kill(-pid, signal);
     } catch (error) {
-      if (error?.code !== 'ESRCH') child.kill(signal);
+      if (
+        error?.code !== 'ESRCH' &&
+        directChild &&
+        directChild.exitCode === null &&
+        directChild.signalCode === null
+      ) {
+        directChild.kill(signal);
+      }
     }
   }
 
@@ -223,10 +266,11 @@ export class ChildSupervisor {
     const children = [...this.children];
     for (const child of children) this.terminate(child, signal);
     if (children.length > 0) {
-      const timer = setTimeout(() => {
-        for (const child of this.children) this.terminate(child, 'SIGKILL');
+      setTimeout(() => {
+        for (const child of children) {
+          if (child.pid) this.terminateProcessGroup(child.pid, 'SIGKILL');
+        }
       }, this.killTimeoutMs);
-      timer.unref();
     }
   }
 
