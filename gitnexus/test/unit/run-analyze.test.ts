@@ -17,6 +17,7 @@ import {
 } from '../../src/storage/repo-manager.js';
 import { taintModelVersion } from '../../src/core/ingestion/taint/typescript-model.js';
 import { createTempDir } from '../helpers/test-db.js';
+import { readEmbeddingNodeIds } from '../helpers/embedding-seed.js';
 
 describe('run-analyze module', () => {
   it('exports runFullAnalysis as a function', async () => {
@@ -150,8 +151,36 @@ describe('run-analyze module', () => {
 
       const finalized = await loadMeta(storagePath);
       if (!finalized) throw new Error('expected finalized metadata');
+      const [pendingNodeId] = await readEmbeddingNodeIds(tmpRepo.dbPath);
+      if (!pendingNodeId) throw new Error('expected a persisted embedding node');
       await saveMeta(storagePath, {
         ...finalized,
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 0,
+          totalNodes: 1,
+          chunksProcessed: 0,
+          model: 'test-model',
+          dimensions: 384,
+          pendingNodeIds: [pendingNodeId],
+        },
+      });
+      fetchMock.mockClear();
+
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      expect(fetchMock).toHaveBeenCalled();
+      expect((await loadMeta(storagePath))?.embeddingCheckpoint).toBeUndefined();
+
+      const resumedPending = await loadMeta(storagePath);
+      if (!resumedPending) throw new Error('expected pending-window resume metadata');
+      fetchMock.mockClear();
+      await saveMeta(storagePath, {
+        ...resumedPending,
         embeddingCheckpoint: {
           at: new Date().toISOString(),
           nodesProcessed: 1,

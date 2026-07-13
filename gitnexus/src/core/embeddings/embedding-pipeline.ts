@@ -311,9 +311,15 @@ export interface EmbeddingPipelineCheckpoint {
   chunksProcessed: number;
 }
 
+export interface EmbeddingPipelineCheckpointWindow extends EmbeddingPipelineCheckpoint {
+  nodeIds: string[];
+}
+
 export interface EmbeddingPipelineOptions {
   signal?: AbortSignal;
   checkpointEveryNodes?: number;
+  forceReembedNodeIds?: ReadonlySet<string>;
+  onCheckpointWindowStart?: (window: EmbeddingPipelineCheckpointWindow) => Promise<void>;
   onCheckpoint?: (checkpoint: EmbeddingPipelineCheckpoint) => Promise<void>;
 }
 
@@ -425,6 +431,7 @@ export const runEmbeddingPipeline = async (
     // Phase 2: Query embeddable nodes
     let nodes = await queryEmbeddableNodes(executeQuery);
     throwIfCancelled();
+    const embeddableNodeIds = new Set(nodes.map((node) => node.id));
 
     // Incremental mode: compare content hashes, delete stale rows, skip fresh ones.
     // Computed hashes for stale nodes are cached so batchInsertEmbeddings can reuse them
@@ -434,16 +441,20 @@ export const runEmbeddingPipeline = async (
     // than all up front — see U6 / KTD7. `staleNodeIds` is consulted inside the
     // batch loop; it stays empty in full (non-incremental) mode so no deletes fire.
     const staleNodeIds = new Set<string>();
-    if (existingEmbeddings && existingEmbeddings.size > 0) {
+    const forceReembedNodeIds = pipelineOptions.forceReembedNodeIds;
+    if (
+      (existingEmbeddings && existingEmbeddings.size > 0) ||
+      (forceReembedNodeIds && forceReembedNodeIds.size > 0)
+    ) {
       const beforeCount = nodes.length;
       nodes = nodes.filter((n) => {
-        const existingHash = existingEmbeddings.get(n.id);
+        const existingHash = existingEmbeddings?.get(n.id);
         if (existingHash === undefined) {
           // New node — needs embedding
           return true;
         }
         const currentHash = contentHashForNode(n, finalConfig);
-        if (currentHash !== existingHash) {
+        if (currentHash !== existingHash || forceReembedNodeIds?.has(n.id)) {
           // Content changed — cache hash for reuse during insert, mark for DELETE + re-embed
           computedStaleHashes.set(n.id, currentHash);
           staleNodeIds.add(n.id);
@@ -458,6 +469,14 @@ export const runEmbeddingPipeline = async (
           `📦 Incremental embeddings: ${beforeCount} total, ${existingEmbeddings.size} cached, ${staleNodeIds.size} stale, ${nodes.length} to embed`,
         );
       }
+    }
+
+    if (forceReembedNodeIds && forceReembedNodeIds.size > 0) {
+      const removedPendingNodeIds = [...forceReembedNodeIds].filter(
+        (nodeId) => !embeddableNodeIds.has(nodeId),
+      );
+      await deleteStaleEmbeddingRows(executeWithReusedStatement, removedPendingNodeIds);
+      throwIfCancelled();
     }
 
     const totalNodes = nodes.length;
@@ -491,8 +510,11 @@ export const runEmbeddingPipeline = async (
     const batchSize = finalConfig.batchSize;
     const chunkSize = finalConfig.chunkSize;
     const overlap = finalConfig.overlap;
+    const checkpointWindowNodeCount = Math.max(
+      batchSize,
+      Math.ceil(checkpointEveryNodes / batchSize) * batchSize,
+    );
     let processedNodes = 0;
-    let lastCheckpointAt = 0;
 
     onProgress({
       phase: 'embedding',
@@ -506,6 +528,17 @@ export const runEmbeddingPipeline = async (
     // Process in batches of nodes
     for (let batchIndex = 0; batchIndex < totalNodes; batchIndex += batchSize) {
       throwIfCancelled();
+      if (pipelineOptions.onCheckpointWindowStart && batchIndex % checkpointWindowNodeCount === 0) {
+        await pipelineOptions.onCheckpointWindowStart({
+          nodesProcessed: processedNodes,
+          totalNodes,
+          chunksProcessed: totalChunks,
+          nodeIds: nodes
+            .slice(batchIndex, batchIndex + checkpointWindowNodeCount)
+            .map((node) => node.id),
+        });
+        throwIfCancelled();
+      }
       const batch = nodes.slice(batchIndex, batchIndex + batchSize);
 
       // Chunk each node and generate text
@@ -631,14 +664,13 @@ export const runEmbeddingPipeline = async (
 
       if (
         pipelineOptions.onCheckpoint &&
-        (processedNodes - lastCheckpointAt >= checkpointEveryNodes || processedNodes === totalNodes)
+        (processedNodes % checkpointWindowNodeCount === 0 || processedNodes === totalNodes)
       ) {
         await pipelineOptions.onCheckpoint({
           nodesProcessed: processedNodes,
           totalNodes,
           chunksProcessed: totalChunks,
         });
-        lastCheckpointAt = processedNodes;
         throwIfCancelled();
       }
     }
