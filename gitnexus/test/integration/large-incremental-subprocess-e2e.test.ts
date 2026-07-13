@@ -21,6 +21,11 @@ type HarnessResult = {
   logs: string[];
   sidecars: string[];
   lastCommit: string;
+  ftsSearch?: {
+    query: string;
+    ftsAvailable: boolean;
+    results: Array<{ filePath: string; score: number; rank: number }>;
+  };
 };
 
 const childEnv = (gitnexusHome: string): NodeJS.ProcessEnv => ({
@@ -28,7 +33,10 @@ const childEnv = (gitnexusHome: string): NodeJS.ProcessEnv => ({
   CI: '1',
   NODE_ENV: 'test',
   GITNEXUS_HOME: gitnexusHome,
-  GITNEXUS_LBUG_EXTENSION_INSTALL: 'never',
+  // The R09 contract requires FTS but must never install during the child
+  // process. CI and local setup preinstall the extension; load-only fails
+  // closed when that prerequisite is absent.
+  GITNEXUS_LBUG_EXTENSION_INSTALL: 'load-only',
   GITNEXUS_WORKER_POOL_SIZE: '2',
   GITNEXUS_PARSE_CHUNK_CONCURRENCY: '1',
 });
@@ -151,6 +159,30 @@ describe('large incremental analysis subprocess contract', () => {
       expect(initial.stats.files).toBe(61);
       expect(initial.stats.nodes).toBeGreaterThan(61);
 
+      // Exercise active FTS deletion below the escalation threshold before
+      // the wide importer-closure scenario. A rename is represented as an
+      // old-path delete plus a new-path insert, so LadybugDB must remove the
+      // indexed File/Function rows without entering its historical FTS delete
+      // crash or silently leaving stale derived state.
+      const src = path.join(fixture.repoPath, 'src');
+      fs.renameSync(path.join(src, 'spoke-059.ts'), path.join(src, 'r09-small-renamed.ts'));
+      fs.writeFileSync(
+        path.join(src, 'r09-small-renamed.ts'),
+        "import { hubValue } from './hub';\nexport function r09SmallFtsNeedle(): number { return hubValue(59); }\n",
+      );
+      commitAll(fixture.repoPath, 'exercise active FTS row deletion');
+
+      const smallIncremental = runChild(fixture.repoPath, fixture.gitnexusHome, [
+        '--fts-query',
+        'r09SmallFtsNeedle',
+      ]);
+      expect(smallIncremental.logs.join('\n')).not.toContain('switching to a full DB write');
+      expect(smallIncremental.stats.files).toBe(61);
+      expect(smallIncremental.ftsSearch?.ftsAvailable).toBe(true);
+      expect(smallIncremental.ftsSearch?.results.map((result) => result.filePath)).toContain(
+        'src/r09-small-renamed.ts',
+      );
+
       const seedFiles = [
         'src/hub.ts',
         'src/spoke-000.ts',
@@ -165,13 +197,12 @@ describe('large incremental analysis subprocess contract', () => {
       const { storagePath } = getStoragePaths(fixture.repoPath);
       await stampEmbeddingCount(storagePath, seededIds.length);
 
-      const src = path.join(fixture.repoPath, 'src');
       fs.appendFileSync(path.join(src, 'hub.ts'), '\n// importer-closure edit\n');
       fs.renameSync(path.join(src, 'spoke-002.ts'), path.join(src, 'renamed-spoke.ts'));
       fs.rmSync(path.join(src, 'spoke-001.ts'));
       fs.writeFileSync(
         path.join(src, 'added.ts'),
-        "import { hubValue } from './hub';\nexport const added = hubValue(99);\n",
+        "import { hubValue } from './hub';\nexport function r09FtsNeedle(): number { return hubValue(99); }\n",
       );
       commitAll(fixture.repoPath, 'exercise incremental write set');
 
@@ -200,7 +231,10 @@ describe('large incremental analysis subprocess contract', () => {
       const dirtyMeta = await loadMeta(storagePath);
       expect(dirtyMeta?.incrementalInProgress).toBeDefined();
 
-      const recovered = runChild(fixture.repoPath, fixture.gitnexusHome);
+      const recovered = runChild(fixture.repoPath, fixture.gitnexusHome, [
+        '--fts-query',
+        'r09FtsNeedle',
+      ]);
       expect(recovered.logs.join('\n')).toContain(
         'Previous analyze run did not complete cleanly (incrementalInProgress flag set)',
       );
@@ -211,6 +245,10 @@ describe('large incremental analysis subprocess contract', () => {
       expect(recovered.capabilities).toHaveProperty('fts');
       expect(recovered.capabilities).toHaveProperty('vectorSearch');
       expect(Array.isArray(recovered.sidecars)).toBe(true);
+      expect(recovered.ftsSearch?.ftsAvailable).toBe(true);
+      expect(recovered.ftsSearch?.results.map((result) => result.filePath)).toContain(
+        'src/added.ts',
+      );
 
       const survivingEmbeddingIds = await readEmbeddingNodeIds(fixture.repoPath);
       expect(survivingEmbeddingIds.length).toBeGreaterThanOrEqual(4);
@@ -219,8 +257,13 @@ describe('large incremental analysis subprocess contract', () => {
       expect(survivingEmbeddingIds).not.toContain(seeded.get('src/spoke-002.ts')?.[0]);
       expect(await readEmbeddingDimensions(fixture.repoPath)).toEqual([384]);
 
-      const forced = runChild(fixture.repoPath, fixture.gitnexusHome, ['--force']);
+      const forced = runChild(fixture.repoPath, fixture.gitnexusHome, [
+        '--force',
+        '--fts-query',
+        'r09FtsNeedle',
+      ]);
       expect(forced.stats).toEqual(recovered.stats);
+      expect(forced.ftsSearch).toEqual(recovered.ftsSearch);
       expect(await readEmbeddingNodeIds(fixture.repoPath)).toEqual(survivingEmbeddingIds);
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
