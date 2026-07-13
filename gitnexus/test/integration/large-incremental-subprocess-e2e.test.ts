@@ -259,6 +259,16 @@ describe('large incremental analysis subprocess contract', () => {
           'Previous analyze run did not complete cleanly (incrementalInProgress flag set)',
         );
         expect((await loadMeta(storagePath))?.incrementalInProgress).toBeUndefined();
+
+        const recoveredEmbeddingIds = await readEmbeddingNodeIds(fixture.repoPath);
+        const forced = runChild(fixture.repoPath, fixture.gitnexusHome, [
+          '--force',
+          '--fts-query',
+          'r09FtsNeedle',
+        ]);
+        expect(forced.stats).toEqual(recovered.stats);
+        expect(forced.ftsSearch).toEqual(recovered.ftsSearch);
+        expect(await readEmbeddingNodeIds(fixture.repoPath)).toEqual(recoveredEmbeddingIds);
       }
       if (!recovered) throw new Error('recovery matrix produced no successful run');
       const finalRecovered = recovered;
@@ -280,17 +290,8 @@ describe('large incremental analysis subprocess contract', () => {
       expect(survivingEmbeddingIds).not.toContain(seeded.get('src/spoke-001.ts')?.[0]);
       expect(survivingEmbeddingIds).not.toContain(seeded.get('src/spoke-002.ts')?.[0]);
       expect(await readEmbeddingDimensions(fixture.repoPath)).toEqual([384]);
-
-      const forced = runChild(fixture.repoPath, fixture.gitnexusHome, [
-        '--force',
-        '--fts-query',
-        'r09FtsNeedle',
-      ]);
-      expect(forced.stats).toEqual(finalRecovered.stats);
-      expect(forced.ftsSearch).toEqual(finalRecovered.ftsSearch);
-      expect(await readEmbeddingNodeIds(fixture.repoPath)).toEqual(survivingEmbeddingIds);
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
-  }, 1_800_000);
+  }, 2_400_000);
 });
