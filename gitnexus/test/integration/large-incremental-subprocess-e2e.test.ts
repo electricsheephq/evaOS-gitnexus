@@ -14,6 +14,10 @@ import { getStoragePaths, loadMeta } from '../../src/storage/repo-manager.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const childRunner = path.resolve(testDir, '../fixtures/large-incremental-child.mjs');
+const embeddingServerRunner = path.resolve(
+  testDir,
+  '../fixtures/deterministic-embedding-server.mjs',
+);
 
 type HarnessResult = {
   stats: Record<string, number>;
@@ -28,18 +32,33 @@ type HarnessResult = {
   };
 };
 
-const childEnv = (gitnexusHome: string): NodeJS.ProcessEnv => ({
-  ...process.env,
-  CI: '1',
-  NODE_ENV: 'test',
-  GITNEXUS_HOME: gitnexusHome,
-  // The R09 contract requires FTS but must never install during the child
-  // process. CI and local setup preinstall the extension; load-only fails
-  // closed when that prerequisite is absent.
-  GITNEXUS_LBUG_EXTENSION_INSTALL: 'load-only',
-  GITNEXUS_WORKER_POOL_SIZE: '2',
-  GITNEXUS_PARSE_CHUNK_CONCURRENCY: '1',
-});
+const childEnv = (gitnexusHome: string, embeddingUrl: string): NodeJS.ProcessEnv => {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('GITNEXUS_EMBEDDING_')) delete env[key];
+  }
+  return {
+    ...env,
+    CI: '1',
+    NODE_ENV: 'test',
+    GITNEXUS_HOME: gitnexusHome,
+    // The R09 contract requires FTS but must never install during the child
+    // process. CI and local setup preinstall the extension; load-only fails
+    // closed when that prerequisite is absent.
+    GITNEXUS_LBUG_EXTENSION_INSTALL: 'load-only',
+    GITNEXUS_WORKER_POOL_SIZE: '2',
+    GITNEXUS_PARSE_CHUNK_CONCURRENCY: '1',
+    // Recovery may need to regenerate embeddings after a destructive phase.
+    // Keep that proof real but hermetic: a local deterministic endpoint means
+    // no model download, credentials, or external network can affect the test.
+    GITNEXUS_EMBEDDING_URL: embeddingUrl,
+    GITNEXUS_EMBEDDING_MODEL: 'gitnexus-test-deterministic-v1',
+    GITNEXUS_EMBEDDING_DIMS: '384',
+    GITNEXUS_EMBEDDING_MAX_ATTEMPTS: '1',
+    GITNEXUS_EMBEDDING_RETRY_CAP_MS: '1',
+    GITNEXUS_EMBEDDING_MIN_INTERVAL_MS: '0',
+  };
+};
 
 const commitAll = (repoPath: string, message: string): void => {
   for (const args of [
@@ -96,17 +115,58 @@ const parseHarnessResult = (stdout: string): HarnessResult => {
   return JSON.parse(line.slice('HARNESS_RESULT='.length)) as HarnessResult;
 };
 
-const runChild = (repoPath: string, gitnexusHome: string, args: string[] = []): HarnessResult => {
+const runChild = (
+  repoPath: string,
+  gitnexusHome: string,
+  embeddingUrl: string,
+  args: string[] = [],
+): HarnessResult => {
   const result = spawnSync(process.execPath, [childRunner, repoPath, ...args], {
     encoding: 'utf8',
     timeout: 300_000,
-    env: childEnv(gitnexusHome),
+    env: childEnv(gitnexusHome, embeddingUrl),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   expect(result.error).toBeUndefined();
   expect(result.signal, result.stderr).toBeNull();
   expect(result.status, result.stderr).toBe(0);
   return parseHarnessResult(result.stdout);
+};
+
+const startEmbeddingServer = async (): Promise<{ child: ChildProcess; url: string }> => {
+  const child = spawn(process.execPath, [embeddingServerRunner], {
+    env: { ...process.env, NODE_ENV: 'test' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const url = await new Promise<string>((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => reject(new Error('embedding server did not start')), 30_000);
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk.toString();
+      const line = stdout
+        .split(/\r?\n/u)
+        .find((candidate) => candidate.startsWith('EMBEDDING_SERVER='));
+      if (line) {
+        clearTimeout(timer);
+        resolve(line.slice('EMBEDDING_SERVER='.length));
+      }
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      reject(
+        new Error(`embedding server exited before ready: code=${code} signal=${signal} ${stderr}`),
+      );
+    });
+  });
+  return { child, url };
 };
 
 const waitForFile = async (filePath: string, child: ChildProcess): Promise<void> => {
@@ -153,9 +213,14 @@ const readEmbeddingDimensions = async (repoPath: string): Promise<number[]> => {
 describe('large incremental analysis subprocess contract', () => {
   it('surfaces process failure and recovers add/edit/rename/delete plus importer closure and embeddings', async () => {
     expect(fs.existsSync(childRunner), `missing child runner: ${childRunner}`).toBe(true);
+    expect(
+      fs.existsSync(embeddingServerRunner),
+      `missing embedding server: ${embeddingServerRunner}`,
+    ).toBe(true);
     const fixture = setupLargeRepo();
+    const embeddingServer = await startEmbeddingServer();
     try {
-      const initial = runChild(fixture.repoPath, fixture.gitnexusHome);
+      const initial = runChild(fixture.repoPath, fixture.gitnexusHome, embeddingServer.url);
       expect(initial.stats.files).toBe(61);
       expect(initial.stats.nodes).toBeGreaterThan(61);
 
@@ -172,10 +237,12 @@ describe('large incremental analysis subprocess contract', () => {
       );
       commitAll(fixture.repoPath, 'exercise active FTS row deletion');
 
-      const smallIncremental = runChild(fixture.repoPath, fixture.gitnexusHome, [
-        '--fts-query',
-        'r09SmallFtsNeedle',
-      ]);
+      const smallIncremental = runChild(
+        fixture.repoPath,
+        fixture.gitnexusHome,
+        embeddingServer.url,
+        ['--fts-query', 'r09SmallFtsNeedle'],
+      );
       expect(smallIncremental.logs.join('\n')).not.toContain('switching to a full DB write');
       expect(smallIncremental.stats.files).toBe(61);
       expect(smallIncremental.ftsSearch?.ftsAvailable).toBe(true);
@@ -206,67 +273,102 @@ describe('large incremental analysis subprocess contract', () => {
       );
       commitAll(fixture.repoPath, 'exercise incremental write set');
 
-      const readyFile = path.join(fixture.root, 'pause-ready.json');
-      const interrupted = spawn(
-        process.execPath,
-        [childRunner, fixture.repoPath, '--pause-on-escalation', readyFile],
-        {
-          env: childEnv(fixture.gitnexusHome),
-          stdio: ['ignore', 'pipe', 'pipe'],
-        },
-      );
-      await waitForFile(readyFile, interrupted);
-      const pauseState = JSON.parse(fs.readFileSync(readyFile, 'utf8')) as {
-        message: string;
-        dirty: { phase?: string; effectiveWriteCount?: number; deleteCount?: number };
-      };
-      expect(pauseState.message).toContain('switching to a full DB write');
-      expect(pauseState.dirty.phase).toBe('effective-write-set');
-      expect(pauseState.dirty.effectiveWriteCount).toBeGreaterThanOrEqual(50);
-      expect(pauseState.dirty.deleteCount).toBeGreaterThanOrEqual(50);
+      const boundaries = [
+        ['before-delete', 'escalated-full-write'],
+        ['during-delete', 'escalated-full-write'],
+        ['during-insert', 'escalated-load-graph'],
+        ['before-finalize', 'escalated-load-graph'],
+      ] as const;
+      let recovered: HarnessResult | undefined;
+      for (const [index, [boundary, expectedDirtyPhase]] of boundaries.entries()) {
+        if (index > 0) {
+          fs.appendFileSync(path.join(src, 'hub.ts'), `\n// ${boundary} interruption\n`);
+          commitAll(fixture.repoPath, `prepare ${boundary} interruption`);
+        }
+        const readyFile = path.join(fixture.root, `pause-ready-${boundary}.json`);
+        const interrupted = spawn(
+          process.execPath,
+          [childRunner, fixture.repoPath, '--pause-at', boundary, '--pause-ready', readyFile],
+          {
+            env: childEnv(fixture.gitnexusHome, embeddingServer.url),
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        );
+        await waitForFile(readyFile, interrupted);
+        const pauseState = JSON.parse(fs.readFileSync(readyFile, 'utf8')) as {
+          boundary: string;
+          details: { phase?: string; removedPath?: string; table?: string };
+          dirty: { phase?: string; effectiveWriteCount?: number; deleteCount?: number };
+        };
+        expect(pauseState.boundary).toBe(boundary);
+        expect(pauseState.details.phase).toBe(expectedDirtyPhase);
+        expect(pauseState.dirty.phase).toBe(expectedDirtyPhase);
+        expect(pauseState.dirty.effectiveWriteCount).toBeGreaterThanOrEqual(50);
+        expect(pauseState.dirty.deleteCount).toBeGreaterThanOrEqual(50);
+        if (boundary === 'during-delete') {
+          expect(pauseState.details.removedPath).toMatch(/lbug$/);
+        }
+        if (boundary === 'during-insert') {
+          expect(pauseState.details.table).toBeTruthy();
+        }
 
-      const stopped = await stopChild(interrupted);
-      expect(stopped.code).not.toBe(0);
-      expect(stopped.signal).toBe('SIGTERM');
-      const dirtyMeta = await loadMeta(storagePath);
-      expect(dirtyMeta?.incrementalInProgress).toBeDefined();
+        const stopped = await stopChild(interrupted);
+        expect(stopped.code).not.toBe(0);
+        expect(stopped.signal).toBe('SIGTERM');
+        const dirtyMeta = await loadMeta(storagePath);
+        expect(dirtyMeta?.incrementalInProgress?.phase).toBe(expectedDirtyPhase);
 
-      const recovered = runChild(fixture.repoPath, fixture.gitnexusHome, [
-        '--fts-query',
-        'r09FtsNeedle',
-      ]);
-      expect(recovered.logs.join('\n')).toContain(
-        'Previous analyze run did not complete cleanly (incrementalInProgress flag set)',
-      );
+        recovered = runChild(fixture.repoPath, fixture.gitnexusHome, embeddingServer.url, [
+          '--fts-query',
+          'r09FtsNeedle',
+        ]);
+        expect(recovered.logs.join('\n')).toContain(
+          'Previous analyze run did not complete cleanly (incrementalInProgress flag set)',
+        );
+        expect((await loadMeta(storagePath))?.incrementalInProgress).toBeUndefined();
+
+        const recoveredEmbeddingIds = await readEmbeddingNodeIds(fixture.repoPath);
+        expect(
+          recoveredEmbeddingIds.length,
+          `${boundary} recovery silently lost every preserved or regenerated embedding`,
+        ).toBeGreaterThanOrEqual(4);
+        expect(recovered.stats.embeddings).toBe(recoveredEmbeddingIds.length);
+        const forced = runChild(fixture.repoPath, fixture.gitnexusHome, embeddingServer.url, [
+          '--force',
+          '--fts-query',
+          'r09FtsNeedle',
+        ]);
+        expect(forced.stats).toEqual(recovered.stats);
+        expect(forced.ftsSearch).toEqual(recovered.ftsSearch);
+        expect((await readEmbeddingNodeIds(fixture.repoPath)).toSorted()).toEqual(
+          recoveredEmbeddingIds.toSorted(),
+        );
+      }
+      if (!recovered) throw new Error('recovery matrix produced no successful run');
+      const finalRecovered = recovered;
       const recoveredMeta = await loadMeta(storagePath);
       expect(recoveredMeta?.incrementalInProgress).toBeUndefined();
-      expect(recovered.stats.files).toBe(61);
-      expect(recovered.stats.nodes).toBeGreaterThan(61);
-      expect(recovered.capabilities).toHaveProperty('fts');
-      expect(recovered.capabilities).toHaveProperty('vectorSearch');
-      expect(Array.isArray(recovered.sidecars)).toBe(true);
-      expect(recovered.ftsSearch?.ftsAvailable).toBe(true);
-      expect(recovered.ftsSearch?.results.map((result) => result.filePath)).toContain(
+      expect(finalRecovered.stats.files).toBe(61);
+      expect(finalRecovered.stats.nodes).toBeGreaterThan(61);
+      expect(finalRecovered.capabilities).toHaveProperty('fts');
+      expect(finalRecovered.capabilities).toHaveProperty('vectorSearch');
+      expect(Array.isArray(finalRecovered.sidecars)).toBe(true);
+      expect(finalRecovered.ftsSearch?.ftsAvailable).toBe(true);
+      expect(finalRecovered.ftsSearch?.results.map((result) => result.filePath)).toContain(
         'src/added.ts',
       );
 
       const survivingEmbeddingIds = await readEmbeddingNodeIds(fixture.repoPath);
       expect(survivingEmbeddingIds.length).toBeGreaterThanOrEqual(4);
-      expect(recovered.stats.embeddings).toBe(survivingEmbeddingIds.length);
+      expect(finalRecovered.stats.embeddings).toBe(survivingEmbeddingIds.length);
       expect(survivingEmbeddingIds).not.toContain(seeded.get('src/spoke-001.ts')?.[0]);
       expect(survivingEmbeddingIds).not.toContain(seeded.get('src/spoke-002.ts')?.[0]);
       expect(await readEmbeddingDimensions(fixture.repoPath)).toEqual([384]);
-
-      const forced = runChild(fixture.repoPath, fixture.gitnexusHome, [
-        '--force',
-        '--fts-query',
-        'r09FtsNeedle',
-      ]);
-      expect(forced.stats).toEqual(recovered.stats);
-      expect(forced.ftsSearch).toEqual(recovered.ftsSearch);
-      expect(await readEmbeddingNodeIds(fixture.repoPath)).toEqual(survivingEmbeddingIds);
     } finally {
+      if (embeddingServer.child.exitCode === null && embeddingServer.child.signalCode === null) {
+        await stopChild(embeddingServer.child);
+      }
       fs.rmSync(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
-  }, 600_000);
+  }, 2_400_000);
 });

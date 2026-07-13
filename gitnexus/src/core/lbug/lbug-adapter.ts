@@ -934,11 +934,16 @@ const copyCsvWithRetry = async (
  * keeps the IGNORE_ERRORS=true retry; a hard failure throws (no node rows ⇒ the
  * relationship COPY would dangle on missing endpoints).
  */
+export interface LbugLoadHooks {
+  onNodeCopyCommitted?: (table: NodeTableName, index: number, total: number) => void;
+}
+
 const copyNodeCSVs = async (
   targetConn: lbug.Connection,
   nodeFileEntries: [NodeTableName, { csvPath: string; rows: number }][],
   log: (message: string) => void,
   totalSteps: number,
+  hooks?: LbugLoadHooks,
 ): Promise<void> => {
   let stepsDone = 0;
   for (const [table, { csvPath, rows }] of nodeFileEntries) {
@@ -950,6 +955,7 @@ const copyNodeCSVs = async (
       const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
       throw new Error(`COPY failed for ${table}: ${retryMsg.slice(0, 200)}`);
     });
+    hooks?.onNodeCopyCommitted?.(table, stepsDone - 1, totalSteps);
   }
 };
 
@@ -979,6 +985,7 @@ export const loadGraphToLbug = async (
    * emits none — the manifest is the sole source and there is no double-COPY.
    */
   pdgEmitManifest?: PdgEmitManifest,
+  hooks?: LbugLoadHooks,
 ) => {
   if (!conn) {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
@@ -1050,7 +1057,7 @@ export const loadGraphToLbug = async (
     // denominator is the node-table count — not +1 reserving a rel step.
     // .catch captures the failure so an overlapped (mid-emit) rejection cannot
     // surface as an unhandled rejection; it is rethrown at the FK barrier below.
-    nodeCopyPromise = copyNodeCSVs(writeConn, entries, log, entries.length).catch((e) => {
+    nodeCopyPromise = copyNodeCSVs(writeConn, entries, log, entries.length, hooks).catch((e) => {
       nodeCopyError = e;
     });
   };
@@ -2085,14 +2092,25 @@ export class LbugWipeError extends Error {
  * DB the run is about to recreate, so neither needs (or may share) the
  * loud-failure contract here.
  */
-export const wipeLbugDbFiles = async (lbugPath: string): Promise<void> => {
+export interface LbugWipeOptions {
+  onRemoved?: (removedPath: string, index: number, total: number) => void;
+}
+
+export const wipeLbugDbFiles = async (
+  lbugPath: string,
+  options: LbugWipeOptions = {},
+): Promise<void> => {
   const lockPath = `${lbugPath}.lock`;
   const family = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.shadow`, lockPath];
   let survivors: string[] = [];
 
   for (let attempt = 1; attempt <= HANDLE_RELEASE_PROBE_ATTEMPTS; attempt++) {
     survivors = [];
-    for (const f of family) {
+    for (const [index, f] of family.entries()) {
+      const existedBefore = await fs.access(f).then(
+        () => true,
+        () => false,
+      );
       try {
         await fs.rm(f, { recursive: true, force: true });
       } catch {
@@ -2104,7 +2122,11 @@ export const wipeLbugDbFiles = async (lbugPath: string): Promise<void> => {
         () => false, // still present
         (err: unknown) => (err as NodeJS.ErrnoException | null)?.code === 'ENOENT',
       );
-      if (!gone) survivors.push(f);
+      if (!gone) {
+        survivors.push(f);
+      } else if (existedBefore) {
+        options.onRemoved?.(f, index, family.length);
+      }
     }
     if (survivors.length === 0) return;
     if (attempt < HANDLE_RELEASE_PROBE_ATTEMPTS) {

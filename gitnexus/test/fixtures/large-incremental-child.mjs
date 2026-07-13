@@ -12,16 +12,18 @@ const bm25IndexUrl = pathToFileURL(path.join(packageRoot, 'dist/core/search/bm25
 const [repoPath, ...args] = process.argv.slice(2);
 if (!repoPath) {
   throw new Error(
-    'usage: large-incremental-child.mjs <repo> [--force] [--embeddings] [--pause-on-escalation <file>] [--fts-query <text>]',
+    'usage: large-incremental-child.mjs <repo> [--force] [--embeddings] [--pause-at <boundary> --pause-ready <file>] [--fts-query <text>]',
   );
 }
 
 const force = args.includes('--force');
 const embeddings = args.includes('--embeddings');
-const pauseIndex = args.indexOf('--pause-on-escalation');
-const pauseReadyFile = pauseIndex >= 0 ? args[pauseIndex + 1] : undefined;
-if (pauseIndex >= 0 && !pauseReadyFile) {
-  throw new Error('--pause-on-escalation requires a ready-file path');
+const pauseAtIndex = args.indexOf('--pause-at');
+const pauseAt = pauseAtIndex >= 0 ? args[pauseAtIndex + 1] : undefined;
+const pauseReadyIndex = args.indexOf('--pause-ready');
+const pauseReadyFile = pauseReadyIndex >= 0 ? args[pauseReadyIndex + 1] : undefined;
+if ((pauseAt && !pauseReadyFile) || (!pauseAt && pauseReadyFile)) {
+  throw new Error('--pause-at and --pause-ready must be provided together');
 }
 const ftsQueryIndex = args.indexOf('--fts-query');
 const ftsQuery = ftsQueryIndex >= 0 ? args[ftsQueryIndex + 1] : undefined;
@@ -37,20 +39,22 @@ let paused = false;
 
 const onLog = (message) => {
   logs.push(message);
-  if (!paused && pauseReadyFile && message.includes('switching to a full DB write')) {
-    paused = true;
-    const metadataPath = path.join(storagePath, 'gitnexus.json');
-    const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-    fs.writeFileSync(
-      pauseReadyFile,
-      JSON.stringify({ message, dirty: metadata.incrementalInProgress }),
-      'utf8',
-    );
+};
 
-    const latch = new Int32Array(new SharedArrayBuffer(4));
-    Atomics.wait(latch, 0, 0, 120_000);
-    throw new Error('pause-on-escalation timed out before the parent terminated this process');
-  }
+const onRecoveryBoundary = (boundary, details) => {
+  if (paused || !pauseReadyFile || boundary !== pauseAt) return;
+  paused = true;
+  const metadataPath = path.join(storagePath, 'gitnexus.json');
+  const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+  fs.writeFileSync(
+    pauseReadyFile,
+    JSON.stringify({ boundary, details, dirty: metadata.incrementalInProgress }),
+    { encoding: 'utf8', flag: 'wx', mode: 0o600 },
+  );
+
+  const latch = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(latch, 0, 0, 120_000);
+  throw new Error(`pause-at ${boundary} timed out before the parent terminated this process`);
 };
 
 try {
@@ -63,7 +67,7 @@ try {
       embeddings,
       embeddingsNodeLimit: embeddings ? 0 : undefined,
     },
-    { onProgress: () => {}, onLog },
+    { onProgress: () => {}, onLog, onRecoveryBoundary },
   );
 
   const meta = await loadMeta(storagePath);
