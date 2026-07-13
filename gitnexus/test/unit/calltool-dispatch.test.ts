@@ -705,9 +705,13 @@ describe('LocalBackend.callTool', () => {
       expect(
         cap
           .records()
-          .some((record) => /exact scan refused.*2 chunks exceed.*limit of 1/i.test(String(record.msg))),
+          .some((record) =>
+            /exact scan refused.*2 chunks exceed.*limit of 1/i.test(String(record.msg)),
+          ),
       ).toBe(true);
-      const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
+      const queries = (executeQuery as any).mock.calls.map(
+        ([, cypher]: [string, string]) => cypher,
+      );
       expect(queries.some((cypher: string) => cypher.includes('e.embedding AS embedding'))).toBe(
         false,
       );
