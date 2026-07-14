@@ -8,13 +8,19 @@
  * - Error handling for invalid URIs
  * - Resource handlers with mocked backend
  */
-import { describe, it, expect, vi } from 'vitest';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
 import {
   getResourceDefinitions,
   getResourceTemplates,
   parseResourceUri,
   readResource,
 } from '../../src/mcp/resources.js';
+
+const { loadMetaMock } = vi.hoisted(() => ({ loadMetaMock: vi.fn().mockResolvedValue(null) }));
+vi.mock('../../src/storage/repo-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/storage/repo-manager.js')>();
+  return { ...actual, loadMeta: loadMetaMock };
+});
 
 // ─── Minimal mock backend ──────────────────────────────────────────
 
@@ -25,6 +31,8 @@ function createMockBackend(overrides: Partial<Record<string, any>> = {}): any {
       overrides.resolvedRepo ?? {
         name: 'test-repo',
         repoPath: '/tmp/test-repo',
+        storagePath: '/tmp/test-repo/.gitnexus',
+        lbugPath: '/tmp/test-repo/.gitnexus/lbug',
         lastCommit: 'abc1234',
       },
     ),
@@ -392,5 +400,61 @@ describe('readResource', () => {
     expect(result).toContain('query({search_query: "auth"');
     expect(result).not.toContain('query({query:');
     expect(result).not.toMatch(/gitnexus_/);
+  });
+});
+
+describe('context resource metadata freshness', () => {
+  const context = {
+    projectName: 'test-project',
+    stats: { fileCount: 100, functionCount: 500, communityCount: 3, processCount: 10 },
+  };
+
+  beforeEach(() => {
+    loadMetaMock.mockReset();
+    loadMetaMock.mockResolvedValue(null);
+  });
+
+  it('uses fresh disk stats after repository authorization succeeds', async () => {
+    loadMetaMock.mockResolvedValue({
+      repoPath: '/tmp/test-repo',
+      lastCommit: 'fresh-head',
+      indexedAt: '2026-07-14T00:00:00.000Z',
+      stats: { files: 250, nodes: 1500, processes: 25 },
+    });
+    const backend = createMockBackend({ context });
+
+    const result = await readResource('gitnexus://repo/test-project/context', backend);
+
+    expect(backend.resolveRepo).toHaveBeenCalledWith('test-project');
+    expect(loadMetaMock).toHaveBeenCalledWith('/tmp/test-repo/.gitnexus');
+    expect(result).toContain('files: 250');
+    expect(result).toContain('symbols: 1500');
+    expect(result).toContain('processes: 25');
+  });
+
+  it('falls back to cached stats when disk metadata is missing or unreadable', async () => {
+    const backend = createMockBackend({ context });
+
+    const missing = await readResource('gitnexus://repo/test-project/context', backend);
+    loadMetaMock.mockRejectedValueOnce(new Error('EACCES'));
+    const unreadable = await readResource('gitnexus://repo/test-project/context', backend);
+
+    for (const result of [missing, unreadable]) {
+      expect(result).toContain('files: 100');
+      expect(result).toContain('symbols: 500');
+      expect(result).toContain('processes: 10');
+    }
+  });
+
+  it('does not read metadata when repository authorization fails', async () => {
+    const backend = createMockBackend({
+      resolveRepo: vi.fn().mockRejectedValue(new Error('Repository is not allowed')),
+      context,
+    });
+
+    await expect(readResource('gitnexus://repo/denied/context', backend)).rejects.toThrow(
+      'Repository is not allowed',
+    );
+    expect(loadMetaMock).not.toHaveBeenCalled();
   });
 });

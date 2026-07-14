@@ -7,6 +7,7 @@
 
 import type { LocalBackend } from './local/local-backend.js';
 import { checkStaleness } from './staleness.js';
+import { loadMeta } from '../storage/repo-manager.js';
 
 export interface ResourceDefinition {
   uri: string;
@@ -311,9 +312,12 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
     return 'error: No codebase loaded. Run: gitnexus analyze';
   }
 
+  // Repo handles are cached, while analysis can refresh metadata out of process.
+  const freshMeta = await loadMeta(repo.storagePath).catch(() => null);
+
   // Check staleness
   const repoPath = repo.repoPath;
-  const lastCommit = repo.lastCommit || 'HEAD';
+  const lastCommit = freshMeta?.lastCommit ?? repo.lastCommit ?? 'HEAD';
   const staleness = repoPath
     ? checkStaleness(repoPath, lastCommit)
     : { isStale: false, commitsBehind: 0 };
@@ -327,9 +331,9 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
 
   lines.push('');
   lines.push('stats:');
-  lines.push(`  files: ${context.stats.fileCount}`);
-  lines.push(`  symbols: ${context.stats.functionCount}`);
-  lines.push(`  processes: ${context.stats.processCount}`);
+  lines.push(`  files: ${freshMeta?.stats?.files ?? context.stats.fileCount}`);
+  lines.push(`  symbols: ${freshMeta?.stats?.nodes ?? context.stats.functionCount}`);
+  lines.push(`  processes: ${freshMeta?.stats?.processes ?? context.stats.processCount}`);
   lines.push('');
   lines.push('tools_available:');
   lines.push('  - query: Process-grouped code intelligence (execution flows related to a concept)');
