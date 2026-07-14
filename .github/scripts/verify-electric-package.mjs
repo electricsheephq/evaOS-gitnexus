@@ -162,8 +162,14 @@ function verifyVendorTree(installed) {
     throw new Error(`vendor tree contains forbidden build artifacts: ${forbidden.join(', ')}`);
   }
 
-  for (const name of ['tree-sitter-dart', 'tree-sitter-proto', 'tree-sitter-swift']) {
-    const entry = path.join(installed, 'node_modules', name);
+  for (const name of [
+    'tree-sitter-c',
+    'tree-sitter-dart',
+    'tree-sitter-kotlin',
+    'tree-sitter-proto',
+    'tree-sitter-swift',
+  ]) {
+    const entry = path.join(vendorRoot, name);
     if (!fs.existsSync(entry)) continue;
     const stat = fs.lstatSync(entry);
     if (stat.isSymbolicLink()) {

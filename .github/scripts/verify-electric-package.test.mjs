@@ -51,9 +51,15 @@ function fixture({ ladybugVersion = '0.18.1', checksumLineEnding = '\n' } = {}) 
       bin: { gitnexus: 'dist/cli/index.js' },
     }),
   );
-  fs.mkdirSync(path.join(installed, 'vendor', 'tree-sitter-typescript'), { recursive: true });
-  for (const name of ['tree-sitter-dart', 'tree-sitter-proto', 'tree-sitter-swift']) {
-    fs.mkdirSync(path.join(installed, 'node_modules', name), { recursive: true });
+  for (const name of [
+    'tree-sitter-c',
+    'tree-sitter-dart',
+    'tree-sitter-kotlin',
+    'tree-sitter-proto',
+    'tree-sitter-swift',
+    'tree-sitter-typescript',
+  ]) {
+    fs.mkdirSync(path.join(installed, 'vendor', name), { recursive: true });
   }
   fs.writeFileSync(
     path.join(ladybug, 'package.json'),
@@ -190,10 +196,16 @@ test('fails closed on vendor build artifacts', () => {
   assert.match(result.stderr, /vendor tree contains forbidden build artifacts/u);
 });
 
-for (const name of ['tree-sitter-dart', 'tree-sitter-proto', 'tree-sitter-swift']) {
+for (const name of [
+  'tree-sitter-c',
+  'tree-sitter-dart',
+  'tree-sitter-kotlin',
+  'tree-sitter-proto',
+  'tree-sitter-swift',
+]) {
   test(`fails closed when ${name} is a symlink or junction`, () => {
     const values = fixture();
-    const grammar = path.join(values.installed, 'node_modules', name);
+    const grammar = path.join(values.installed, 'vendor', name);
     const target = path.join(values.root, `${name}-target`);
     fs.rmSync(grammar, { recursive: true });
     fs.mkdirSync(target);
