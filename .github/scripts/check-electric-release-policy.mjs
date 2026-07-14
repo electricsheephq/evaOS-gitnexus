@@ -263,6 +263,8 @@ function checkReleaseWorkflow(workflows) {
 
   const publishStep = findNamedStep(releaseJob, 'Verify assets and publish the draft');
   checkRunRequirements(publishStep, 'publish the verified draft step', [
+    ['gh release download', 'fresh release asset download'],
+    ['sha256sum --check', 'fresh release checksum verification'],
     ['ENCODED_TAG', 'URL-encoded final release lookup'],
     ['releases/tags/$ENCODED_TAG', 'URL-encoded final release lookup'],
     ['gh api --method PATCH', 'GitHub Release PATCH'],

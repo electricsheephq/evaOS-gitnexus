@@ -94,6 +94,8 @@ jobs:
       - name: Verify assets and publish the draft
         run: |
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          gh release download "$TAG" --pattern "gitnexus-$VERSION.tgz" --pattern SHA256SUMS
+          sha256sum --check SHA256SUMS
           gh api "repos/$REPO/releases/tags/$ENCODED_TAG"
           gh api --method PATCH releases/1 -F draft=false
 `;
@@ -344,6 +346,19 @@ test('rejects a raw slash-bearing final release lookup', () => {
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /URL-encoded final release lookup/);
+});
+
+test('rejects publish without re-downloading and checksum-verifying release assets', () => {
+  let workflow = replaceOnce(
+    validWorkflow,
+    '          gh release download "$TAG" --pattern "gitnexus-$VERSION.tgz" --pattern SHA256SUMS\n',
+    '',
+  );
+  workflow = replaceOnce(workflow, '          sha256sum --check SHA256SUMS\n', '');
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /fresh release asset download/);
+  assert.match(result.stderr, /fresh release checksum verification/);
 });
 
 test('rejects missing electric tag, tarball, or checksum wiring', () => {

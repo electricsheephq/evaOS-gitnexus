@@ -398,6 +398,17 @@ jobs:
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
+          VERIFY_DIR="$(mktemp -d)"
+          gh release download "$TAG" \
+            --repo "$REPO" \
+            --pattern "gitnexus-$VERSION.tgz" \
+            --pattern SHA256SUMS \
+            --dir "$VERIFY_DIR"
+          (
+            cd "$VERIFY_DIR"
+            sha256sum --check SHA256SUMS
+          )
+
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
           RELEASE_JSON="$(gh api "repos/$REPO/releases/tags/$ENCODED_TAG")"
           RELEASE_ID="$(jq -r .id <<< "$RELEASE_JSON")"
