@@ -291,9 +291,15 @@ describe('startMcpHttpServer', () => {
         expect(tool.inputSchema).not.toHaveProperty('allOf');
       }
     } finally {
-      await client.close();
-      await close();
-      await cleanup();
+      try {
+        await client.close();
+      } finally {
+        try {
+          await close();
+        } finally {
+          await cleanup();
+        }
+      }
     }
   });
 
