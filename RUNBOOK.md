@@ -163,3 +163,48 @@ If the error text is `"Only one write transaction at a time is allowed in the sy
 - Architecture overview: [ARCHITECTURE.md](ARCHITECTURE.md)  
 - Agent safety rules: [GUARDRAILS.md](GUARDRAILS.md)  
 - Tests: [TESTING.md](TESTING.md)
+
+---
+
+## Electric fork releases
+
+Electric Sheep fork releases are GitHub Releases only. The fork does not publish
+to npm, GitHub Container Registry, Docker Hub, or another package registry.
+
+Prepare each version through a reviewed release PR:
+
+1. Set `gitnexus/package.json` and `gitnexus/package-lock.json` to a version such
+   as `1.6.10-electric.1`.
+2. Run `node gitnexus/scripts/sync-plugin-versions.mjs` from the repository root.
+3. Add `Documentation/releases/<version>.md` and update `gitnexus/CHANGELOG.md`.
+4. Run `npm run check:electric-release-policy`, the plugin-version test, build,
+   typecheck, and `npm pack --dry-run`.
+5. Merge the release PR only after required CI and review pass.
+
+Create the release from the current `main` branch with the protected workflow:
+
+```bash
+gh workflow run electric-release.yml \
+  --repo electricsheephq/evaOS-gitnexus \
+  --ref main \
+  -f expected_version=1.6.10-electric.1 \
+  -f prerelease=false
+```
+
+The workflow reruns exact-head CI, builds `gitnexus-<version>.tgz`, installs and
+smokes that tarball in an isolated prefix, writes `SHA256SUMS`, and pauses at the
+protected `internal-release` environment before creating
+`electric/v<version>`. It never opens a GitNexus index or calls an embedding
+provider.
+
+After downloading both assets, verify and install locally:
+
+```bash
+sha256sum --check SHA256SUMS
+npm install --global ./gitnexus-1.6.10-electric.1.tgz
+gitnexus --version
+```
+
+A GitHub Release does not authorize an OpenClaw/evaOS rollout. Keep the prior
+installation available for rollback, switch runtime source separately, and do
+not rebuild or migrate a live index unless that rollout explicitly requires it.

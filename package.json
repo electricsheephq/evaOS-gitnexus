@@ -5,7 +5,7 @@
     "prepare": "husky",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check:release-governance": "node .github/scripts/check-release-governance.mjs",
+    "check:electric-release-policy": "node .github/scripts/check-electric-release-policy.mjs",
     "lint": "eslint .",
     "lint:fix": "eslint --fix .",
     "gitnexus:refresh": "gitnexus analyze --embeddings --skills",

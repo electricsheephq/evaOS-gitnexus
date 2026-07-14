@@ -1,0 +1,183 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const CHECKER = path.join(REPO_ROOT, '.github/scripts/check-electric-release-policy.mjs');
+const temporaryRoots = [];
+
+const validWorkflow = `name: Electric Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        required: true
+        type: string
+      prerelease:
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+jobs:
+  inspect:
+    permissions:
+      contents: read
+    steps:
+      - run: |
+          test "$GITHUB_REF" = refs/heads/main
+          TAG="electric/v1.6.10-electric.1"
+          echo "$TAG"
+  ci:
+    needs: inspect
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      actions: read
+  package:
+    needs: [inspect, ci]
+    permissions:
+      contents: read
+    steps:
+      - run: |
+          npm pack --dry-run
+          npm pack
+          shasum -a 256 gitnexus-*.tgz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: electric-release-assets
+          path: |
+            gitnexus-*.tgz
+            SHA256SUMS
+  release:
+    needs: [inspect, package]
+    environment:
+      name: internal-release
+    permissions:
+      contents: write
+    steps:
+      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
+        with:
+          tag_name: electric/v1.6.10-electric.1
+          files: |
+            release-assets/gitnexus-*.tgz
+            release-assets/SHA256SUMS
+`;
+
+function createFixture(workflow = validWorkflow) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-electric-release-policy-'));
+  temporaryRoots.push(root);
+  fs.mkdirSync(path.join(root, '.github/workflows'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.github/workflows/electric-release.yml'), workflow);
+  fs.writeFileSync(
+    path.join(root, '.github/workflows/ci.yml'),
+    'name: CI\non:\n  workflow_call:\npermissions: {}\njobs: {}\n',
+  );
+  return root;
+}
+
+function runChecker(root) {
+  return spawnSync(process.execPath, [CHECKER, '--repo-root', root], { encoding: 'utf8' });
+}
+
+function replaceOnce(value, search, replacement) {
+  assert.ok(value.includes(search), `fixture is missing ${JSON.stringify(search)}`);
+  return value.replace(search, replacement);
+}
+
+test.after(() => {
+  for (const root of temporaryRoots) fs.rmSync(root, { force: true, recursive: true });
+});
+
+test('accepts the protected GitHub-only electric release workflow', () => {
+  const result = runChecker(createFixture());
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /electric release policy check passed/);
+});
+
+test('rejects a legacy publish workflow even when the electric workflow exists', () => {
+  const root = createFixture();
+  fs.writeFileSync(
+    path.join(root, '.github/workflows/publish.yml'),
+    'name: Publish\non:\n  workflow_dispatch:\njobs: {}\n',
+  );
+  const result = runChecker(root);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /publish\.yml must not exist/);
+});
+
+test('rejects npm and Docker publication commands in any workflow', () => {
+  const root = createFixture();
+  fs.writeFileSync(
+    path.join(root, '.github/workflows/unsafe.yml'),
+    `name: Unsafe\non:\n  workflow_dispatch:\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish --access public\n      - run: docker login ghcr.io\n      - run: docker push ghcr.io/example/image\n`,
+  );
+  const result = runChecker(root);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /npm publish/);
+  assert.match(result.stderr, /docker login/);
+  assert.match(result.stderr, /docker push/);
+});
+
+test('rejects a build action whose push input is not statically false', () => {
+  const root = createFixture();
+  fs.writeFileSync(
+    path.join(root, '.github/workflows/docker.yml'),
+    `name: Docker\non:\n  pull_request:\njobs:\n  build:\n    permissions:\n      contents: read\n    steps:\n      - uses: docker/build-push-action@deadbeef\n        with:\n          push: \${{ github.event_name != 'pull_request' }}\n`,
+  );
+  const result = runChecker(root);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /push must be statically false/);
+});
+
+test('rejects release triggers other than workflow_dispatch', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    'on:\n  workflow_dispatch:',
+    'on:\n  push:\n    tags: ["electric/v*"]\n  workflow_dispatch:',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /manual-only/);
+});
+
+test('rejects a release job without the protected environment', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '    environment:\n      name: internal-release\n',
+    '',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /internal-release/);
+});
+
+test('rejects registry-capable permissions and non-minimal release permissions', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '    permissions:\n      contents: write\n    steps:',
+    '    permissions:\n      contents: write\n      packages: write\n      id-token: write\n    steps:',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /packages: write/);
+  assert.match(result.stderr, /id-token: write/);
+  assert.match(result.stderr, /only contents: write/);
+});
+
+test('rejects missing electric tag, tarball, or checksum wiring', () => {
+  let workflow = validWorkflow.replaceAll('electric/v1.6.10-electric.1', 'v1.6.10');
+  workflow = workflow.replaceAll('gitnexus-*.tgz', 'bundle.zip');
+  workflow = workflow.replaceAll('SHA256SUMS', 'checksums.txt');
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /electric\/v/);
+  assert.match(result.stderr, /\.tgz/);
+  assert.match(result.stderr, /SHA256SUMS/);
+});

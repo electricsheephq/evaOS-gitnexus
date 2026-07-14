@@ -106,24 +106,26 @@ describe('sync-plugin-versions', () => {
     expect(await fs.readFile(claudePluginPath, 'utf8')).toBe(before);
   });
 
-  it('runs and verifies synchronization before the RC tag while staging every manifest', async () => {
+  it('verifies every plugin manifest before the Electric release action', async () => {
     const workflow = await fs.readFile(
-      path.join(REPO_ROOT, '.github', 'workflows', 'publish.yml'),
+      path.join(REPO_ROOT, '.github', 'workflows', 'electric-release.yml'),
       'utf8',
     );
-    const syncPosition = workflow.indexOf('node scripts/sync-plugin-versions.mjs');
-    const tagPosition = workflow.indexOf('- name: Create and push rc tags');
+    const verifyPosition = workflow.indexOf(
+      '- name: Verify release identity and manifest versions',
+    );
+    const releasePosition = workflow.indexOf('softprops/action-gh-release@');
 
-    expect(syncPosition).toBeGreaterThan(-1);
-    expect(workflow).toContain('test/unit/sync-plugin-versions.test.ts');
-    expect(syncPosition).toBeLessThan(tagPosition);
-    for (const stagedPath of [
-      '../gitnexus-claude-plugin/.claude-plugin/plugin.json',
-      '../.claude-plugin/marketplace.json',
-      '../gitnexus-claude-plugin/.codex-plugin/plugin.json',
-      '../.agents/plugins/marketplace.json',
+    expect(verifyPosition).toBeGreaterThan(-1);
+    expect(releasePosition).toBeGreaterThan(verifyPosition);
+    for (const manifestPath of [
+      'gitnexus-claude-plugin/.claude-plugin/plugin.json',
+      '.claude-plugin/marketplace.json',
+      'gitnexus-claude-plugin/.codex-plugin/plugin.json',
+      '.agents/plugins/marketplace.json',
     ]) {
-      expect(workflow).toContain(stagedPath);
+      expect(workflow).toContain(manifestPath);
     }
+    expect(workflow).toContain('manifest version mismatch');
   });
 });

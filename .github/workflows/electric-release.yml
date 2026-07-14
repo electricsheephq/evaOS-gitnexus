@@ -1,0 +1,266 @@
+name: Electric Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        description: 'Exact committed fork version, for example 1.6.10-electric.1'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark the GitHub Release as a prerelease'
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: Verify Electric release identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+      head_sha: ${{ steps.identity.outputs.head_sha }}
+      notes_path: ${{ steps.identity.outputs.notes_path }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+      - name: Verify release identity and manifest versions
+        id: identity
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Electric releases may run only from refs/heads/main."
+            exit 1
+          fi
+
+          HEAD_SHA="$(git rev-parse HEAD)"
+          REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+          if [ -z "$REMOTE_MAIN" ] || [ "$HEAD_SHA" != "$REMOTE_MAIN" ]; then
+            echo "::error::Checked-out commit is not current remote main."
+            exit 1
+          fi
+
+          PACKAGE_NAME="$(node -p "require('./gitnexus/package.json').name")"
+          VERSION="$(node -p "require('./gitnexus/package.json').version")"
+          if [ "$PACKAGE_NAME" != "gitnexus" ]; then
+            echo "::error::Unexpected package identity: $PACKAGE_NAME"
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-electric\.[0-9]+$ ]]; then
+            echo "::error::Fork version must match X.Y.Z-electric.N; got $VERSION"
+            exit 1
+          fi
+          if [ "$EXPECTED_VERSION" != "$VERSION" ]; then
+            echo "::error::Expected version $EXPECTED_VERSION does not match committed version $VERSION"
+            exit 1
+          fi
+
+          VERSION="$VERSION" node <<'NODE'
+          const fs = require('node:fs');
+          const expected = process.env.VERSION;
+          const pluginPaths = [
+            'gitnexus-claude-plugin/.claude-plugin/plugin.json',
+            'gitnexus-claude-plugin/.codex-plugin/plugin.json',
+          ];
+          const marketplacePaths = [
+            '.claude-plugin/marketplace.json',
+            '.agents/plugins/marketplace.json',
+          ];
+          for (const file of pluginPaths) {
+            const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+            if (value.version !== expected) {
+              throw new Error(`manifest version mismatch: ${file} has ${value.version}, expected ${expected}`);
+            }
+          }
+          for (const file of marketplacePaths) {
+            const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+            const matches = value.plugins.filter((plugin) => plugin?.name === 'gitnexus');
+            if (matches.length !== 1 || matches[0].version !== expected) {
+              throw new Error(`manifest version mismatch: ${file} must contain one gitnexus ${expected} entry`);
+            }
+          }
+          NODE
+
+          TAG="electric/v$VERSION"
+          NOTES_PATH="Documentation/releases/$VERSION.md"
+          if [ ! -f "$NOTES_PATH" ]; then
+            echo "::error::Missing release notes: $NOTES_PATH"
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag already exists: $TAG"
+            exit 1
+          fi
+
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          STATUS="$(curl --silent --show-error --output /tmp/electric-release.json \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$REPO/releases/tags/$ENCODED_TAG")"
+          case "$STATUS" in
+            404) ;;
+            200)
+              echo "::error::GitHub Release already exists for $TAG"
+              exit 1
+              ;;
+            *)
+              echo "::error::Unable to verify release absence; GitHub returned HTTP $STATUS"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "head_sha=$HEAD_SHA"
+            echo "notes_path=$NOTES_PATH"
+          } >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: Exact-head CI
+    needs: inspect
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      actions: read
+
+  package:
+    name: Build and prove release tarball
+    needs: [inspect, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.inspect.outputs.head_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-gitnexus
+        with:
+          build: 'true'
+      - name: Pack and install isolated CLI
+        shell: bash
+        working-directory: gitnexus
+        env:
+          EXPECTED_VERSION: ${{ needs.inspect.outputs.version }}
+        run: |
+          set -euo pipefail
+          ASSET_DIR="$RUNNER_TEMP/electric-release-assets"
+          PREFIX="$RUNNER_TEMP/electric-release-prefix"
+          mkdir -p "$ASSET_DIR" "$PREFIX"
+
+          npm pack --dry-run --json > "$RUNNER_TEMP/npm-pack-dry-run.json"
+          npm pack --json --pack-destination "$ASSET_DIR" > "$RUNNER_TEMP/npm-pack.json"
+          FILENAME="$(node -e "const value=require('$RUNNER_TEMP/npm-pack.json'); if(value.length!==1) process.exit(1); process.stdout.write(value[0].filename)")"
+          ASSET_PATH="$ASSET_DIR/$FILENAME"
+          if [ ! -s "$ASSET_PATH" ]; then
+            echo "::error::npm pack did not create $ASSET_PATH"
+            exit 1
+          fi
+
+          npm install --global --prefix "$PREFIX" "$ASSET_PATH"
+          VERSION_OUTPUT="$("$PREFIX/bin/gitnexus" --version)"
+          if [[ "$VERSION_OUTPUT" != *"$EXPECTED_VERSION"* ]]; then
+            echo "::error::Packaged CLI version '$VERSION_OUTPUT' does not contain $EXPECTED_VERSION"
+            exit 1
+          fi
+          "$PREFIX/bin/gitnexus" --help >/dev/null
+          "$PREFIX/bin/gitnexus" mcp --help >/dev/null
+
+          (
+            cd "$ASSET_DIR"
+            sha256sum "$FILENAME" > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+      - name: Upload proven release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: electric-release-${{ needs.inspect.outputs.version }}
+          path: |
+            ${{ runner.temp }}/electric-release-assets/gitnexus-*.tgz
+            ${{ runner.temp }}/electric-release-assets/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Create protected Electric GitHub Release
+    needs: [inspect, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: internal-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.inspect.outputs.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Download proven release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: electric-release-${{ needs.inspect.outputs.version }}
+          path: release-assets
+      - name: Verify downloaded checksums
+        shell: bash
+        run: cd release-assets && sha256sum --check SHA256SUMS
+      - name: Create annotated Electric tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.inspect.outputs.tag }}
+          VERSION: ${{ needs.inspect.outputs.version }}
+          HEAD_SHA: ${{ needs.inspect.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          TAG_OBJECT="$(gh api --method POST "repos/$REPO/git/tags" \
+            -f "tag=$TAG" \
+            -f "message=GitNexus $VERSION" \
+            -f "object=$HEAD_SHA" \
+            -f 'type=commit' \
+            -f 'tagger[name]=github-actions[bot]' \
+            -f 'tagger[email]=41898282+github-actions[bot]@users.noreply.github.com' \
+            -f "tagger[date]=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --jq .sha)"
+          gh api --method POST "repos/$REPO/git/refs" \
+            -f "ref=refs/tags/$TAG" \
+            -f "sha=$TAG_OBJECT" >/dev/null
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
+        with:
+          tag_name: ${{ needs.inspect.outputs.tag }}
+          name: GitNexus ${{ needs.inspect.outputs.version }}
+          body_path: ${{ needs.inspect.outputs.notes_path }}
+          prerelease: ${{ inputs.prerelease }}
+          files: |
+            release-assets/gitnexus-*.tgz
+            release-assets/SHA256SUMS
+          fail_on_unmatched_files: true
