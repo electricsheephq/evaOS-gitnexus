@@ -161,8 +161,8 @@ interface RequiredStringGroup {
 
 const TOOL_REQUIRED_STRING_GROUPS: Readonly<Record<string, RequiredStringGroup>> = {
   impact: {
-    keys: ['target'],
-    error: 'impact requires at least one of target, name, or symbol.',
+    keys: ['target', 'target_uid'],
+    error: 'impact requires target, name, symbol, or target_uid.',
   },
   api_impact: {
     keys: ['route', 'file'],

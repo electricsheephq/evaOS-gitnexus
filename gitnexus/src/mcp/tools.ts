@@ -438,7 +438,7 @@ Each edit is tagged with confidence:
     name: 'impact',
     description: `Analyze the blast radius of changing a code symbol.
 Returns affected symbols grouped by depth, plus risk assessment, affected execution flows, and affected modules.
-Requires at least one of "target", "name", or "symbol"; aliases are normalized and conflicting values are rejected before repository resolution.
+Requires at least one of "target", "name", or "symbol", unless "target_uid" selects the symbol directly; aliases are normalized and conflicting values are rejected before repository resolution.
 
 MODE (opt-in): "callgraph" (default) walks symbol→symbol edges (CALLS/IMPORTS/EXTENDS/IMPLEMENTS) — inter-procedural, the established comparator/default behavior. "pdg" requires an index built with \`gitnexus analyze --pdg\` and returns one unified PDG-facing result: statement-level control/data dependence from the persisted PDG plus inter-procedural symbol reach. The explicit interprocedural surface is interproceduralByDepth/pdgInterprocedural; byDepth remains the compatibility symbol bucket. pdg remains incompatible with crossDepth and @group targets; relationTypes/minConfidence filter the inter-symbol reach.
 

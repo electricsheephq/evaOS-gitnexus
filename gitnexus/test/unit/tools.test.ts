@@ -169,6 +169,7 @@ describe('GITNEXUS_TOOLS', () => {
     expect(impactTool.description).toContain(
       'Requires at least one of "target", "name", or "symbol"',
     );
+    expect(impactTool.description).toContain('unless "target_uid" selects the symbol directly');
   });
 
   it('impact tool advertises the PDG-only `line` statement anchor (integer, min 0, not required)', () => {

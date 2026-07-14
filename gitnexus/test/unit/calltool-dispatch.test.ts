@@ -396,6 +396,22 @@ describe('LocalBackend.callTool', () => {
     },
   );
 
+  it('preserves impact target_uid-only selection before local dispatch', async () => {
+    const impactSpy = vi
+      .spyOn(backend as any, 'impact')
+      .mockResolvedValue({ status: 'uid-selected' });
+
+    const result = await backend.callTool('impact', {
+      target_uid: 'Function:src/auth.ts:validate',
+      direction: 'upstream',
+    });
+
+    expect(result).toEqual({ status: 'uid-selected' });
+    expect(impactSpy.mock.calls[0][1]).toMatchObject({
+      target_uid: 'Function:src/auth.ts:validate',
+    });
+  });
+
   it.each([
     ['impact', { target: 'validate', name: 'login', direction: 'upstream' }],
     ['impact', { name: 'validate', symbol: 'login', direction: 'upstream' }],
