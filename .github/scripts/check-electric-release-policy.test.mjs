@@ -93,6 +93,8 @@ jobs:
           gh release upload "$TAG" --clobber gitnexus-*.tgz SHA256SUMS
       - name: Verify assets and publish the draft
         run: |
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          gh api "repos/$REPO/releases/tags/$ENCODED_TAG"
           gh api --method PATCH releases/1 -F draft=false
 `;
 
@@ -335,6 +337,13 @@ test('rejects tag creation that does not target the exact inspected head', () =>
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /exact-head tag target/);
+});
+
+test('rejects a raw slash-bearing final release lookup', () => {
+  const workflow = replaceOnce(validWorkflow, 'releases/tags/$ENCODED_TAG', 'releases/tags/$TAG');
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /URL-encoded final release lookup/);
 });
 
 test('rejects missing electric tag, tarball, or checksum wiring', () => {

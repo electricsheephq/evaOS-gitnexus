@@ -398,7 +398,8 @@ jobs:
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
-          RELEASE_JSON="$(gh api "repos/$REPO/releases/tags/$TAG")"
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          RELEASE_JSON="$(gh api "repos/$REPO/releases/tags/$ENCODED_TAG")"
           RELEASE_ID="$(jq -r .id <<< "$RELEASE_JSON")"
           jq -e --arg tag "$TAG" --arg asset "gitnexus-$VERSION.tgz" '
             .tag_name == $tag and
