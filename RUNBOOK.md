@@ -205,7 +205,15 @@ interpreter. It rejects direct npm/Docker publication, registry-write
 permissions, registry configuration and credential variables, dynamic registry
 push inputs, and new unapproved OIDC jobs. Required review, branch protection,
 the protected environment, and the absence of registry credentials remain part
-of the release boundary.
+of the release boundary. Registry-adjacent workflow strings have no silent
+allowlist escape; an intentional policy change requires a reviewed checker and
+negative-test change.
+
+The package proof intentionally installs and executes the tarball on an isolated
+GitHub-hosted runner. Only protected-main manifests are read first; they must be
+regular JSON files no larger than 64 KiB and must match the committed package
+version. This proves the native CLI artifact without granting registry, runtime,
+index, or embedding access.
 
 After downloading both assets, verify and install locally:
 

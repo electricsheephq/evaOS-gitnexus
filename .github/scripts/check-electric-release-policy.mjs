@@ -212,6 +212,7 @@ function checkReleaseWorkflow(workflows) {
     ['.claude-plugin/marketplace.json', 'Claude marketplace manifest verification'],
     ['.agents/plugins/marketplace.json', 'Codex marketplace manifest verification'],
     ['manifest version mismatch', 'manifest mismatch failure'],
+    ['MAX_MANIFEST_BYTES', 'bounded manifest parsing'],
   ]);
 
   const packageStep = findNamedStep(workflow?.jobs?.package, 'Pack and install isolated CLI');

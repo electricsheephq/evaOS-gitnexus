@@ -40,6 +40,7 @@ jobs:
           echo .claude-plugin/marketplace.json
           echo .agents/plugins/marketplace.json
           echo "manifest version mismatch"
+          echo MAX_MANIFEST_BYTES
   ci:
     needs: inspect
     uses: ./.github/workflows/ci.yml
@@ -118,6 +119,12 @@ test.after(() => {
 
 test('accepts the protected GitHub-only electric release workflow', () => {
   const result = runChecker(createFixture());
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /electric release policy check passed/);
+});
+
+test('accepts the committed repository workflow set', () => {
+  const result = runChecker(REPO_ROOT);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /electric release policy check passed/);
 });

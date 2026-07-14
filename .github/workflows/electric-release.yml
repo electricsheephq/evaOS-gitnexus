@@ -86,6 +86,18 @@ jobs:
           VERSION="$VERSION" node <<'NODE'
           const fs = require('node:fs');
           const expected = process.env.VERSION;
+          const MAX_MANIFEST_BYTES = 64 * 1024;
+          function readManifest(file) {
+            const stat = fs.lstatSync(file);
+            if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_MANIFEST_BYTES) {
+              throw new Error(`manifest must be a non-empty regular file under ${MAX_MANIFEST_BYTES} bytes: ${file}`);
+            }
+            const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+            if (!value || typeof value !== 'object' || Array.isArray(value)) {
+              throw new Error(`manifest must contain a JSON object: ${file}`);
+            }
+            return value;
+          }
           const pluginPaths = [
             'gitnexus-claude-plugin/.claude-plugin/plugin.json',
             'gitnexus-claude-plugin/.codex-plugin/plugin.json',
@@ -95,13 +107,16 @@ jobs:
             '.agents/plugins/marketplace.json',
           ];
           for (const file of pluginPaths) {
-            const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+            const value = readManifest(file);
             if (value.version !== expected) {
               throw new Error(`manifest version mismatch: ${file} has ${value.version}, expected ${expected}`);
             }
           }
           for (const file of marketplacePaths) {
-            const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+            const value = readManifest(file);
+            if (!Array.isArray(value.plugins)) {
+              throw new Error(`marketplace manifest must contain a plugins array: ${file}`);
+            }
             const matches = value.plugins.filter((plugin) => plugin?.name === 'gitnexus');
             if (matches.length !== 1 || matches[0].version !== expected) {
               throw new Error(`manifest version mismatch: ${file} must contain one gitnexus ${expected} entry`);
