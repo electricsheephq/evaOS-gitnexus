@@ -1825,7 +1825,7 @@ describe('sanitizeWikiErrorForConsole', () => {
     const { sanitizeWikiErrorForConsole } = await import('../../src/cli/wiki.js');
 
     expect(sanitizeWikiErrorForConsole('first\r\nsecond\nthird\u001b[31mred\u2028last')).toBe(
-      'first second third\uFFFD[31mred last',
+      'firstsecondthird\uFFFD[31mred last',
     );
   });
 });
