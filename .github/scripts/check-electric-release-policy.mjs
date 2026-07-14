@@ -220,11 +220,21 @@ function checkReleaseWorkflow(workflows) {
     ['npm pack --dry-run', 'npm pack dry-run'],
     ['FILENAME="gitnexus-$EXPECTED_VERSION.tgz"', 'deterministic package asset filename'],
     [
+      'if [ ! -f "$ASSET_PATH" ] || [ ! -s "$ASSET_PATH" ]; then',
+      'non-empty regular package asset validation',
+    ],
+    [
       'if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then',
       'exact packaged-version equality check',
     ],
     ['SHA256SUMS', 'SHA256SUMS asset'],
   ]);
+  if (
+    typeof packageStep?.step?.run === 'string' &&
+    /\bJSON\.parse\s*\(/.test(packageStep.step.run)
+  ) {
+    fail('electric-release.yml package proof step must not parse npm pack stdout as JSON');
+  }
   const packageNeeds = Array.isArray(workflow?.jobs?.package?.needs)
     ? workflow.jobs.package.needs
     : [workflow?.jobs?.package?.needs];
