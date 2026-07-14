@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const EXPECTED_LADYBUG_VERSION = '0.18.1';
+
+function parseArgs(argv) {
+  const values = {};
+  for (let index = 0; index < argv.length; index += 2) {
+    const key = argv[index];
+    const value = argv[index + 1];
+    if (!key?.startsWith('--') || !value) {
+      throw new Error(
+        'usage: verify-electric-package.mjs --asset <tarball> --checksums <file> --prefix <dir> --expected-version <version>',
+      );
+    }
+    values[key.slice(2)] = value;
+  }
+  for (const key of ['asset', 'checksums', 'prefix', 'expected-version']) {
+    if (!values[key]) throw new Error(`missing --${key}`);
+  }
+  return values;
+}
+
+function requireRegularFile(file) {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.size <= 0)
+    throw new Error(`expected a non-empty regular file: ${file}`);
+}
+
+function verifyChecksum(assetPath, checksumPath) {
+  requireRegularFile(assetPath);
+  requireRegularFile(checksumPath);
+  const filename = path.basename(assetPath);
+  const matches = fs
+    .readFileSync(checksumPath, 'utf8')
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map((line) => line.match(/^([0-9a-f]{64})\s+\*?(.+)$/u))
+    .filter((match) => match?.[2] === filename);
+  if (matches.length !== 1) {
+    throw new Error(`SHA256SUMS must contain exactly one lowercase SHA-256 entry for ${filename}`);
+  }
+  const actual = createHash('sha256').update(fs.readFileSync(assetPath)).digest('hex');
+  if (actual !== matches[0][1]) throw new Error(`SHA-256 mismatch for ${filename}`);
+  return actual;
+}
+
+function locateInstalledPackage(prefix) {
+  const candidates = [
+    path.join(prefix, 'lib', 'node_modules', 'gitnexus'),
+    path.join(prefix, 'node_modules', 'gitnexus'),
+  ];
+  const installed = candidates.find((candidate) =>
+    fs.existsSync(path.join(candidate, 'package.json')),
+  );
+  if (!installed) throw new Error(`installed gitnexus package not found under ${prefix}`);
+  return installed;
+}
+
+function runCli(prefix, args) {
+  const executable =
+    process.platform === 'win32'
+      ? path.join(prefix, 'gitnexus.cmd')
+      : path.join(prefix, 'bin', 'gitnexus');
+  const result = spawnSync(executable, args, {
+    encoding: 'utf8',
+    env: { ...process.env, NO_COLOR: '1' },
+    shell: process.platform === 'win32',
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `gitnexus ${args.join(' ')} failed: ${result.error?.message ?? result.stderr.trim()}`,
+    );
+  }
+  return result.stdout.trim();
+}
+
+export function verifyElectricPackage({ asset, checksums, prefix, expectedVersion }) {
+  const digest = verifyChecksum(asset, checksums);
+  const installed = locateInstalledPackage(prefix);
+  const packageJson = JSON.parse(fs.readFileSync(path.join(installed, 'package.json'), 'utf8'));
+  if (packageJson.name !== 'gitnexus' || packageJson.version !== expectedVersion) {
+    throw new Error(
+      `installed package identity is ${packageJson.name}@${packageJson.version}, expected gitnexus@${expectedVersion}`,
+    );
+  }
+
+  const ladybugPackagePath = path.join(
+    installed,
+    'node_modules',
+    '@ladybugdb',
+    'core',
+    'package.json',
+  );
+  const ladybugPackage = JSON.parse(fs.readFileSync(ladybugPackagePath, 'utf8'));
+  if (ladybugPackage.version !== EXPECTED_LADYBUG_VERSION) {
+    throw new Error(
+      `installed @ladybugdb/core is ${ladybugPackage.version}, expected ${EXPECTED_LADYBUG_VERSION}`,
+    );
+  }
+
+  const requireFromPackage = createRequire(path.join(installed, 'package.json'));
+  const loaded = requireFromPackage('@ladybugdb/core');
+  const api = loaded?.default ?? loaded;
+  if (typeof api?.Database !== 'function' || typeof api?.Connection !== 'function') {
+    throw new Error('@ladybugdb/core loaded without Database and Connection constructors');
+  }
+
+  const versionOutput = runCli(prefix, ['--version']);
+  if (versionOutput !== expectedVersion) {
+    throw new Error(`packaged CLI version is ${versionOutput}, expected ${expectedVersion}`);
+  }
+  runCli(prefix, ['--help']);
+  runCli(prefix, ['mcp', '--help']);
+
+  return {
+    package: `gitnexus@${expectedVersion}`,
+    ladybug: `@ladybugdb/core@${EXPECTED_LADYBUG_VERSION}`,
+    sha256: digest,
+    nativeImport: 'ok',
+    cli: 'ok',
+    mcpHelp: 'ok',
+  };
+}
+
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+) {
+  try {
+    const args = parseArgs(process.argv.slice(2));
+    const result = verifyElectricPackage({
+      asset: path.resolve(args.asset),
+      checksums: path.resolve(args.checksums),
+      prefix: path.resolve(args.prefix),
+      expectedVersion: args['expected-version'],
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  }
+}
