@@ -13,7 +13,7 @@ const SCRIPT = path.join(
 );
 const temporaryRoots = [];
 
-function fixture({ ladybugVersion = '0.18.1' } = {}) {
+function fixture({ ladybugVersion = '0.18.1', checksumLineEnding = '\n' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-electric-package-'));
   temporaryRoots.push(root);
   const prefix = path.join(root, 'prefix');
@@ -29,6 +29,10 @@ function fixture({ ladybugVersion = '0.18.1' } = {}) {
     path.join(installed, 'package.json'),
     JSON.stringify({ name: 'gitnexus', version: '1.6.10-electric.2' }),
   );
+  fs.mkdirSync(path.join(installed, 'vendor', 'tree-sitter-typescript'), { recursive: true });
+  for (const name of ['tree-sitter-dart', 'tree-sitter-proto', 'tree-sitter-swift']) {
+    fs.mkdirSync(path.join(installed, 'node_modules', name), { recursive: true });
+  }
   fs.writeFileSync(
     path.join(ladybug, 'package.json'),
     JSON.stringify({ name: '@ladybugdb/core', version: ladybugVersion, main: 'index.cjs' }),
@@ -61,8 +65,8 @@ else process.exit(2);
   fs.writeFileSync(asset, 'deterministic tarball fixture');
   const digest = createHash('sha256').update(fs.readFileSync(asset)).digest('hex');
   const checksums = path.join(root, 'SHA256SUMS');
-  fs.writeFileSync(checksums, `${digest}  ${path.basename(asset)}\n`);
-  return { root, prefix, asset, checksums };
+  fs.writeFileSync(checksums, `${digest}  ${path.basename(asset)}${checksumLineEnding}`);
+  return { root, prefix, installed, asset, checksums };
 }
 
 function runArgs(args) {
@@ -95,9 +99,35 @@ test('verifies checksum, package identity, native import, CLI, and MCP help', ()
     ladybug: '@ladybugdb/core@0.18.1',
     sha256: createHash('sha256').update('deterministic tarball fixture').digest('hex'),
     nativeImport: 'ok',
+    vendorTree: 'ok',
     cli: 'ok',
     mcpHelp: 'ok',
   });
+});
+
+test('accepts CRLF checksum files', () => {
+  const result = run(fixture({ checksumLineEnding: '\r\n' }));
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('fails closed on vendor build artifacts', () => {
+  const values = fixture();
+  fs.mkdirSync(path.join(values.installed, 'vendor', 'tree-sitter-typescript', 'build'));
+  const result = run(values);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /vendor tree contains forbidden build artifacts/u);
+});
+
+test('fails closed when a materialized grammar is a symlink or junction', () => {
+  const values = fixture();
+  const grammar = path.join(values.installed, 'node_modules', 'tree-sitter-dart');
+  const target = path.join(values.root, 'grammar-target');
+  fs.rmSync(grammar, { recursive: true });
+  fs.mkdirSync(target);
+  fs.symlinkSync(target, grammar, process.platform === 'win32' ? 'junction' : 'dir');
+  const result = run(values);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must not be a symlink or junction/u);
 });
 
 test('fails closed when the installed LadybugDB version drifts', () => {

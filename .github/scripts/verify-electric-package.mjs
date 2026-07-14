@@ -43,7 +43,8 @@ function verifyChecksum(assetPath, checksumPath) {
   const filename = path.basename(assetPath);
   const matches = fs
     .readFileSync(checksumPath, 'utf8')
-    .split(/\r?\n/u)
+    .split(/\n/u)
+    .map((line) => line.replace(/\r$/u, ''))
     .filter(Boolean)
     .map((line) => line.match(/^([0-9a-f]{64})\s+\*?(.+)$/u))
     .filter((match) => match?.[2] === filename);
@@ -68,6 +69,11 @@ function locateInstalledPackage(prefix) {
 }
 
 function runCli(prefix, args) {
+  for (const arg of args) {
+    if (!/^[a-z0-9-]+$/iu.test(arg)) {
+      throw new Error(`unsafe packaged CLI argument: ${arg}`);
+    }
+  }
   const executable =
     process.platform === 'win32'
       ? path.join(prefix, 'gitnexus.cmd')
@@ -85,6 +91,37 @@ function runCli(prefix, args) {
   return result.stdout.trim();
 }
 
+function verifyVendorTree(installed) {
+  const vendorRoot = path.join(installed, 'vendor');
+  const forbidden = [];
+  if (fs.existsSync(vendorRoot)) {
+    const pending = [vendorRoot];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const entryPath = path.join(current, entry.name);
+        if (entry.name === 'node_modules' || entry.name === 'build') forbidden.push(entryPath);
+        if (entry.isDirectory() && !entry.isSymbolicLink()) pending.push(entryPath);
+      }
+    }
+  }
+  if (forbidden.length > 0) {
+    throw new Error(`vendor tree contains forbidden build artifacts: ${forbidden.join(', ')}`);
+  }
+
+  for (const name of ['tree-sitter-dart', 'tree-sitter-proto', 'tree-sitter-swift']) {
+    const entry = path.join(installed, 'node_modules', name);
+    if (!fs.existsSync(entry)) continue;
+    const stat = fs.lstatSync(entry);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`materialized grammar must not be a symlink or junction: ${entry}`);
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`materialized grammar must be a directory: ${entry}`);
+    }
+  }
+}
+
 export function verifyElectricPackage({ asset, checksums, prefix, expectedVersion }) {
   const digest = verifyChecksum(asset, checksums);
   const installed = locateInstalledPackage(prefix);
@@ -94,6 +131,7 @@ export function verifyElectricPackage({ asset, checksums, prefix, expectedVersio
       `installed package identity is ${packageJson.name}@${packageJson.version}, expected gitnexus@${expectedVersion}`,
     );
   }
+  verifyVendorTree(installed);
 
   const ladybugPackagePath = path.join(
     installed,
@@ -128,6 +166,7 @@ export function verifyElectricPackage({ asset, checksums, prefix, expectedVersio
     ladybug: `@ladybugdb/core@${EXPECTED_LADYBUG_VERSION}`,
     sha256: digest,
     nativeImport: 'ok',
+    vendorTree: 'ok',
     cli: 'ok',
     mcpHelp: 'ok',
   };
