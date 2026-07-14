@@ -56,6 +56,8 @@ jobs:
         run: |
           npm pack --dry-run
           npm pack
+          FILENAME="gitnexus-$EXPECTED_VERSION.tgz"
+          test -s "$FILENAME"
           VERSION_OUTPUT="$EXPECTED_VERSION"
           if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then exit 1; fi
           shasum -a 256 gitnexus-*.tgz > SHA256SUMS
@@ -307,6 +309,17 @@ test('rejects packaging that does not depend on exact-head CI', () => {
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /package job must depend on exact-head ci/);
+});
+
+test('rejects parsing npm pack stdout instead of using the deterministic asset name', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '          FILENAME="gitnexus-$EXPECTED_VERSION.tgz"\n',
+    '          FILENAME="$(node -e \'JSON.parse(process.env.PACK_OUTPUT)\')"\n',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /deterministic package asset filename/);
 });
 
 test('rejects an unencoded slash-bearing tag-state lookup', () => {

@@ -218,6 +218,7 @@ function checkReleaseWorkflow(workflows) {
   const packageStep = findNamedStep(workflow?.jobs?.package, 'Pack and install isolated CLI');
   checkRunRequirements(packageStep, 'package proof step', [
     ['npm pack --dry-run', 'npm pack dry-run'],
+    ['FILENAME="gitnexus-$EXPECTED_VERSION.tgz"', 'deterministic package asset filename'],
     [
       'if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then',
       'exact packaged-version equality check',
