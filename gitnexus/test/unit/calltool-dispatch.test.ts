@@ -380,6 +380,53 @@ describe('LocalBackend.callTool', () => {
   });
 
   it.each([
+    ['impact', { direction: 'upstream' }, /target.*name.*symbol/i],
+    ['impact', { target: '   ', direction: 'upstream' }, /target.*name.*symbol/i],
+    ['api_impact', {}, /route.*file/i],
+    ['api_impact', { route: ' ', file: '' }, /route.*file/i],
+  ])(
+    'rejects missing %s lookup keys before repository resolution',
+    async (method, params, error) => {
+      const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+
+      const result = await backend.callTool(method, params);
+
+      expect(result.error).toMatch(error);
+      expect(resolveSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it('preserves impact target_uid-only selection before local dispatch', async () => {
+    const impactSpy = vi
+      .spyOn(backend as any, 'impact')
+      .mockResolvedValue({ status: 'uid-selected' });
+
+    const result = await backend.callTool('impact', {
+      target_uid: 'Function:src/auth.ts:validate',
+      direction: 'upstream',
+    });
+
+    expect(result).toEqual({ status: 'uid-selected' });
+    expect(impactSpy.mock.calls[0][1]).toMatchObject({
+      target_uid: 'Function:src/auth.ts:validate',
+    });
+  });
+
+  it('removes blank api_impact lookup keys before dispatching a valid fallback', async () => {
+    const apiImpactSpy = vi
+      .spyOn(backend as any, 'apiImpact')
+      .mockResolvedValue({ status: 'file-selected' });
+
+    const result = await backend.callTool('api_impact', {
+      route: '   ',
+      file: ' src/routes.ts ',
+    });
+
+    expect(result).toEqual({ status: 'file-selected' });
+    expect(apiImpactSpy.mock.calls[0][1]).toEqual({ file: 'src/routes.ts' });
+  });
+
+  it.each([
     ['impact', { target: 'validate', name: 'login', direction: 'upstream' }],
     ['impact', { name: 'validate', symbol: 'login', direction: 'upstream' }],
     ['context', { name: 'validate', file_path: 'src/auth.ts', file: 'src/login.ts' }],
@@ -405,6 +452,23 @@ describe('LocalBackend.callTool', () => {
     });
 
     expect(groupImpactSpy.mock.calls[0][0]).toMatchObject({ target: 'validate' });
+  });
+
+  it('preserves impact target_uid-only selection before @group forwarding', async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    const groupImpactSpy = vi
+      .spyOn(backend.getGroupService(), 'groupImpact')
+      .mockResolvedValue({ status: 'uid-selected' } as any);
+
+    await backend.callTool('impact', {
+      target_uid: 'Function:src/auth.ts:validate',
+      direction: 'upstream',
+      repo: '@grp',
+    });
+
+    expect(groupImpactSpy.mock.calls[0][0]).toMatchObject({
+      target_uid: 'Function:src/auth.ts:validate',
+    });
   });
 
   it('dispatches query tool', async () => {

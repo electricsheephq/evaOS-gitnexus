@@ -28,12 +28,6 @@ export interface ToolDefinition {
       }
     >;
     required: string[];
-    /**
-     * JSON-Schema `anyOf` for cross-property constraints `required` cannot express
-     * — e.g. "at least one of route/file". Forwarded verbatim to clients by the
-     * server's ListTools handler, so MCP clients see the constraint.
-     */
-    anyOf?: Array<{ required: string[] }>;
   };
 }
 
@@ -444,6 +438,7 @@ Each edit is tagged with confidence:
     name: 'impact',
     description: `Analyze the blast radius of changing a code symbol.
 Returns affected symbols grouped by depth, plus risk assessment, affected execution flows, and affected modules.
+Requires at least one of "target", "name", or "symbol", unless "target_uid" selects the symbol directly; aliases are normalized and conflicting values are rejected before repository resolution.
 
 MODE (opt-in): "callgraph" (default) walks symbol→symbol edges (CALLS/IMPORTS/EXTENDS/IMPLEMENTS) — inter-procedural, the established comparator/default behavior. "pdg" requires an index built with \`gitnexus analyze --pdg\` and returns one unified PDG-facing result: statement-level control/data dependence from the persisted PDG plus inter-procedural symbol reach. The explicit interprocedural surface is interproceduralByDepth/pdgInterprocedural; byDepth remains the compatibility symbol bucket. pdg remains incompatible with crossDepth and @group targets; relationTypes/minConfidence filter the inter-symbol reach.
 
@@ -615,7 +610,6 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
         },
       },
       required: ['direction'],
-      anyOf: [{ required: ['target'] }, { required: ['name'] }, { required: ['symbol'] }],
     },
   },
   {
@@ -784,7 +778,7 @@ Returns routes that have both detected response keys AND consumers. Shows top-le
     name: 'api_impact',
     description: `Pre-change impact report for an API route handler.
 
-WHEN TO USE: BEFORE modifying any API route handler. Shows what consumers depend on, what response fields they access, what middleware protects the route, and what execution flows it triggers. Requires at least "route" or "file" parameter.
+WHEN TO USE: BEFORE modifying any API route handler. Shows what consumers depend on, what response fields they access, what middleware protects the route, and what execution flows it triggers. Requires at least "route" or "file" parameter; the requirement is enforced before repository resolution.
 
 Risk levels: LOW (0-3 consumers), MEDIUM (4-9 or any mismatches), HIGH (10+ consumers or mismatches with 4+ consumers). Mismatches with confidence "low" indicate the consumer file fetches multiple routes — property attribution is approximate.
 
@@ -803,9 +797,6 @@ Response shape is keyed on how many routes match, not on the data: exactly one m
         repo: { type: 'string', description: 'Repository name or path.' },
       },
       required: [],
-      // Exactly one lookup key is needed, but either works (route wins if both
-      // are passed) — so the structural constraint is "at least one of route/file".
-      anyOf: [{ required: ['route'] }, { required: ['file'] }],
     },
   },
   {

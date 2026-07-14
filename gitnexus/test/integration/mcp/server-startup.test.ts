@@ -234,7 +234,7 @@ describe('MCP server end-to-end startup', () => {
       const toolsResponse = (await server.nextMessage()) as {
         jsonrpc: string;
         id: number;
-        result?: { tools: Array<{ name: string }> };
+        result?: { tools: Array<{ name: string; inputSchema: Record<string, unknown> }> };
       };
 
       expect(toolsResponse.id).toBe(2);
@@ -251,6 +251,11 @@ describe('MCP server end-to-end startup', () => {
       ];
       for (const t of expectedTools) {
         expect(toolNames).toContain(t);
+      }
+      for (const tool of toolsResponse.result!.tools) {
+        expect(tool.inputSchema).not.toHaveProperty('anyOf');
+        expect(tool.inputSchema).not.toHaveProperty('oneOf');
+        expect(tool.inputSchema).not.toHaveProperty('allOf');
       }
 
       // tools/call list_repos — proves the paginated { repositories, pagination }

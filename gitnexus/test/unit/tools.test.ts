@@ -59,6 +59,14 @@ describe('GITNEXUS_TOOLS', () => {
     }
   });
 
+  it('advertises provider-compatible root schemas without combinators', () => {
+    for (const tool of GITNEXUS_TOOLS) {
+      expect(tool.inputSchema).not.toHaveProperty('anyOf');
+      expect(tool.inputSchema).not.toHaveProperty('oneOf');
+      expect(tool.inputSchema).not.toHaveProperty('allOf');
+    }
+  });
+
   it('each tool exposes all MCP safety annotations', () => {
     for (const tool of GITNEXUS_TOOLS) {
       expect(typeof tool.annotations.readOnlyHint).toBe('boolean');
@@ -144,14 +152,12 @@ describe('GITNEXUS_TOOLS', () => {
     expect(contextTool.inputSchema.properties.file).toMatchObject({ type: 'string' });
   });
 
-  it('api_impact tool expresses the route-or-file requirement via anyOf (#2308)', () => {
+  it('api_impact describes its runtime-enforced route-or-file requirement', () => {
     const apiImpactTool = GITNEXUS_TOOLS.find((t) => t.name === 'api_impact')!;
-    expect(apiImpactTool.inputSchema.anyOf).toEqual([
-      { required: ['route'] },
-      { required: ['file'] },
-    ]);
-    // route/file stay optional in `required` (anyOf carries the cross-field rule)
     expect(apiImpactTool.inputSchema.required).toEqual([]);
+    expect(apiImpactTool.inputSchema.properties).toHaveProperty('route');
+    expect(apiImpactTool.inputSchema.properties).toHaveProperty('file');
+    expect(apiImpactTool.description).toContain('Requires at least "route" or "file" parameter');
   });
 
   it('impact tool requires direction and accepts target, name, or symbol', () => {
@@ -160,11 +166,10 @@ describe('GITNEXUS_TOOLS', () => {
     expect(impactTool.inputSchema.required).not.toContain('target');
     expect(impactTool.inputSchema.properties.name).toMatchObject({ type: 'string' });
     expect(impactTool.inputSchema.properties.symbol).toMatchObject({ type: 'string' });
-    expect(impactTool.inputSchema.anyOf).toEqual([
-      { required: ['target'] },
-      { required: ['name'] },
-      { required: ['symbol'] },
-    ]);
+    expect(impactTool.description).toContain(
+      'Requires at least one of "target", "name", or "symbol"',
+    );
+    expect(impactTool.description).toContain('unless "target_uid" selects the symbol directly');
   });
 
   it('impact tool advertises the PDG-only `line` statement anchor (integer, min 0, not required)', () => {

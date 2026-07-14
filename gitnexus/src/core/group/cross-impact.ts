@@ -125,6 +125,7 @@ export function validateGroupImpactParams(params: Record<string, unknown>):
       name: string;
       repoPath: string;
       target: string;
+      targetUid?: string;
       direction: 'upstream' | 'downstream';
       maxDepth: number;
       crossDepth: number;
@@ -140,10 +141,11 @@ export function validateGroupImpactParams(params: Record<string, unknown>):
   const name = String(params.name ?? '').trim();
   const repoPath = String(params.repo ?? '').trim();
   const target = String(params.target ?? '').trim();
+  const targetUid = String(params.target_uid ?? '').trim();
   if (!name) return { ok: false, error: 'name is required' };
   if (!repoPath)
     return { ok: false, error: 'repo is required (group repo path, e.g. app/backend)' };
-  if (!target) return { ok: false, error: 'target is required' };
+  if (!target && !targetUid) return { ok: false, error: 'target or target_uid is required' };
   if (
     params.service !== undefined &&
     params.service !== null &&
@@ -190,6 +192,7 @@ export function validateGroupImpactParams(params: Record<string, unknown>):
     name,
     repoPath,
     target,
+    targetUid: targetUid || undefined,
     direction,
     maxDepth,
     crossDepth,
@@ -446,6 +449,7 @@ export async function runGroupImpact(
     name,
     repoPath,
     target,
+    targetUid,
     direction,
     maxDepth,
     crossDepth: _crossDepth,
@@ -472,7 +476,8 @@ export async function runGroupImpact(
   if ('error' in resolved) return { error: resolved.error };
 
   const impactParams: Parameters<GroupToolPort['impact']>[1] = {
-    target,
+    target: target || undefined,
+    target_uid: targetUid,
     direction,
     maxDepth,
     relationTypes: relationTypes && relationTypes.length > 0 ? relationTypes : undefined,

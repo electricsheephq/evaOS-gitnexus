@@ -63,6 +63,21 @@ describe('cross-impact', () => {
     if (!r.ok) expect(r.error).toContain('direction');
   });
 
+  it('accepts target_uid as the group impact selector', () => {
+    const result = validateGroupImpactParams({
+      name: 'suite',
+      repo: 'app/backend',
+      target_uid: 'Function:src/auth.ts:validate',
+      direction: 'upstream',
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      target: '',
+      targetUid: 'Function:src/auth.ts:validate',
+    });
+  });
+
   it('test_validateGroupImpactParams_clamps_crossDepth_and_warns', () => {
     const r = validateGroupImpactParams({
       name: 'g',

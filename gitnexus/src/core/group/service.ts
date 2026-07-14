@@ -38,7 +38,8 @@ export interface GroupToolPort {
   impact(
     repo: GroupRepoHandle,
     params: {
-      target: string;
+      target?: string;
+      target_uid?: string;
       direction: 'upstream' | 'downstream';
       maxDepth?: number;
       relationTypes?: string[];

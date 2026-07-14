@@ -71,6 +71,9 @@ describe('MCP read-only mode', () => {
       expect(response.tools.map((tool) => tool.name).sort()).toEqual(READ_ONLY_TOOLS);
       for (const tool of response.tools) {
         expect(tool.description).not.toMatch(/GROUP MODE|CROSS-REPO|@<groupName>/);
+        expect(tool.inputSchema).not.toHaveProperty('anyOf');
+        expect(tool.inputSchema).not.toHaveProperty('oneOf');
+        expect(tool.inputSchema).not.toHaveProperty('allOf');
         const properties = tool.inputSchema.properties as Record<
           string,
           { description?: string } | undefined
