@@ -81,10 +81,10 @@ jobs:
           echo "tag_exists=$TAG_EXISTS"
           echo "release_exists=$RELEASE_EXISTS"
       - name: Create annotated Electric tag when absent
+        if: steps.resume_state.outputs.tag_exists != 'true'
         run: |
-          if [ "$TAG_EXISTS" != "true" ]; then
-            echo "create annotated tag"
-          fi
+          gh api --method POST "repos/$REPO/git/tags" -f object="$HEAD_SHA"
+          gh api --method POST "repos/$REPO/git/refs"
       - name: Create or resume draft release and upload assets
         run: |
           if [ "$RELEASE_EXISTS" != "true" ]; then
@@ -317,6 +317,24 @@ test('rejects protected mutation without a fresh current-main guard', () => {
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /fresh current-main guard/);
+});
+
+test('rejects tag creation without the resumable-state guard', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    "        if: steps.resume_state.outputs.tag_exists != 'true'\n",
+    '',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /tag creation guard/);
+});
+
+test('rejects tag creation that does not target the exact inspected head', () => {
+  const workflow = replaceOnce(validWorkflow, '-f object="$HEAD_SHA"', '-f object="$GITHUB_SHA"');
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /exact-head tag target/);
 });
 
 test('rejects missing electric tag, tarball, or checksum wiring', () => {

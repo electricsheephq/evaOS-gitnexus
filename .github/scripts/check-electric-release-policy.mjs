@@ -242,6 +242,15 @@ function checkReleaseWorkflow(workflows) {
   ]);
 
   const tagStep = findNamedStep(releaseJob, 'Create annotated Electric tag when absent');
+  if (tagStep?.step?.if !== "steps.resume_state.outputs.tag_exists != 'true'") {
+    fail('electric-release.yml tag creation guard must use the reverified tag state');
+  }
+  checkRunRequirements(tagStep, 'tag creation step', [
+    ['--method POST', 'POST-only tag creation'],
+    ['git/tags', 'annotated tag object creation'],
+    ['git/refs', 'tag ref creation'],
+    ['$HEAD_SHA', 'exact-head tag target'],
+  ]);
   const upsertStep = findNamedStep(releaseJob, 'Create or resume draft release and upload assets');
   checkRunRequirements(upsertStep, 'draft release step', [
     ['gh release create', 'draft release creation'],
