@@ -7,11 +7,29 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { EXPECTED_LADYBUG_VERSION } from './verify-electric-package.mjs';
+
 const SCRIPT = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'verify-electric-package.mjs',
 );
 const temporaryRoots = [];
+
+test('keeps the release verifier synchronized with the exact package pin', () => {
+  const packageJson = JSON.parse(
+    fs.readFileSync(
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        '..',
+        '..',
+        'gitnexus',
+        'package.json',
+      ),
+      'utf8',
+    ),
+  );
+  assert.equal(packageJson.dependencies['@ladybugdb/core'], EXPECTED_LADYBUG_VERSION);
+});
 
 function fixture({ ladybugVersion = '0.18.1', checksumLineEnding = '\n' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-electric-package-'));

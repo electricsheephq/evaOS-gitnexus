@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const EXPECTED_LADYBUG_VERSION = '0.18.1';
+export const EXPECTED_LADYBUG_VERSION = '0.18.1';
 const ARGUMENT_KEYS = new Set(['asset', 'checksums', 'prefix', 'expected-version']);
 const USAGE =
   'usage: verify-electric-package.mjs --asset <tarball> --checksums <file> --prefix <dir> --expected-version <version>';
