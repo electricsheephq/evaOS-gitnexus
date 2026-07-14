@@ -1,0 +1,479 @@
+name: Recover Electric Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        description: 'Exact retained fork version, for example 1.6.10-electric.2'
+        required: true
+        type: string
+      release_id:
+        description: 'Immutable numeric ID of the retained draft release'
+        required: true
+        type: string
+      source_sha:
+        description: 'Exact 40-hex release source commit proven by the original run'
+        required: true
+        type: string
+      source_run_id:
+        description: 'Original failed Electric Release workflow run ID'
+        required: true
+        type: string
+      tarball_sha256:
+        description: 'Exact 64-hex SHA-256 of the retained tarball'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark the recovered GitHub Release as a prerelease'
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: Verify proven Electric draft recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      policy_sha: ${{ steps.proof.outputs.policy_sha }}
+      version: ${{ steps.proof.outputs.version }}
+      tag: ${{ steps.proof.outputs.tag }}
+      release_id: ${{ steps.proof.outputs.release_id }}
+      source_sha: ${{ steps.proof.outputs.source_sha }}
+      source_run_id: ${{ steps.proof.outputs.source_run_id }}
+      tarball_sha256: ${{ steps.proof.outputs.tarball_sha256 }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+      - name: Validate recovery inputs
+        id: inputs
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TARBALL_SHA256: ${{ inputs.tarball_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Electric release recovery may run only from refs/heads/main."
+            exit 1
+          fi
+          if ! [[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-electric\.[0-9]+$ ]]; then
+            echo "::error::Version must match X.Y.Z-electric.N."
+            exit 1
+          fi
+          if ! [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::release_id must be a positive integer."
+            exit 1
+          fi
+          if ! [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::source_run_id must be a positive integer."
+            exit 1
+          fi
+          if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::source_sha must be exactly 40 lowercase hexadecimal characters."
+            exit 1
+          fi
+          if ! [[ "$TARBALL_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::tarball_sha256 must be exactly 64 lowercase hexadecimal characters."
+            exit 1
+          fi
+          {
+            echo "version=$EXPECTED_VERSION"
+            echo "release_id=$RELEASE_ID"
+            echo "source_sha=$SOURCE_SHA"
+            echo "source_run_id=$SOURCE_RUN_ID"
+            echo "tarball_sha256=$TARBALL_SHA256"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.inputs.outputs.source_sha }}
+          path: release-source
+          persist-credentials: false
+      - name: Verify proven Electric draft recovery
+        id: proof
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+          RELEASE_ID: ${{ steps.inputs.outputs.release_id }}
+          SOURCE_SHA: ${{ steps.inputs.outputs.source_sha }}
+          SOURCE_RUN_ID: ${{ steps.inputs.outputs.source_run_id }}
+          TARBALL_SHA256: ${{ steps.inputs.outputs.tarball_sha256 }}
+        run: |
+          set -euo pipefail
+          POLICY_SHA="$(git rev-parse HEAD)"
+          if [ "$POLICY_SHA" != "$GITHUB_SHA" ]; then
+            echo "::error::Recovery policy checkout does not match the workflow run SHA."
+            exit 1
+          fi
+          CURRENT_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
+          if [ "$CURRENT_MAIN_SHA" != "$POLICY_SHA" ]; then
+            echo "::error::Recovery policy SHA is not current GitHub main."
+            exit 1
+          fi
+          git cat-file -e "$SOURCE_SHA^{commit}"
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" "$POLICY_SHA"; then
+            echo "::error::Release source $SOURCE_SHA is not an ancestor of current main $POLICY_SHA."
+            exit 1
+          fi
+
+          SOURCE_DIR="$GITHUB_WORKSPACE/release-source" VERSION="$VERSION" node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const expected = process.env.VERSION;
+          const sourceDir = process.env.SOURCE_DIR;
+          const MAX_MANIFEST_BYTES = 64 * 1024;
+          function readManifest(file) {
+            const absolute = path.join(sourceDir, file);
+            const stat = fs.lstatSync(absolute);
+            if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_MANIFEST_BYTES) {
+              throw new Error(`manifest must be a non-empty regular file under ${MAX_MANIFEST_BYTES} bytes: ${file}`);
+            }
+            const value = JSON.parse(fs.readFileSync(absolute, 'utf8'));
+            if (!value || typeof value !== 'object' || Array.isArray(value)) {
+              throw new Error(`manifest must contain a JSON object: ${file}`);
+            }
+            return value;
+          }
+          const packageManifest = readManifest('gitnexus/package.json');
+          if (packageManifest.name !== 'gitnexus' || packageManifest.version !== expected) {
+            throw new Error('manifest version mismatch: gitnexus/package.json');
+          }
+          for (const file of [
+            'gitnexus-claude-plugin/.claude-plugin/plugin.json',
+            'gitnexus-claude-plugin/.codex-plugin/plugin.json',
+          ]) {
+            if (readManifest(file).version !== expected) {
+              throw new Error(`manifest version mismatch: ${file}`);
+            }
+          }
+          for (const file of ['.claude-plugin/marketplace.json', '.agents/plugins/marketplace.json']) {
+            const value = readManifest(file);
+            const matches = Array.isArray(value.plugins)
+              ? value.plugins.filter((plugin) => plugin?.name === 'gitnexus')
+              : [];
+            if (matches.length !== 1 || matches[0].version !== expected) {
+              throw new Error(`manifest version mismatch: ${file}`);
+            }
+          }
+          const notes = path.join(sourceDir, 'Documentation/releases', `${expected}.md`);
+          const notesStat = fs.lstatSync(notes);
+          if (!notesStat.isFile() || notesStat.size <= 0) {
+            throw new Error(`missing release notes for ${expected}`);
+          }
+          NODE
+
+          RUN_JSON="$(gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID")"
+          jq -e --arg sha "$SOURCE_SHA" '
+            .path == ".github/workflows/electric-release.yml" and
+            .event == "workflow_dispatch" and
+            .status == "completed" and
+            .conclusion == "failure" and
+            .head_sha == $sha
+          ' <<< "$RUN_JSON" >/dev/null
+          gh api --paginate --slurp "repos/$REPO/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100" \
+            > /tmp/electric-recovery-jobs.json
+          jq -e '
+            ([.[] | .jobs[] | select(.name == "Verify Electric release identity" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name == "Exact-head CI / CI Gate" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name | startswith("Exact-head CI /")) | select(.conclusion != "success" and .conclusion != "skipped")] | length) == 0 and
+            ([.[] | .jobs[] | select(.name == "Build and prove release tarball" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name == "Create protected Electric GitHub Release" and .conclusion == "failure")] | length) == 1
+          ' /tmp/electric-recovery-jobs.json >/dev/null
+          gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals" \
+            > /tmp/electric-recovery-approvals.json
+          jq -e '
+            [.[] | select(.state == "approved") | .environments[]? | select(.name == "internal-release")]
+            | length > 0
+          ' /tmp/electric-recovery-approvals.json >/dev/null
+
+          TAG="electric/v$VERSION"
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          gh api "repos/$REPO/git/ref/tags/$ENCODED_TAG" > /tmp/electric-recovery-tag.json
+          OBJECT_TYPE="$(jq -r .object.type /tmp/electric-recovery-tag.json)"
+          OBJECT_SHA="$(jq -r .object.sha /tmp/electric-recovery-tag.json)"
+          for _ in 1 2 3 4; do
+            if [ "$OBJECT_TYPE" != "tag" ]; then break; fi
+            gh api "repos/$REPO/git/tags/$OBJECT_SHA" > /tmp/electric-recovery-tag-object.json
+            OBJECT_TYPE="$(jq -r .object.type /tmp/electric-recovery-tag-object.json)"
+            OBJECT_SHA="$(jq -r .object.sha /tmp/electric-recovery-tag-object.json)"
+          done
+          if [ "$OBJECT_TYPE" != "commit" ] || [ "$OBJECT_SHA" != "$SOURCE_SHA" ]; then
+            echo "::error::Immutable tag $TAG does not resolve to source $SOURCE_SHA."
+            exit 1
+          fi
+
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" \
+            > /tmp/electric-recovery-release-pages.json
+          RELEASE_MATCHES="$(jq -c --arg tag "$TAG" \
+            '[.[][] | select(.tag_name == $tag)]' \
+            /tmp/electric-recovery-release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          case "$RELEASE_COUNT" in
+            0)
+              echo "::error::No draft release exists for $TAG"
+              exit 1
+              ;;
+            1) ;;
+            *)
+              echo "::error::Multiple releases exist for $TAG"
+              exit 1
+              ;;
+          esac
+          RELEASE_JSON="$(jq -c '.[0]' <<< "$RELEASE_MATCHES")"
+          ASSET_NAME="gitnexus-$VERSION.tgz"
+          jq -e \
+            --arg id "$RELEASE_ID" \
+            --arg source "$SOURCE_SHA" \
+            --arg asset "$ASSET_NAME" \
+            --arg digest "sha256:$TARBALL_SHA256" '
+              (.id | tostring) == $id and
+              .draft == true and
+              .target_commitish == $source and
+              (.assets | length) == 2 and
+              ([.assets[] | select(.name == $asset and .size > 0 and .digest == $digest)] | length) == 1 and
+              ([.assets[] | select(.name == "SHA256SUMS" and .size > 0 and (.digest | startswith("sha256:")))] | length) == 1
+            ' <<< "$RELEASE_JSON" >/dev/null
+
+          {
+            echo "policy_sha=$POLICY_SHA"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "release_id=$RELEASE_ID"
+            echo "source_sha=$SOURCE_SHA"
+            echo "source_run_id=$SOURCE_RUN_ID"
+            echo "tarball_sha256=$TARBALL_SHA256"
+          } >> "$GITHUB_OUTPUT"
+
+  recover:
+    name: Publish proven Electric draft
+    needs: inspect
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: internal-release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.inspect.outputs.policy_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+      - name: Reverify proven Electric draft recovery
+        id: state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          POLICY_SHA: ${{ needs.inspect.outputs.policy_sha }}
+          VERSION: ${{ needs.inspect.outputs.version }}
+          TAG: ${{ needs.inspect.outputs.tag }}
+          RELEASE_ID: ${{ needs.inspect.outputs.release_id }}
+          SOURCE_SHA: ${{ needs.inspect.outputs.source_sha }}
+          SOURCE_RUN_ID: ${{ needs.inspect.outputs.source_run_id }}
+          TARBALL_SHA256: ${{ needs.inspect.outputs.tarball_sha256 }}
+        run: |
+          set -euo pipefail
+          CURRENT_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
+          if [ "$CURRENT_MAIN_SHA" != "$POLICY_SHA" ]; then
+            echo "::error::main advanced after recovery inspection."
+            exit 1
+          fi
+
+          RUN_JSON="$(gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID")"
+          jq -e --arg sha "$SOURCE_SHA" '
+            .path == ".github/workflows/electric-release.yml" and
+            .event == "workflow_dispatch" and
+            .status == "completed" and
+            .conclusion == "failure" and
+            .head_sha == $sha
+          ' <<< "$RUN_JSON" >/dev/null
+          gh api --paginate --slurp "repos/$REPO/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100" \
+            > /tmp/electric-recovery-reverify-jobs.json
+          jq -e '
+            ([.[] | .jobs[] | select(.name == "Exact-head CI / CI Gate" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name | startswith("Exact-head CI /")) | select(.conclusion != "success" and .conclusion != "skipped")] | length) == 0 and
+            ([.[] | .jobs[] | select(.name == "Build and prove release tarball" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name == "Create protected Electric GitHub Release" and .conclusion == "failure")] | length) == 1
+          ' /tmp/electric-recovery-reverify-jobs.json >/dev/null
+          gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals" \
+            > /tmp/electric-recovery-reverify-approvals.json
+          jq -e '
+            [.[] | select(.state == "approved") | .environments[]? | select(.name == "internal-release")]
+            | length > 0
+          ' /tmp/electric-recovery-reverify-approvals.json >/dev/null
+
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          gh api "repos/$REPO/git/ref/tags/$ENCODED_TAG" > /tmp/electric-recovery-reverify-tag.json
+          OBJECT_TYPE="$(jq -r .object.type /tmp/electric-recovery-reverify-tag.json)"
+          OBJECT_SHA="$(jq -r .object.sha /tmp/electric-recovery-reverify-tag.json)"
+          for _ in 1 2 3 4; do
+            if [ "$OBJECT_TYPE" != "tag" ]; then break; fi
+            gh api "repos/$REPO/git/tags/$OBJECT_SHA" > /tmp/electric-recovery-reverify-tag-object.json
+            OBJECT_TYPE="$(jq -r .object.type /tmp/electric-recovery-reverify-tag-object.json)"
+            OBJECT_SHA="$(jq -r .object.sha /tmp/electric-recovery-reverify-tag-object.json)"
+          done
+          if [ "$OBJECT_TYPE" != "commit" ] || [ "$OBJECT_SHA" != "$SOURCE_SHA" ]; then
+            echo "::error::Immutable tag moved or no longer resolves to the proven source."
+            exit 1
+          fi
+
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" \
+            > /tmp/electric-recovery-reverify-release-pages.json
+          RELEASE_MATCHES="$(jq -c --arg tag "$TAG" \
+            '[.[][] | select(.tag_name == $tag)]' \
+            /tmp/electric-recovery-reverify-release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          case "$RELEASE_COUNT" in
+            0)
+              echo "::error::No draft release exists for $TAG"
+              exit 1
+              ;;
+            1) ;;
+            *)
+              echo "::error::Multiple releases exist for $TAG"
+              exit 1
+              ;;
+          esac
+          RELEASE_JSON="$(jq -c '.[0]' <<< "$RELEASE_MATCHES")"
+          ASSET_NAME="gitnexus-$VERSION.tgz"
+          jq -e \
+            --arg id "$RELEASE_ID" \
+            --arg source "$SOURCE_SHA" \
+            --arg asset "$ASSET_NAME" \
+            --arg digest "sha256:$TARBALL_SHA256" '
+              (.id | tostring) == $id and
+              .draft == true and
+              .target_commitish == $source and
+              (.assets | length) == 2 and
+              ([.assets[] | select(.name == $asset and .size > 0 and .digest == $digest)] | length) == 1 and
+              ([.assets[] | select(.name == "SHA256SUMS" and .size > 0 and (.digest | startswith("sha256:")))] | length) == 1
+            ' <<< "$RELEASE_JSON" >/dev/null
+          TARBALL_ASSET_ID="$(jq -r --arg asset "$ASSET_NAME" '.assets[] | select(.name == $asset) | .id' <<< "$RELEASE_JSON")"
+          CHECKSUM_ASSET_ID="$(jq -r '.assets[] | select(.name == "SHA256SUMS") | .id' <<< "$RELEASE_JSON")"
+          {
+            echo "tarball_asset_id=$TARBALL_ASSET_ID"
+            echo "checksum_asset_id=$CHECKSUM_ASSET_ID"
+          } >> "$GITHUB_OUTPUT"
+      - name: Verify retained assets and publish by immutable ID
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          POLICY_SHA: ${{ needs.inspect.outputs.policy_sha }}
+          VERSION: ${{ needs.inspect.outputs.version }}
+          TAG: ${{ needs.inspect.outputs.tag }}
+          RELEASE_ID: ${{ needs.inspect.outputs.release_id }}
+          SOURCE_SHA: ${{ needs.inspect.outputs.source_sha }}
+          TARBALL_SHA256: ${{ needs.inspect.outputs.tarball_sha256 }}
+          TARBALL_ASSET_ID: ${{ steps.state.outputs.tarball_asset_id }}
+          CHECKSUM_ASSET_ID: ${{ steps.state.outputs.checksum_asset_id }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          VERIFY_DIR="$(mktemp -d)"
+          PREFIX="$RUNNER_TEMP/electric-recovery-prefix"
+          FILENAME="gitnexus-$VERSION.tgz"
+          cd "$VERIFY_DIR"
+          gh api -H "Accept: application/octet-stream" \
+            "repos/$REPO/releases/assets/$TARBALL_ASSET_ID" > "$FILENAME"
+          gh api -H "Accept: application/octet-stream" \
+            "repos/$REPO/releases/assets/$CHECKSUM_ASSET_ID" > SHA256SUMS
+          if [ ! -f "$FILENAME" ] || [ ! -s "$FILENAME" ] || [ ! -f SHA256SUMS ] || [ ! -s SHA256SUMS ]; then
+            echo "::error::Retained release assets are missing or empty."
+            exit 1
+          fi
+          EXPECTED_SUM_LINE="$TARBALL_SHA256  $FILENAME"
+          if [ "$(wc -l < SHA256SUMS | tr -d ' ')" != "1" ] || [ "$(cat SHA256SUMS)" != "$EXPECTED_SUM_LINE" ]; then
+            echo "::error::SHA256SUMS must contain exactly the proven tarball digest and filename."
+            exit 1
+          fi
+          sha256sum --check --strict SHA256SUMS
+          if [ "$(sha256sum "$FILENAME" | awk '{print $1}')" != "$TARBALL_SHA256" ]; then
+            echo "::error::Downloaded tarball digest does not match the proven digest."
+            exit 1
+          fi
+
+          npm install --global --prefix "$PREFIX" "$FILENAME"
+          VERSION_OUTPUT="$("$PREFIX/bin/gitnexus" --version)"
+          if [ "$VERSION_OUTPUT" != "$VERSION" ]; then
+            echo "::error::Retained CLI version '$VERSION_OUTPUT' does not equal $VERSION."
+            exit 1
+          fi
+          "$PREFIX/bin/gitnexus" --help >/dev/null
+          "$PREFIX/bin/gitnexus" mcp --help >/dev/null
+
+          FINAL_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
+          if [ "$FINAL_MAIN_SHA" != "$POLICY_SHA" ]; then
+            echo "::error::main advanced during retained asset verification."
+            exit 1
+          fi
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          gh api "repos/$REPO/git/ref/tags/$ENCODED_TAG" > /tmp/electric-recovery-final-tag.json
+          OBJECT_TYPE="$(jq -r .object.type /tmp/electric-recovery-final-tag.json)"
+          OBJECT_SHA="$(jq -r .object.sha /tmp/electric-recovery-final-tag.json)"
+          for _ in 1 2 3 4; do
+            if [ "$OBJECT_TYPE" != "tag" ]; then break; fi
+            gh api "repos/$REPO/git/tags/$OBJECT_SHA" > /tmp/electric-recovery-final-tag-object.json
+            OBJECT_TYPE="$(jq -r .object.type /tmp/electric-recovery-final-tag-object.json)"
+            OBJECT_SHA="$(jq -r .object.sha /tmp/electric-recovery-final-tag-object.json)"
+          done
+          if [ "$OBJECT_TYPE" != "commit" ]; then
+            echo "::error::Immutable tag no longer resolves to a commit."
+            exit 1
+          fi
+          if [ "$OBJECT_SHA" != "$SOURCE_SHA" ]; then
+            echo "::error::Immutable tag moved during retained asset verification."
+            exit 1
+          fi
+
+          FINAL_JSON="$(gh api "repos/$REPO/releases/$RELEASE_ID")"
+          jq -e \
+            --arg id "$RELEASE_ID" \
+            --arg tag "$TAG" \
+            --arg source "$SOURCE_SHA" \
+            --arg asset "$FILENAME" \
+            --arg digest "sha256:$TARBALL_SHA256" '
+              (.id | tostring) == $id and
+              .tag_name == $tag and
+              .draft == true and
+              .target_commitish == $source and
+              (.assets | length) == 2 and
+              ([.assets[] | select(.name == $asset and .size > 0 and .digest == $digest)] | length) == 1 and
+              ([.assets[] | select(.name == "SHA256SUMS" and .size > 0)] | length) == 1
+            ' <<< "$FINAL_JSON" >/dev/null
+
+          PUBLISHED_JSON="$(gh api --method PATCH "repos/$REPO/releases/$RELEASE_ID" \
+            -F draft=false \
+            -F prerelease="$PRERELEASE")"
+          jq -e \
+            --arg id "$RELEASE_ID" \
+            --arg tag "$TAG" \
+            --argjson prerelease "$PRERELEASE" '
+              (.id | tostring) == $id and .tag_name == $tag and .draft == false and .prerelease == $prerelease
+            ' <<< "$PUBLISHED_JSON" >/dev/null
