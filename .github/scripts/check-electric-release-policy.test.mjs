@@ -30,10 +30,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - run: |
+      - name: Verify release identity and manifest versions
+        run: |
           test "$GITHUB_REF" = refs/heads/main
           TAG="electric/v1.6.10-electric.1"
           echo "$TAG"
+          echo gitnexus-claude-plugin/.claude-plugin/plugin.json
+          echo gitnexus-claude-plugin/.codex-plugin/plugin.json
+          echo .claude-plugin/marketplace.json
+          echo .agents/plugins/marketplace.json
+          echo "manifest version mismatch"
   ci:
     needs: inspect
     uses: ./.github/workflows/ci.yml
@@ -48,6 +54,8 @@ jobs:
       - run: |
           npm pack --dry-run
           npm pack
+          VERSION_OUTPUT="$EXPECTED_VERSION"
+          if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then exit 1; fi
           shasum -a 256 gitnexus-*.tgz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
@@ -62,7 +70,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - run: |
+      - name: Create or resume draft release and upload assets
+        run: |
           if [ "$TAG_EXISTS" != "true" ]; then
             echo "create annotated tag"
           fi
@@ -139,6 +148,18 @@ test('rejects a build action whose push input is not statically false', () => {
   assert.match(result.stderr, /push must be statically false/);
 });
 
+test('rejects docker login actions and non-static push-to-registry inputs', () => {
+  const root = createFixture();
+  fs.writeFileSync(
+    path.join(root, '.github/workflows/unsafe-registry.yml'),
+    `name: Unsafe registry\non:\n  workflow_dispatch:\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: docker/login-action@deadbeef\n      - uses: example/publisher@deadbeef\n        with:\n          push-to-registry: \${{ github.ref == 'refs/heads/main' }}\n`,
+  );
+  const result = runChecker(root);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /docker login/);
+  assert.match(result.stderr, /enables registry push/);
+});
+
 test('rejects release triggers other than workflow_dispatch', () => {
   const workflow = replaceOnce(
     validWorkflow,
@@ -159,6 +180,17 @@ test('rejects a release job without the protected environment', () => {
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /internal-release/);
+});
+
+test('rejects write permissions on non-release jobs', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '  package:\n    needs: [inspect, ci]\n    permissions:\n      contents: read',
+    '  package:\n    needs: [inspect, ci]\n    permissions:\n      contents: write',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must stay read-only/);
 });
 
 test('rejects registry-capable permissions and non-minimal release permissions', () => {
@@ -207,6 +239,23 @@ test('rejects a release flow without resumable draft and asset upload semantics'
   assert.match(result.stderr, /draft release/);
   assert.match(result.stderr, /resumable asset upload/);
   assert.match(result.stderr, /publish the verified draft/);
+});
+
+test('rejects missing manifest verification or release ordering', () => {
+  let workflow = replaceOnce(
+    validWorkflow,
+    'gitnexus-claude-plugin/.codex-plugin/plugin.json',
+    'missing-codex-plugin.json',
+  );
+  workflow = replaceOnce(
+    workflow,
+    '      - name: Verify release identity and manifest versions',
+    '      - name: Create or resume draft release and upload assets',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Codex plugin manifest verification/);
+  assert.match(result.stderr, /manifest verification must run before release mutation/);
 });
 
 test('rejects missing electric tag, tarball, or checksum wiring', () => {

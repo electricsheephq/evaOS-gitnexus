@@ -142,6 +142,18 @@ function checkReleaseWorkflow(workflows) {
   }
 
   const releaseJob = workflow?.jobs?.release;
+  for (const jobName of ['inspect', 'ci', 'package']) {
+    const permissions = workflow?.jobs?.[jobName]?.permissions;
+    const entries =
+      permissions && typeof permissions === 'object' ? Object.entries(permissions) : [];
+    for (const [scope, level] of entries) {
+      if (level !== 'read' && level !== 'none') {
+        fail(
+          `electric-release.yml:jobs.${jobName}.permissions.${scope} must stay read-only, got ${level}`,
+        );
+      }
+    }
+  }
   const environment =
     typeof releaseJob?.environment === 'string'
       ? releaseJob.environment
@@ -175,6 +187,10 @@ function checkReleaseWorkflow(workflows) {
     ['gitnexus-', '.tgz asset', /gitnexus-[^\s]*\.tgz/],
     ['SHA256SUMS', 'SHA256SUMS asset'],
     ['npm pack --dry-run', 'npm pack dry-run'],
+    [
+      'if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then',
+      'exact packaged-version equality check',
+    ],
     ['internal-release', 'protected environment'],
     ['refs/heads/main', 'main ref guard'],
     ['TAG_EXISTS', 'exact-head tag resume guard'],
@@ -184,11 +200,31 @@ function checkReleaseWorkflow(workflows) {
     ['gh release upload', 'release asset upload'],
     ['--clobber', 'resumable asset upload'],
     ['-F draft=false', 'publish the verified draft'],
+    ['gitnexus-claude-plugin/.claude-plugin/plugin.json', 'Claude plugin manifest verification'],
+    ['gitnexus-claude-plugin/.codex-plugin/plugin.json', 'Codex plugin manifest verification'],
+    ['.claude-plugin/marketplace.json', 'Claude marketplace manifest verification'],
+    ['.agents/plugins/marketplace.json', 'Codex marketplace manifest verification'],
+    ['manifest version mismatch', 'manifest mismatch failure'],
   ];
   for (const [literal, description, pattern] of requiredText) {
     if (pattern ? !pattern.test(candidate.raw) : !candidate.raw.includes(literal)) {
       fail(`electric-release.yml must include ${description}`);
     }
+  }
+
+  const verifyPosition = candidate.raw.indexOf(
+    '- name: Verify release identity and manifest versions',
+  );
+  const mutationPositions = [
+    candidate.raw.indexOf('- name: Create annotated Electric tag when absent'),
+    candidate.raw.indexOf('- name: Create or resume draft release and upload assets'),
+  ].filter((position) => position >= 0);
+  if (
+    verifyPosition < 0 ||
+    mutationPositions.length === 0 ||
+    mutationPositions.some((position) => verifyPosition >= position)
+  ) {
+    fail('electric-release.yml manifest verification must run before release mutation');
   }
 }
 

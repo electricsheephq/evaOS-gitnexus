@@ -207,8 +207,8 @@ jobs:
 
           npm install --global --prefix "$PREFIX" "$ASSET_PATH"
           VERSION_OUTPUT="$("$PREFIX/bin/gitnexus" --version)"
-          if [[ "$VERSION_OUTPUT" != *"$EXPECTED_VERSION"* ]]; then
-            echo "::error::Packaged CLI version '$VERSION_OUTPUT' does not contain $EXPECTED_VERSION"
+          if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then
+            echo "::error::Packaged CLI version '$VERSION_OUTPUT' does not equal $EXPECTED_VERSION"
             exit 1
           fi
           "$PREFIX/bin/gitnexus" --help >/dev/null
