@@ -224,9 +224,17 @@ function checkReleaseWorkflow(workflows) {
     ],
     ['SHA256SUMS', 'SHA256SUMS asset'],
   ]);
+  const packageNeeds = Array.isArray(workflow?.jobs?.package?.needs)
+    ? workflow.jobs.package.needs
+    : [workflow?.jobs?.package?.needs];
+  if (!packageNeeds.includes('ci')) {
+    fail('electric-release.yml package job must depend on exact-head ci');
+  }
 
   const reverifyStep = findNamedStep(releaseJob, 'Reverify resumable release state');
   checkRunRequirements(reverifyStep, 'reverify resumable release state step', [
+    ['ENCODED_TAG', 'URL-encoded tag-state lookup'],
+    ['git/ref/tags/$ENCODED_TAG', 'URL-encoded tag-state lookup'],
     ['TAG_EXISTS', 'fresh tag-state output'],
     ['RELEASE_EXISTS', 'fresh release-state output'],
   ]);

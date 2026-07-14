@@ -74,6 +74,8 @@ jobs:
     steps:
       - name: Reverify resumable release state
         run: |
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          curl "https://api.github.com/repos/$REPO/git/ref/tags/$ENCODED_TAG"
           echo "tag_exists=$TAG_EXISTS"
           echo "release_exists=$RELEASE_EXISTS"
       - name: Create annotated Electric tag when absent
@@ -260,7 +262,7 @@ test('rejects a release flow without resumable draft and asset upload semantics'
 test('rejects a release flow without protected-job state re-verification', () => {
   const workflow = replaceOnce(
     validWorkflow,
-    '      - name: Reverify resumable release state\n        run: |\n          echo "tag_exists=$TAG_EXISTS"\n          echo "release_exists=$RELEASE_EXISTS"\n',
+    '      - name: Reverify resumable release state\n        run: |\n          ENCODED_TAG="$(jq -rn --arg value "$TAG" \'$value | @uri\')"\n          curl "https://api.github.com/repos/$REPO/git/ref/tags/$ENCODED_TAG"\n          echo "tag_exists=$TAG_EXISTS"\n          echo "release_exists=$RELEASE_EXISTS"\n',
     '',
   );
   const result = runChecker(createFixture(workflow));
@@ -288,6 +290,24 @@ test('rejects release mutation that does not depend on manifest verification', (
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /manifest verification must run before release mutation/);
+});
+
+test('rejects packaging that does not depend on exact-head CI', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '  package:\n    needs: [inspect, ci]',
+    '  package:\n    needs: [inspect]',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /package job must depend on exact-head ci/);
+});
+
+test('rejects an unencoded slash-bearing tag-state lookup', () => {
+  const workflow = replaceOnce(validWorkflow, 'git/ref/tags/$ENCODED_TAG', 'git/ref/tags/$TAG');
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /URL-encoded tag-state lookup/);
 });
 
 test('rejects missing electric tag, tarball, or checksum wiring', () => {
