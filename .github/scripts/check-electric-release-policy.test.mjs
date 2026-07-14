@@ -59,15 +59,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Pack and install isolated CLI
+      - name: Pack release tarball
         run: |
           npm pack --dry-run
           npm pack
           FILENAME="gitnexus-$EXPECTED_VERSION.tgz"
           ASSET_PATH="$FILENAME"
           if [ ! -f "$ASSET_PATH" ] || [ ! -s "$ASSET_PATH" ]; then exit 1; fi
-          VERSION_OUTPUT="$EXPECTED_VERSION"
-          if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then exit 1; fi
           shasum -a 256 gitnexus-*.tgz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
@@ -75,8 +73,25 @@ jobs:
           path: |
             gitnexus-*.tgz
             SHA256SUMS
-  release:
+  package_proof:
+    name: Prove release tarball (\${{ matrix.os }})
     needs: [inspect, package]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - name: Install and verify release tarball
+        run: |
+          npm install --global --prefix "$PREFIX" "$ASSET_PATH"
+          node .github/scripts/verify-electric-package.mjs \
+            --asset "$ASSET_PATH" \
+            --checksums "$ASSET_DIR/SHA256SUMS" \
+            --prefix "$PREFIX" \
+            --expected-version "$EXPECTED_VERSION"
+  release:
+    needs: [inspect, package, package_proof]
     environment:
       name: internal-release
     permissions:
@@ -180,6 +195,9 @@ jobs:
           echo .github/workflows/electric-release.yml
           echo "Exact-head CI / CI Gate"
           echo "Build and prove release tarball"
+          echo "Prove release tarball (ubuntu-latest)"
+          echo "Prove release tarball (macos-latest)"
+          echo "Prove release tarball (windows-latest)"
           echo "Create protected Electric GitHub Release"
           gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals"
           echo internal-release
@@ -209,6 +227,9 @@ jobs:
           gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID"
           echo "Exact-head CI / CI Gate"
           echo "Build and prove release tarball"
+          echo "Prove release tarball (ubuntu-latest)"
+          echo "Prove release tarball (macos-latest)"
+          echo "Prove release tarball (windows-latest)"
           gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals"
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
           gh api "repos/$REPO/git/ref/tags/$ENCODED_TAG"
@@ -451,7 +472,7 @@ test('rejects missing manifest verification or release ordering', () => {
 test('rejects release mutation that does not depend on manifest verification', () => {
   const workflow = replaceOnce(
     validWorkflow,
-    '  release:\n    needs: [inspect, package]',
+    '  release:\n    needs: [inspect, package, package_proof]',
     '  release:\n    needs: [package]',
   );
   const result = runChecker(createFixture(workflow));
@@ -468,6 +489,39 @@ test('rejects packaging that does not depend on exact-head CI', () => {
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /package job must depend on exact-head ci/);
+});
+
+test('rejects package proof that omits a supported runner family', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '        os: [ubuntu-latest, macos-latest, windows-latest]',
+    '        os: [ubuntu-latest, windows-latest]',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /package proof matrix must cover ubuntu, macOS, and Windows/);
+});
+
+test('rejects a package proof display name that would break recovery', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '    name: Prove release tarball (${{ matrix.os }})',
+    '    name: Release package proof (${{ matrix.os }})',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /package proof job name must match recovery proof identities/);
+});
+
+test('rejects package proof that skips the shared verifier', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    'verify-electric-package.mjs',
+    'unverified-package.mjs',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /shared package verifier/);
 });
 
 test('rejects packaging without the deterministic asset name', () => {

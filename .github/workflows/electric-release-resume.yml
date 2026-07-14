@@ -197,6 +197,9 @@ jobs:
             ([.[] | .jobs[] | select(.name == "Exact-head CI / CI Gate" and .conclusion == "success")] | length) == 1 and
             ([.[] | .jobs[] | select(.name | startswith("Exact-head CI /")) | select(.conclusion != "success" and .conclusion != "skipped")] | length) == 0 and
             ([.[] | .jobs[] | select(.name == "Build and prove release tarball" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name == "Prove release tarball (ubuntu-latest)" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name == "Prove release tarball (macos-latest)" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name == "Prove release tarball (windows-latest)" and .conclusion == "success")] | length) == 1 and
             ([.[] | .jobs[] | select(.name == "Create protected Electric GitHub Release" and .conclusion == "failure")] | length) == 1
           ' /tmp/electric-recovery-jobs.json >/dev/null
           gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals" \
@@ -319,6 +322,9 @@ jobs:
             ([.[] | .jobs[] | select(.name == "Exact-head CI / CI Gate" and .conclusion == "success")] | length) == 1 and
             ([.[] | .jobs[] | select(.name | startswith("Exact-head CI /")) | select(.conclusion != "success" and .conclusion != "skipped")] | length) == 0 and
             ([.[] | .jobs[] | select(.name == "Build and prove release tarball" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name == "Prove release tarball (ubuntu-latest)" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name == "Prove release tarball (macos-latest)" and .conclusion == "success")] | length) == 1 and
+            ([.[] | .jobs[] | select(.name == "Prove release tarball (windows-latest)" and .conclusion == "success")] | length) == 1 and
             ([.[] | .jobs[] | select(.name == "Create protected Electric GitHub Release" and .conclusion == "failure")] | length) == 1
           ' /tmp/electric-recovery-reverify-jobs.json >/dev/null
           gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals" \

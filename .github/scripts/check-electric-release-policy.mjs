@@ -188,12 +188,12 @@ function checkReleaseWorkflow(workflows) {
     }
   }
 
-  for (const jobName of ['inspect', 'ci', 'package', 'release']) {
+  for (const jobName of ['inspect', 'ci', 'package', 'package_proof', 'release']) {
     if (!workflow?.jobs?.[jobName]) fail(`electric-release.yml must define ${jobName} job`);
   }
 
   const releaseJob = workflow?.jobs?.release;
-  for (const jobName of ['inspect', 'ci', 'package']) {
+  for (const jobName of ['inspect', 'ci', 'package', 'package_proof']) {
     const permissions = workflow?.jobs?.[jobName]?.permissions;
     const entries =
       permissions && typeof permissions === 'object' ? Object.entries(permissions) : [];
@@ -249,17 +249,13 @@ function checkReleaseWorkflow(workflows) {
   ]);
   checkDraftSafeReleaseLookup(inspectStep, 'manifest verification step');
 
-  const packageStep = findNamedStep(workflow?.jobs?.package, 'Pack and install isolated CLI');
-  checkRunRequirements(packageStep, 'package proof step', [
+  const packageStep = findNamedStep(workflow?.jobs?.package, 'Pack release tarball');
+  checkRunRequirements(packageStep, 'package build step', [
     ['npm pack --dry-run', 'npm pack dry-run'],
     ['FILENAME="gitnexus-$EXPECTED_VERSION.tgz"', 'deterministic package asset filename'],
     [
       'if [ ! -f "$ASSET_PATH" ] || [ ! -s "$ASSET_PATH" ]; then',
       'non-empty regular package asset validation',
-    ],
-    [
-      'if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then',
-      'exact packaged-version equality check',
     ],
     ['SHA256SUMS', 'SHA256SUMS asset'],
   ]);
@@ -267,7 +263,7 @@ function checkReleaseWorkflow(workflows) {
     typeof packageStep?.step?.run === 'string' &&
     /\bJSON\.parse\s*\(/.test(packageStep.step.run)
   ) {
-    fail('electric-release.yml package proof step must not parse npm pack stdout as JSON');
+    fail('electric-release.yml package build step must not parse npm pack stdout as JSON');
   }
   const packageNeeds = Array.isArray(workflow?.jobs?.package?.needs)
     ? workflow.jobs.package.needs
@@ -275,6 +271,34 @@ function checkReleaseWorkflow(workflows) {
   if (!packageNeeds.includes('ci')) {
     fail('electric-release.yml package job must depend on exact-head ci');
   }
+
+  const proofJob = workflow?.jobs?.package_proof;
+  if (proofJob?.name !== 'Prove release tarball (${{ matrix.os }})') {
+    fail('electric-release.yml package proof job name must match recovery proof identities');
+  }
+  const proofOperatingSystems = proofJob?.strategy?.matrix?.os;
+  const expectedOperatingSystems = ['macos-latest', 'ubuntu-latest', 'windows-latest'];
+  if (
+    !Array.isArray(proofOperatingSystems) ||
+    JSON.stringify([...proofOperatingSystems].sort()) !== JSON.stringify(expectedOperatingSystems)
+  ) {
+    fail('electric-release.yml package proof matrix must cover ubuntu, macOS, and Windows');
+  }
+  const proofNeeds = Array.isArray(proofJob?.needs) ? proofJob.needs : [proofJob?.needs];
+  if (!proofNeeds.includes('inspect') || !proofNeeds.includes('package')) {
+    fail(
+      'electric-release.yml package proof must depend on inspected release identity and tarball',
+    );
+  }
+  const proofStep = findNamedStep(proofJob, 'Install and verify release tarball');
+  checkRunRequirements(proofStep, 'cross-platform package proof step', [
+    ['npm install --global --prefix', 'clean-prefix package installation'],
+    ['verify-electric-package.mjs', 'shared package verifier'],
+    ['--asset', 'tarball checksum verification'],
+    ['--checksums', 'SHA256SUMS verification'],
+    ['--prefix', 'installed-prefix verification'],
+    ['--expected-version', 'exact packaged-version equality check'],
+  ]);
 
   const reverifyStep = findNamedStep(releaseJob, 'Reverify resumable release state');
   checkRunRequirements(reverifyStep, 'reverify resumable release state step', [
@@ -317,7 +341,11 @@ function checkReleaseWorkflow(workflows) {
   checkDraftSafeReleaseLookup(publishStep, 'publish the verified draft step');
 
   const releaseNeeds = Array.isArray(releaseJob?.needs) ? releaseJob.needs : [releaseJob?.needs];
-  if (!releaseNeeds.includes('inspect') || !releaseNeeds.includes('package')) {
+  if (
+    !releaseNeeds.includes('inspect') ||
+    !releaseNeeds.includes('package') ||
+    !releaseNeeds.includes('package_proof')
+  ) {
     fail('electric-release.yml manifest verification must run before release mutation');
   }
   const orderedReleaseSteps = [reverifyStep, tagStep, upsertStep, publishStep];
@@ -410,6 +438,9 @@ function checkRecoveryWorkflow(workflows) {
     ['.github/workflows/electric-release.yml', 'original Electric Release workflow identity'],
     ['Exact-head CI / CI Gate', 'successful exact-head CI proof'],
     ['Build and prove release tarball', 'successful package proof'],
+    ['Prove release tarball (ubuntu-latest)', 'successful Linux package proof'],
+    ['Prove release tarball (macos-latest)', 'successful macOS package proof'],
+    ['Prove release tarball (windows-latest)', 'successful Windows package proof'],
     ['Create protected Electric GitHub Release', 'failed protected release proof'],
     ['repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals', 'original environment approval proof'],
     ['internal-release', 'internal-release approval proof'],
@@ -426,6 +457,9 @@ function checkRecoveryWorkflow(workflows) {
     ['repos/$REPO/actions/runs/$SOURCE_RUN_ID', 'original Electric Release run proof'],
     ['Exact-head CI / CI Gate', 'successful exact-head CI proof'],
     ['Build and prove release tarball', 'successful package proof'],
+    ['Prove release tarball (ubuntu-latest)', 'successful Linux package proof'],
+    ['Prove release tarball (macos-latest)', 'successful macOS package proof'],
+    ['Prove release tarball (windows-latest)', 'successful Windows package proof'],
     ['repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals', 'original environment approval proof'],
     ['$RELEASE_ID', 'immutable release ID binding'],
     ['$SOURCE_SHA', 'immutable source SHA binding'],
