@@ -13,6 +13,12 @@ const ARGUMENT_KEYS = new Set(['asset', 'checksums', 'prefix', 'expected-version
 const USAGE =
   'usage: verify-electric-package.mjs --asset <tarball> --checksums <file> --prefix <dir> --expected-version <version>';
 
+export function isCliTimeout(result) {
+  return (
+    result.error?.code === 'ETIMEDOUT' || (result.status === null && result.signal === 'SIGKILL')
+  );
+}
+
 function parseArgs(argv) {
   const values = {};
   for (let index = 0; index < argv.length; index += 2) {
@@ -127,7 +133,7 @@ export function runCli(prefix, args, timeoutMs = PACKAGED_CLI_TIMEOUT_MS) {
     shell: false,
     timeout: timeoutMs,
   });
-  if (result.error?.code === 'ETIMEDOUT') {
+  if (isCliTimeout(result)) {
     throw new Error(`gitnexus ${args.join(' ')} timed out after ${timeoutMs}ms`);
   }
   if (result.error || result.status !== 0) {

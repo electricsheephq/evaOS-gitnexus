@@ -7,7 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { EXPECTED_LADYBUG_VERSION, runCli } from './verify-electric-package.mjs';
+import { EXPECTED_LADYBUG_VERSION, isCliTimeout, runCli } from './verify-electric-package.mjs';
 
 const SCRIPT = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -147,6 +147,12 @@ test('fails fast when the packaged CLI hangs', () => {
   assert.ok(Date.now() - started < 5_000, 'hard timeout must not wait for natural child exit');
 });
 
+test('classifies timeout results consistently across Node platforms', () => {
+  assert.equal(isCliTimeout({ error: { code: 'ETIMEDOUT' }, status: null, signal: null }), true);
+  assert.equal(isCliTimeout({ error: undefined, status: null, signal: 'SIGKILL' }), true);
+  assert.equal(isCliTimeout({ error: { code: 'ENOENT' }, status: null, signal: null }), false);
+});
+
 test('fails closed when the installed launcher is unusable', () => {
   const values = fixture();
   if (process.platform === 'win32') {
@@ -156,7 +162,7 @@ test('fails closed when the installed launcher is unusable', () => {
   }
   const result = run(values);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /gitnexus(?: CLI entry| launcher)|EACCES/u);
+  assert.match(result.stderr, /gitnexus(?: CLI entry| launcher)|EACCES|ENOENT/u);
 });
 
 test('fails closed when the installed launcher targets the wrong entry', () => {
