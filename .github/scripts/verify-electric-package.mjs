@@ -86,6 +86,22 @@ function locateInstalledCli(prefix) {
   return entry;
 }
 
+function verifyInstalledLauncher(prefix, entry) {
+  const firstLine = fs.readFileSync(entry, 'utf8').split(/\r?\n/u, 1)[0];
+  if (!/^#!.*\bnode\b/u.test(firstLine)) {
+    throw new Error(`installed gitnexus CLI entry must declare a Node shebang: ${entry}`);
+  }
+  if (process.platform === 'win32') {
+    requireRegularFile(path.join(prefix, 'gitnexus.cmd'));
+    return;
+  }
+  const launcher = path.join(prefix, 'bin', 'gitnexus');
+  if (!fs.existsSync(launcher))
+    throw new Error(`installed gitnexus launcher is missing: ${launcher}`);
+  fs.accessSync(entry, fs.constants.X_OK);
+  fs.accessSync(launcher, fs.constants.X_OK);
+}
+
 export function runCli(prefix, args, timeoutMs = PACKAGED_CLI_TIMEOUT_MS) {
   for (const arg of args) {
     if (!/^[a-z0-9-]+$/iu.test(arg)) {
@@ -152,6 +168,7 @@ export function verifyElectricPackage({ asset, checksums, prefix, expectedVersio
     );
   }
   verifyVendorTree(installed);
+  verifyInstalledLauncher(prefix, locateInstalledCli(prefix));
 
   const ladybugPackagePath = path.join(
     installed,
@@ -187,6 +204,7 @@ export function verifyElectricPackage({ asset, checksums, prefix, expectedVersio
     sha256: digest,
     nativeImport: 'ok',
     vendorTree: 'ok',
+    launcher: 'ok',
     cli: 'ok',
     mcpHelp: 'ok',
   };

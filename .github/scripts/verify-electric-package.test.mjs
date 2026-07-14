@@ -73,6 +73,17 @@ else process.exit(2);
   const cliScript = path.join(installed, 'dist', 'cli', 'index.js');
   fs.mkdirSync(path.dirname(cliScript), { recursive: true });
   fs.writeFileSync(cliScript, cliSource);
+  if (process.platform === 'win32') {
+    fs.writeFileSync(
+      path.join(prefix, 'gitnexus.cmd'),
+      '@node "%~dp0\\node_modules\\gitnexus\\dist\\cli\\index.js" %*\r\n',
+    );
+  } else {
+    fs.chmodSync(cliScript, 0o755);
+    const bin = path.join(prefix, 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.symlinkSync(cliScript, path.join(bin, 'gitnexus'));
+  }
 
   const asset = path.join(root, 'gitnexus-1.6.10-electric.2.tgz');
   fs.writeFileSync(asset, 'deterministic tarball fixture');
@@ -113,6 +124,7 @@ test('verifies checksum, package identity, native import, CLI, and MCP help', ()
     sha256: createHash('sha256').update('deterministic tarball fixture').digest('hex'),
     nativeImport: 'ok',
     vendorTree: 'ok',
+    launcher: 'ok',
     cli: 'ok',
     mcpHelp: 'ok',
   });
@@ -135,6 +147,18 @@ test('fails fast when the packaged CLI hangs', () => {
   assert.ok(Date.now() - started < 5_000, 'hard timeout must not wait for natural child exit');
 });
 
+test('fails closed when the installed launcher is unusable', () => {
+  const values = fixture();
+  if (process.platform === 'win32') {
+    fs.rmSync(path.join(values.prefix, 'gitnexus.cmd'));
+  } else {
+    fs.chmodSync(values.cliScript, 0o644);
+  }
+  const result = run(values);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /gitnexus(?: CLI entry| launcher)|EACCES/u);
+});
+
 test('fails closed on vendor build artifacts', () => {
   const values = fixture();
   fs.mkdirSync(path.join(values.installed, 'vendor', 'tree-sitter-typescript', 'build'));
@@ -143,17 +167,19 @@ test('fails closed on vendor build artifacts', () => {
   assert.match(result.stderr, /vendor tree contains forbidden build artifacts/u);
 });
 
-test('fails closed when a materialized grammar is a symlink or junction', () => {
-  const values = fixture();
-  const grammar = path.join(values.installed, 'node_modules', 'tree-sitter-dart');
-  const target = path.join(values.root, 'grammar-target');
-  fs.rmSync(grammar, { recursive: true });
-  fs.mkdirSync(target);
-  fs.symlinkSync(target, grammar, process.platform === 'win32' ? 'junction' : 'dir');
-  const result = run(values);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /must not be a symlink or junction/u);
-});
+for (const name of ['tree-sitter-dart', 'tree-sitter-proto', 'tree-sitter-swift']) {
+  test(`fails closed when ${name} is a symlink or junction`, () => {
+    const values = fixture();
+    const grammar = path.join(values.installed, 'node_modules', name);
+    const target = path.join(values.root, `${name}-target`);
+    fs.rmSync(grammar, { recursive: true });
+    fs.mkdirSync(target);
+    fs.symlinkSync(target, grammar, process.platform === 'win32' ? 'junction' : 'dir');
+    const result = run(values);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /must not be a symlink or junction/u);
+  });
+}
 
 test('fails closed when the installed LadybugDB version drifts', () => {
   const result = run(fixture({ ladybugVersion: '0.18.0' }));

@@ -74,6 +74,7 @@ jobs:
             gitnexus-*.tgz
             SHA256SUMS
   package_proof:
+    name: Prove release tarball (\${{ matrix.os }})
     needs: [inspect, package]
     strategy:
       matrix:
@@ -499,6 +500,17 @@ test('rejects package proof that omits a supported runner family', () => {
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /package proof matrix must cover ubuntu, macOS, and Windows/);
+});
+
+test('rejects a package proof display name that would break recovery', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '    name: Prove release tarball (${{ matrix.os }})',
+    '    name: Release package proof (${{ matrix.os }})',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /package proof job name must match recovery proof identities/);
 });
 
 test('rejects package proof that skips the shared verifier', () => {

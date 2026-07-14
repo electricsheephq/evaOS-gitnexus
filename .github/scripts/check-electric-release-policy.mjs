@@ -273,6 +273,9 @@ function checkReleaseWorkflow(workflows) {
   }
 
   const proofJob = workflow?.jobs?.package_proof;
+  if (proofJob?.name !== 'Prove release tarball (${{ matrix.os }})') {
+    fail('electric-release.yml package proof job name must match recovery proof identities');
+  }
   const proofOperatingSystems = proofJob?.strategy?.matrix?.os;
   const expectedOperatingSystems = ['macos-latest', 'ubuntu-latest', 'windows-latest'];
   if (
