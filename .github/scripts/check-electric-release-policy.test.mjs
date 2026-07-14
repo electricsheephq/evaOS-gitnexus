@@ -41,6 +41,13 @@ jobs:
           echo .agents/plugins/marketplace.json
           echo "manifest version mismatch"
           echo MAX_MANIFEST_BYTES
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > /tmp/release-pages.json
+          RELEASE_MATCHES="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' /tmp/release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          case "$RELEASE_COUNT" in
+            0|1) ;;
+            *) echo "Multiple releases exist for $TAG"; exit 1 ;;
+          esac
   ci:
     needs: inspect
     uses: ./.github/workflows/ci.yml
@@ -81,6 +88,13 @@ jobs:
           if [ "$CURRENT_MAIN_SHA" != "$HEAD_SHA" ]; then exit 1; fi
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
           curl "https://api.github.com/repos/$REPO/git/ref/tags/$ENCODED_TAG"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > /tmp/release-pages.json
+          RELEASE_MATCHES="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' /tmp/release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          case "$RELEASE_COUNT" in
+            0|1) ;;
+            *) echo "Multiple releases exist for $TAG"; exit 1 ;;
+          esac
           echo "tag_exists=$TAG_EXISTS"
           echo "release_exists=$RELEASE_EXISTS"
       - name: Create annotated Electric tag when absent
@@ -99,15 +113,142 @@ jobs:
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
           gh release download "$TAG" --pattern "gitnexus-$VERSION.tgz" --pattern SHA256SUMS
           sha256sum --check SHA256SUMS
-          gh api "repos/$REPO/releases/tags/$ENCODED_TAG"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > /tmp/release-pages.json
+          RELEASE_MATCHES="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' /tmp/release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          case "$RELEASE_COUNT" in
+            0|1) ;;
+            *) echo "Multiple releases exist for $TAG"; exit 1 ;;
+          esac
           gh api --method PATCH releases/1 -F draft=false
 `;
 
-function createFixture(workflow = validWorkflow) {
+const validRecoveryWorkflow = `name: Recover Electric Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        required: true
+        type: string
+      release_id:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      source_run_id:
+        required: true
+        type: string
+      tarball_sha256:
+        required: true
+        type: string
+      prerelease:
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+jobs:
+  inspect:
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Validate recovery inputs
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TARBALL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+      - name: Verify proven Electric draft recovery
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          POLICY_SHA="$(git rev-parse HEAD)"
+          CURRENT_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
+          if [ "$CURRENT_MAIN_SHA" != "$POLICY_SHA" ]; then exit 1; fi
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TARBALL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          git merge-base --is-ancestor "$SOURCE_SHA" "$POLICY_SHA"
+          echo gitnexus-claude-plugin/.claude-plugin/plugin.json
+          echo gitnexus-claude-plugin/.codex-plugin/plugin.json
+          echo .claude-plugin/marketplace.json
+          echo .agents/plugins/marketplace.json
+          echo "manifest version mismatch"
+          echo MAX_MANIFEST_BYTES
+          gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID"
+          echo .github/workflows/electric-release.yml
+          echo "Exact-head CI / CI Gate"
+          echo "Build and prove release tarball"
+          echo "Create protected Electric GitHub Release"
+          gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals"
+          echo internal-release
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          gh api "repos/$REPO/git/ref/tags/$ENCODED_TAG"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > /tmp/release-pages.json
+          RELEASE_MATCHES="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' /tmp/release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          case "$RELEASE_COUNT" in
+            0) echo "No draft release exists for $TAG"; exit 1 ;;
+            1) ;;
+            *) echo "Multiple releases exist for $TAG"; exit 1 ;;
+          esac
+          echo "$RELEASE_ID $SOURCE_SHA sha256:$TARBALL_SHA256"
+  recover:
+    needs: inspect
+    environment:
+      name: internal-release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Reverify proven Electric draft recovery
+        run: |
+          CURRENT_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
+          if [ "$CURRENT_MAIN_SHA" != "$POLICY_SHA" ]; then exit 1; fi
+          gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID"
+          echo "Exact-head CI / CI Gate"
+          echo "Build and prove release tarball"
+          gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals"
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          gh api "repos/$REPO/git/ref/tags/$ENCODED_TAG"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > /tmp/release-pages.json
+          RELEASE_MATCHES="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' /tmp/release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          case "$RELEASE_COUNT" in
+            0) echo "No draft release exists for $TAG"; exit 1 ;;
+            1) ;;
+            *) echo "Multiple releases exist for $TAG"; exit 1 ;;
+          esac
+          echo "$RELEASE_ID $SOURCE_SHA sha256:$TARBALL_SHA256"
+      - name: Verify retained assets and publish by immutable ID
+        run: |
+          gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$TARBALL_ASSET_ID" > "gitnexus-$VERSION.tgz"
+          gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$CHECKSUM_ASSET_ID" > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          npm install --global --prefix "$PREFIX" "gitnexus-$VERSION.tgz"
+          VERSION_OUTPUT="$("$PREFIX/bin/gitnexus" --version)"
+          if [ "$VERSION_OUTPUT" != "$VERSION" ]; then exit 1; fi
+          "$PREFIX/bin/gitnexus" --help >/dev/null
+          "$PREFIX/bin/gitnexus" mcp --help >/dev/null
+          FINAL_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
+          if [ "$FINAL_MAIN_SHA" != "$POLICY_SHA" ]; then exit 1; fi
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          gh api "repos/$REPO/git/ref/tags/$ENCODED_TAG"
+          OBJECT_SHA="$SOURCE_SHA"
+          if [ "$OBJECT_SHA" != "$SOURCE_SHA" ]; then exit 1; fi
+          gh api --method PATCH "repos/$REPO/releases/$RELEASE_ID" -F draft=false
+`;
+
+function createFixture(workflow = validWorkflow, recoveryWorkflow = validRecoveryWorkflow) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-electric-release-policy-'));
   temporaryRoots.push(root);
   fs.mkdirSync(path.join(root, '.github/workflows'), { recursive: true });
   fs.writeFileSync(path.join(root, '.github/workflows/electric-release.yml'), workflow);
+  fs.writeFileSync(
+    path.join(root, '.github/workflows/electric-release-resume.yml'),
+    recoveryWorkflow,
+  );
   fs.writeFileSync(
     path.join(root, '.github/workflows/ci.yml'),
     'name: CI\non:\n  workflow_call:\npermissions: {}\njobs: {}\n',
@@ -122,6 +263,23 @@ function runChecker(root) {
 function replaceOnce(value, search, replacement) {
   assert.ok(value.includes(search), `fixture is missing ${JSON.stringify(search)}`);
   return value.replace(search, replacement);
+}
+
+function replaceOccurrence(value, search, replacement, occurrence) {
+  let offset = 0;
+  for (let index = 0; index <= occurrence; index += 1) {
+    offset = value.indexOf(search, offset);
+    assert.notEqual(
+      offset,
+      -1,
+      `fixture is missing occurrence ${occurrence} of ${JSON.stringify(search)}`,
+    );
+    if (index === occurrence) {
+      return value.slice(0, offset) + replacement + value.slice(offset + search.length);
+    }
+    offset += search.length;
+  }
+  throw new Error('unreachable');
 }
 
 test.after(() => {
@@ -271,8 +429,8 @@ test('rejects a release flow without resumable draft and asset upload semantics'
 test('rejects a release flow without protected-job state re-verification', () => {
   const workflow = replaceOnce(
     validWorkflow,
-    '      - name: Reverify resumable release state\n        run: |\n          CURRENT_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"\n          if [ "$CURRENT_MAIN_SHA" != "$HEAD_SHA" ]; then exit 1; fi\n          ENCODED_TAG="$(jq -rn --arg value "$TAG" \'$value | @uri\')"\n          curl "https://api.github.com/repos/$REPO/git/ref/tags/$ENCODED_TAG"\n          echo "tag_exists=$TAG_EXISTS"\n          echo "release_exists=$RELEASE_EXISTS"\n',
-    '',
+    '      - name: Reverify resumable release state\n',
+    '      - name: Missing protected state verification\n',
   );
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
@@ -378,11 +536,140 @@ test('rejects tag creation that does not target the exact inspected head', () =>
   assert.match(result.stderr, /exact-head tag target/);
 });
 
-test('rejects a raw slash-bearing final release lookup', () => {
-  const workflow = replaceOnce(validWorkflow, 'releases/tags/$ENCODED_TAG', 'releases/tags/$TAG');
+test('rejects the draft-invisible release-by-tag endpoint', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    'gh api --paginate --slurp "repos/$REPO/releases?per_page=100"',
+    'gh api "repos/$REPO/releases/tags/$ENCODED_TAG"',
+  );
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /URL-encoded final release lookup/);
+  assert.match(result.stderr, /draft-safe paginated release list lookup/);
+});
+
+test('rejects a release list lookup without pagination', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    'gh api --paginate --slurp "repos/$REPO/releases?per_page=100"',
+    'gh api "repos/$REPO/releases?per_page=100"',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /draft-safe paginated release list lookup/);
+});
+
+test('rejects release discovery without exact tag filtering', () => {
+  const workflow = replaceOnce(validWorkflow, '.tag_name == $tag', '.draft == true');
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /exact release tag filter/);
+});
+
+for (const [stage, occurrence] of [
+  ['inspect', 0],
+  ['protected reverify', 1],
+  ['publish', 2],
+]) {
+  test(`rejects ${stage} release discovery without exit-bearing duplicate detection`, () => {
+    const workflow = replaceOccurrence(
+      validWorkflow,
+      '*) echo "Multiple releases exist for $TAG"; exit 1 ;;',
+      '*) echo "Multiple releases exist for $TAG" ;;',
+      occurrence,
+    );
+    const result = runChecker(createFixture(workflow));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /exit-bearing duplicate release rejection/);
+  });
+}
+
+test('rejects recovery without the protected internal-release environment', () => {
+  const workflow = replaceOnce(
+    validRecoveryWorkflow,
+    '      name: internal-release\n',
+    '      name: none\n',
+  );
+  const result = runChecker(createFixture(validWorkflow, workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /recovery job must require internal-release environment/);
+});
+
+test('rejects recovery without current-policy and source-ancestor guards', () => {
+  let workflow = replaceOnce(validRecoveryWorkflow, 'git/ref/heads/main', 'git/ref/heads/stale');
+  workflow = replaceOnce(workflow, 'git merge-base --is-ancestor', 'git merge-base');
+  const result = runChecker(createFixture(validWorkflow, workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /current-main policy guard/);
+  assert.match(result.stderr, /release source ancestry guard/);
+});
+
+test('rejects recovery without original run, CI, package, and approval proof', () => {
+  let workflow = validRecoveryWorkflow.replaceAll(
+    'repos/$REPO/actions/runs/$SOURCE_RUN_ID',
+    'repos/$REPO/actions/runs/stale',
+  );
+  workflow = workflow.replaceAll('Exact-head CI / CI Gate', 'Unproven CI');
+  workflow = workflow.replaceAll('Build and prove release tarball', 'Unproven package');
+  workflow = workflow.replaceAll('/approvals', '/missing-approvals');
+  const result = runChecker(createFixture(validWorkflow, workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /original Electric Release run proof/);
+  assert.match(result.stderr, /successful exact-head CI proof/);
+  assert.match(result.stderr, /successful package proof/);
+  assert.match(result.stderr, /original environment approval proof/);
+});
+
+test('rejects recovery without exact release identity and artifact digest binding', () => {
+  let workflow = validRecoveryWorkflow.replaceAll('$RELEASE_ID', '$OTHER_RELEASE_ID');
+  workflow = workflow.replaceAll('sha256:$TARBALL_SHA256', 'sha256:unknown');
+  const result = runChecker(createFixture(validWorkflow, workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /immutable release ID binding/);
+  assert.match(result.stderr, /exact tarball digest binding/);
+});
+
+test('rejects recovery without retained asset checksum and install smoke', () => {
+  let workflow = replaceOnce(
+    validRecoveryWorkflow,
+    'sha256sum --check --strict SHA256SUMS',
+    'true',
+  );
+  workflow = replaceOnce(workflow, 'npm install --global', 'echo install');
+  workflow = replaceOnce(workflow, '"$PREFIX/bin/gitnexus" mcp --help', 'echo mcp-help');
+  const result = runChecker(createFixture(validWorkflow, workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /strict checksum verification/);
+  assert.match(result.stderr, /retained tarball install/);
+  assert.match(result.stderr, /retained MCP CLI smoke/);
+});
+
+test('rejects recovery that creates or uploads release state', () => {
+  const workflow = replaceOnce(
+    validRecoveryWorkflow,
+    '          gh api --method PATCH "repos/$REPO/releases/$RELEASE_ID" -F draft=false\n',
+    '          gh release create "$TAG" --draft\n          gh release upload "$TAG" bundle.tgz\n',
+  );
+  const result = runChecker(createFixture(validWorkflow, workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /recovery may only PATCH the immutable release ID/);
+});
+
+test('rejects recovery publication without final current-main and tag guards', () => {
+  let workflow = replaceOnce(
+    validRecoveryWorkflow,
+    'FINAL_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"',
+    'FINAL_MAIN_SHA="$POLICY_SHA"',
+  );
+  workflow = replaceOccurrence(
+    workflow,
+    'gh api "repos/$REPO/git/ref/tags/$ENCODED_TAG"',
+    'echo tag',
+    2,
+  );
+  const result = runChecker(createFixture(validWorkflow, workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /final current-main guard/);
+  assert.match(result.stderr, /final immutable tag guard/);
 });
 
 test('rejects publish without re-downloading and checksum-verifying release assets', () => {

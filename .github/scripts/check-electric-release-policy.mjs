@@ -63,6 +63,39 @@ function checkRunRequirements(match, stepDescription, requirements) {
 const failures = [];
 const fail = (message) => failures.push(message);
 
+function checkDraftSafeReleaseLookup(match, stepDescription) {
+  checkRunRequirements(match, stepDescription, [
+    [
+      'gh api --paginate --slurp "repos/$REPO/releases?per_page=100"',
+      'draft-safe paginated release list lookup',
+    ],
+    ['.tag_name == $tag', 'exact release tag filter'],
+    ['RELEASE_COUNT', 'bounded release match count'],
+    [
+      '',
+      'exit-bearing duplicate release rejection',
+      /case\s+"\$RELEASE_COUNT"\s+in[\s\S]*?\*\)[\s\S]*?Multiple releases exist for \$TAG[\s\S]*?exit 1[\s\S]*?;;[\s\S]*?esac/,
+    ],
+  ]);
+  if (typeof match?.step?.run === 'string' && match.step.run.includes('releases/tags/')) {
+    fail(
+      `electric-release.yml ${stepDescription} must not use the draft-invisible releases/tags endpoint`,
+    );
+  }
+}
+
+function checkExactPermissions(job, expected, description) {
+  const entries = Object.entries(job?.permissions ?? {}).sort(([left], [right]) =>
+    left.localeCompare(right),
+  );
+  const wanted = Object.entries(expected).sort(([left], [right]) => left.localeCompare(right));
+  if (JSON.stringify(entries) !== JSON.stringify(wanted)) {
+    fail(
+      `electric-release-resume.yml ${description} permissions must be ${JSON.stringify(expected)}`,
+    );
+  }
+}
+
 const APPROVED_OIDC_JOBS = new Set([
   'build-tree-sitter-prebuilds.yml:aggregate',
   'claude.yml:claude',
@@ -214,6 +247,7 @@ function checkReleaseWorkflow(workflows) {
     ['manifest version mismatch', 'manifest mismatch failure'],
     ['MAX_MANIFEST_BYTES', 'bounded manifest parsing'],
   ]);
+  checkDraftSafeReleaseLookup(inspectStep, 'manifest verification step');
 
   const packageStep = findNamedStep(workflow?.jobs?.package, 'Pack and install isolated CLI');
   checkRunRequirements(packageStep, 'package proof step', [
@@ -251,6 +285,7 @@ function checkReleaseWorkflow(workflows) {
     ['TAG_EXISTS', 'fresh tag-state output'],
     ['RELEASE_EXISTS', 'fresh release-state output'],
   ]);
+  checkDraftSafeReleaseLookup(reverifyStep, 'reverify resumable release state step');
 
   const tagStep = findNamedStep(releaseJob, 'Create annotated Electric tag when absent');
   if (tagStep?.step?.if !== "steps.resume_state.outputs.tag_exists != 'true'") {
@@ -276,11 +311,10 @@ function checkReleaseWorkflow(workflows) {
   checkRunRequirements(publishStep, 'publish the verified draft step', [
     ['gh release download', 'fresh release asset download'],
     ['sha256sum --check', 'fresh release checksum verification'],
-    ['ENCODED_TAG', 'URL-encoded final release lookup'],
-    ['releases/tags/$ENCODED_TAG', 'URL-encoded final release lookup'],
     ['gh api --method PATCH', 'GitHub Release PATCH'],
     ['-F draft=false', 'publish the verified draft'],
   ]);
+  checkDraftSafeReleaseLookup(publishStep, 'publish the verified draft step');
 
   const releaseNeeds = Array.isArray(releaseJob?.needs) ? releaseJob.needs : [releaseJob?.needs];
   if (!releaseNeeds.includes('inspect') || !releaseNeeds.includes('package')) {
@@ -299,11 +333,154 @@ function checkReleaseWorkflow(workflows) {
   }
 }
 
+function checkRecoveryWorkflow(workflows) {
+  const candidate = workflows.get('electric-release-resume.yml');
+  if (!candidate) {
+    fail('electric-release-resume.yml must exist');
+    return;
+  }
+
+  const workflow = candidate.value;
+  const triggers = workflow?.on;
+  if (
+    !triggers ||
+    typeof triggers !== 'object' ||
+    Array.isArray(triggers) ||
+    Object.keys(triggers).length !== 1 ||
+    !triggers.workflow_dispatch
+  ) {
+    fail('electric-release-resume.yml must be manual-only through workflow_dispatch');
+  }
+  const inputs = triggers?.workflow_dispatch?.inputs ?? {};
+  for (const inputName of [
+    'expected_version',
+    'release_id',
+    'source_sha',
+    'source_run_id',
+    'tarball_sha256',
+  ]) {
+    if (inputs[inputName]?.required !== true || inputs[inputName]?.type !== 'string') {
+      fail(`electric-release-resume.yml must require string input ${inputName}`);
+    }
+  }
+  if (inputs.prerelease?.type !== 'boolean') {
+    fail('electric-release-resume.yml must declare boolean input prerelease');
+  }
+
+  const jobNames = Object.keys(workflow?.jobs ?? {}).sort();
+  if (JSON.stringify(jobNames) !== JSON.stringify(['inspect', 'recover'])) {
+    fail('electric-release-resume.yml may define only inspect and recover jobs');
+  }
+  const inspectJob = workflow?.jobs?.inspect;
+  const recoverJob = workflow?.jobs?.recover;
+  checkExactPermissions(inspectJob, { actions: 'read', contents: 'read' }, 'inspect job');
+  checkExactPermissions(recoverJob, { actions: 'read', contents: 'write' }, 'recovery job');
+
+  const environment =
+    typeof recoverJob?.environment === 'string'
+      ? recoverJob.environment
+      : recoverJob?.environment?.name;
+  if (environment !== 'internal-release') {
+    fail('electric-release-resume.yml recovery job must require internal-release environment');
+  }
+  const recoveryNeeds = Array.isArray(recoverJob?.needs) ? recoverJob.needs : [recoverJob?.needs];
+  if (!recoveryNeeds.includes('inspect')) {
+    fail('electric-release-resume.yml recovery job must depend on read-only inspection');
+  }
+
+  const inputStep = findNamedStep(inspectJob, 'Validate recovery inputs');
+  checkRunRequirements(inputStep, 'recovery input validation step', [
+    ['refs/heads/main', 'main ref guard'],
+    ['^[0-9a-f]{40}$', 'full source SHA validation'],
+    ['^[0-9a-f]{64}$', 'full tarball SHA-256 validation'],
+  ]);
+
+  const inspectStep = findNamedStep(inspectJob, 'Verify proven Electric draft recovery');
+  checkRunRequirements(inspectStep, 'read-only recovery inspection step', [
+    ['git/ref/heads/main', 'current-main policy guard'],
+    ['if [ "$CURRENT_MAIN_SHA" != "$POLICY_SHA" ]; then', 'current-main policy guard'],
+    ['git merge-base --is-ancestor', 'release source ancestry guard'],
+    ['gitnexus-claude-plugin/.claude-plugin/plugin.json', 'source Claude manifest proof'],
+    ['gitnexus-claude-plugin/.codex-plugin/plugin.json', 'source Codex manifest proof'],
+    ['.claude-plugin/marketplace.json', 'source Claude marketplace proof'],
+    ['.agents/plugins/marketplace.json', 'source Codex marketplace proof'],
+    ['manifest version mismatch', 'source manifest version proof'],
+    ['MAX_MANIFEST_BYTES', 'bounded source manifest parsing'],
+    ['repos/$REPO/actions/runs/$SOURCE_RUN_ID', 'original Electric Release run proof'],
+    ['.github/workflows/electric-release.yml', 'original Electric Release workflow identity'],
+    ['Exact-head CI / CI Gate', 'successful exact-head CI proof'],
+    ['Build and prove release tarball', 'successful package proof'],
+    ['Create protected Electric GitHub Release', 'failed protected release proof'],
+    ['repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals', 'original environment approval proof'],
+    ['internal-release', 'internal-release approval proof'],
+    ['$RELEASE_ID', 'immutable release ID binding'],
+    ['$SOURCE_SHA', 'immutable source SHA binding'],
+    ['sha256:$TARBALL_SHA256', 'exact tarball digest binding'],
+  ]);
+  checkDraftSafeReleaseLookup(inspectStep, 'read-only recovery inspection step');
+
+  const reverifyStep = findNamedStep(recoverJob, 'Reverify proven Electric draft recovery');
+  checkRunRequirements(reverifyStep, 'protected recovery reverify step', [
+    ['git/ref/heads/main', 'current-main policy guard'],
+    ['if [ "$CURRENT_MAIN_SHA" != "$POLICY_SHA" ]; then', 'current-main policy guard'],
+    ['repos/$REPO/actions/runs/$SOURCE_RUN_ID', 'original Electric Release run proof'],
+    ['Exact-head CI / CI Gate', 'successful exact-head CI proof'],
+    ['Build and prove release tarball', 'successful package proof'],
+    ['repos/$REPO/actions/runs/$SOURCE_RUN_ID/approvals', 'original environment approval proof'],
+    ['$RELEASE_ID', 'immutable release ID binding'],
+    ['$SOURCE_SHA', 'immutable source SHA binding'],
+    ['sha256:$TARBALL_SHA256', 'exact tarball digest binding'],
+  ]);
+  checkDraftSafeReleaseLookup(reverifyStep, 'protected recovery reverify step');
+
+  const publishStep = findNamedStep(
+    recoverJob,
+    'Verify retained assets and publish by immutable ID',
+  );
+  checkRunRequirements(publishStep, 'retained recovery asset proof step', [
+    ['releases/assets/$TARBALL_ASSET_ID', 'immutable tarball asset download'],
+    ['releases/assets/$CHECKSUM_ASSET_ID', 'immutable checksum asset download'],
+    ['sha256sum --check --strict SHA256SUMS', 'strict checksum verification'],
+    ['npm install --global', 'retained tarball install'],
+    ['if [ "$VERSION_OUTPUT" != "$VERSION" ]; then', 'exact retained version smoke'],
+    ['$PREFIX/bin/gitnexus" --help', 'retained CLI help smoke'],
+    ['$PREFIX/bin/gitnexus" mcp --help', 'retained MCP CLI smoke'],
+    ['git/ref/heads/main', 'final current-main guard'],
+    ['if [ "$FINAL_MAIN_SHA" != "$POLICY_SHA" ]; then', 'final current-main guard'],
+    ['git/ref/tags/$ENCODED_TAG', 'final immutable tag guard'],
+    ['if [ "$OBJECT_SHA" != "$SOURCE_SHA" ]; then', 'final immutable tag guard'],
+    ['gh api --method PATCH "repos/$REPO/releases/$RELEASE_ID"', 'immutable release ID PATCH'],
+    ['-F draft=false', 'draft publication PATCH'],
+  ]);
+
+  const orderedSteps = [reverifyStep, publishStep];
+  if (
+    orderedSteps.some((match) => !match) ||
+    orderedSteps.some((match, index) => index > 0 && match.index <= orderedSteps[index - 1].index)
+  ) {
+    fail('electric-release-resume.yml must reverify all mutable state before publication');
+  }
+
+  const forbiddenRecoveryMutation =
+    /\bgh\s+release\s+(?:create|upload)\b|\bnpm\s+pack\b|git\/(?:tags|refs)[\s\S]{0,120}--method\s+POST|--method\s+POST[\s\S]{0,120}git\/(?:tags|refs)/i;
+  if (forbiddenRecoveryMutation.test(candidate.raw)) {
+    fail('electric-release-resume.yml recovery may only PATCH the immutable release ID');
+  }
+  const patchCalls = candidate.raw.match(/gh api --method PATCH/g) ?? [];
+  if (patchCalls.length !== 1) {
+    fail('electric-release-resume.yml recovery may contain exactly one GitHub PATCH');
+  }
+  if (candidate.raw.includes('releases/tags/')) {
+    fail('electric-release-resume.yml must not use the draft-invisible releases/tags endpoint');
+  }
+}
+
 function main() {
   const repoRoot = parseRepoRoot(process.argv.slice(2));
   const workflows = readWorkflows(repoRoot);
   checkNoRegistryPublication(workflows);
   checkReleaseWorkflow(workflows);
+  checkRecoveryWorkflow(workflows);
   if (failures.length > 0) {
     for (const message of failures) {
       process.stderr.write(`electric release policy check failed: ${message}\n`);
