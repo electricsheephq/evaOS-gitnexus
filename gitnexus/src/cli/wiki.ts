@@ -56,6 +56,12 @@ function parsePositiveIntegerOption(
   return parsed;
 }
 
+export function sanitizeWikiErrorForConsole(value: unknown): string {
+  return String(value ?? 'Unknown error')
+    .replace(/[\r\n\u2028\u2029]+/g, ' ')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, '\uFFFD');
+}
+
 function isLocalProvider(
   provider: LLMProvider | undefined,
 ): provider is 'cursor' | 'claude' | 'codex' | 'opencode' {
@@ -666,26 +672,29 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
     clearInterval(elapsedTimer);
     bar.stop();
 
-    if (err.message?.includes('No source files')) {
-      console.log(`\n  ${err.message}\n`);
-    } else if (err.message?.includes('LLM request timed out after')) {
-      console.log(`\n  Timeout: ${err.message}\n`);
-    } else if (err.message?.includes('content filter')) {
+    const errorMessage = String(err?.message ?? err ?? 'Unknown error');
+    const displayError = sanitizeWikiErrorForConsole(errorMessage);
+
+    if (errorMessage.includes('No source files')) {
+      console.log(`\n  ${displayError}\n`);
+    } else if (errorMessage.includes('LLM request timed out after')) {
+      console.log(`\n  Timeout: ${displayError}\n`);
+    } else if (errorMessage.includes('content filter')) {
       // Content filter block — actionable message
-      console.log(`\n  Content Filter: ${err.message}\n`);
+      console.log(`\n  Content Filter: ${displayError}\n`);
       console.log(
         '  To resolve: rephrase your prompt or adjust the content filter policy for your deployment.\n',
       );
-    } else if (err.message?.includes('API key') || err.message?.includes('API error')) {
-      console.log(`\n  LLM Error: ${err.message}\n`);
+    } else if (errorMessage.includes('API key') || errorMessage.includes('API error')) {
+      console.log(`\n  LLM Error: ${displayError}\n`);
 
       // Offer to reconfigure on auth-related failures
       const isAuthError =
-        err.message?.includes('401') ||
-        err.message?.includes('403') ||
-        err.message?.includes('502') ||
-        err.message?.includes('authenticate') ||
-        err.message?.includes('Unauthorized');
+        errorMessage.includes('401') ||
+        errorMessage.includes('403') ||
+        errorMessage.includes('502') ||
+        errorMessage.includes('authenticate') ||
+        errorMessage.includes('Unauthorized');
       if (isAuthError && process.stdin.isTTY) {
         const answer = await new Promise<string>((resolve) => {
           const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -701,7 +710,7 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
         }
       }
     } else {
-      console.log(`\n  Error: ${err.message}\n`);
+      console.log(`\n  Error: ${displayError}\n`);
       if (process.env.GITNEXUS_VERBOSE) {
         logger.error({ err }, 'wiki command failed');
       }
