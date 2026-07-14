@@ -163,3 +163,66 @@ If the error text is `"Only one write transaction at a time is allowed in the sy
 - Architecture overview: [ARCHITECTURE.md](ARCHITECTURE.md)  
 - Agent safety rules: [GUARDRAILS.md](GUARDRAILS.md)  
 - Tests: [TESTING.md](TESTING.md)
+
+---
+
+## Electric fork releases
+
+Electric Sheep fork releases are GitHub Releases only. The fork does not publish
+to npm, GitHub Container Registry, Docker Hub, or another package registry.
+
+Prepare each version through a reviewed release PR:
+
+1. Set `gitnexus/package.json` and `gitnexus/package-lock.json` to a version such
+   as `1.6.10-electric.1`.
+2. Run `node gitnexus/scripts/sync-plugin-versions.mjs` from the repository root.
+3. Add `Documentation/releases/<version>.md` and update `gitnexus/CHANGELOG.md`.
+4. Run `npm run check:electric-release-policy`, the plugin-version test, build,
+   typecheck, and `npm pack --dry-run`.
+5. Merge the release PR only after required CI and review pass.
+
+Create the release from the current `main` branch with the protected workflow:
+
+```bash
+gh workflow run electric-release.yml \
+  --repo electricsheephq/evaOS-gitnexus \
+  --ref main \
+  -f expected_version=1.6.10-electric.1 \
+  -f prerelease=false
+```
+
+The workflow reruns exact-head CI, builds `gitnexus-<version>.tgz`, installs and
+smokes that tarball in an isolated prefix, writes `SHA256SUMS`, and pauses at the
+protected `internal-release` environment before creating
+`electric/v<version>`. It never opens a GitNexus index or calls an embedding
+provider. The release is staged as a draft: a failed asset upload leaves an
+exact-head tag and resumable draft, and redispatch safely resumes them. A
+published release or a same-name tag pointing elsewhere fails closed; never
+delete or rewrite a published tag to retry.
+
+`check-electric-release-policy.mjs` is defense in depth, not a shell-language
+interpreter. It rejects direct npm/Docker publication, registry-write
+permissions, registry configuration and credential variables, dynamic registry
+push inputs, and new unapproved OIDC jobs. Required review, branch protection,
+the protected environment, and the absence of registry credentials remain part
+of the release boundary. Registry-adjacent workflow strings have no silent
+allowlist escape; an intentional policy change requires a reviewed checker and
+negative-test change.
+
+The package proof intentionally installs and executes the tarball on an isolated
+GitHub-hosted runner. Only protected-main manifests are read first; they must be
+regular JSON files no larger than 64 KiB and must match the committed package
+version. This proves the native CLI artifact without granting registry, runtime,
+index, or embedding access.
+
+After downloading both assets, verify and install locally:
+
+```bash
+shasum -a 256 --check SHA256SUMS
+npm install --global ./gitnexus-1.6.10-electric.1.tgz
+gitnexus --version
+```
+
+A GitHub Release does not authorize an OpenClaw/evaOS rollout. Keep the prior
+installation available for rollback, switch runtime source separately, and do
+not rebuild or migrate a live index unless that rollout explicitly requires it.
