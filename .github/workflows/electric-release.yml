@@ -253,8 +253,76 @@ jobs:
       - name: Verify downloaded checksums
         shell: bash
         run: cd release-assets && sha256sum --check SHA256SUMS
+      - name: Reverify resumable release state
+        id: resume_state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.inspect.outputs.tag }}
+          HEAD_SHA: ${{ needs.inspect.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          TAG_STATUS="$(curl --silent --show-error --output /tmp/electric-tag-state.json \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$REPO/git/ref/tags/$TAG")"
+          TAG_EXISTS=false
+          case "$TAG_STATUS" in
+            404) ;;
+            200)
+              OBJECT_TYPE="$(jq -r .object.type /tmp/electric-tag-state.json)"
+              OBJECT_SHA="$(jq -r .object.sha /tmp/electric-tag-state.json)"
+              for _ in 1 2 3 4; do
+                if [ "$OBJECT_TYPE" != "tag" ]; then
+                  break
+                fi
+                gh api "repos/$REPO/git/tags/$OBJECT_SHA" > /tmp/electric-tag-object.json
+                OBJECT_TYPE="$(jq -r .object.type /tmp/electric-tag-object.json)"
+                OBJECT_SHA="$(jq -r .object.sha /tmp/electric-tag-object.json)"
+              done
+              if [ "$OBJECT_TYPE" != "commit" ] || [ "$OBJECT_SHA" != "$HEAD_SHA" ]; then
+                echo "::error::Existing tag $TAG does not resolve to exact release head $HEAD_SHA"
+                exit 1
+              fi
+              TAG_EXISTS=true
+              ;;
+            *)
+              echo "::error::Unable to reverify tag state; GitHub returned HTTP $TAG_STATUS"
+              exit 1
+              ;;
+          esac
+
+          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
+          RELEASE_STATUS="$(curl --silent --show-error --output /tmp/electric-release-state.json \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$REPO/releases/tags/$ENCODED_TAG")"
+          RELEASE_EXISTS=false
+          case "$RELEASE_STATUS" in
+            404) ;;
+            200)
+              if [ "$TAG_EXISTS" != "true" ] || [ "$(jq -r .draft /tmp/electric-release-state.json)" != "true" ]; then
+                echo "::error::Existing release state is not a resumable exact-head draft"
+                exit 1
+              fi
+              RELEASE_EXISTS=true
+              ;;
+            *)
+              echo "::error::Unable to reverify release state; GitHub returned HTTP $RELEASE_STATUS"
+              exit 1
+              ;;
+          esac
+          {
+            echo "tag_exists=$TAG_EXISTS"
+            echo "release_exists=$RELEASE_EXISTS"
+          } >> "$GITHUB_OUTPUT"
       - name: Create annotated Electric tag when absent
-        if: needs.inspect.outputs.tag_exists != 'true'
+        if: steps.resume_state.outputs.tag_exists != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -285,7 +353,7 @@ jobs:
           VERSION: ${{ needs.inspect.outputs.version }}
           HEAD_SHA: ${{ needs.inspect.outputs.head_sha }}
           NOTES_PATH: ${{ needs.inspect.outputs.notes_path }}
-          RELEASE_EXISTS: ${{ needs.inspect.outputs.release_exists }}
+          RELEASE_EXISTS: ${{ steps.resume_state.outputs.release_exists }}
         run: |
           set -euo pipefail
           if [ "$RELEASE_EXISTS" != "true" ]; then

@@ -42,6 +42,24 @@ function visit(value, visitor, trail = []) {
   }
 }
 
+function findNamedStep(job, name) {
+  const steps = Array.isArray(job?.steps) ? job.steps : [];
+  const index = steps.findIndex((step) => step?.name === name);
+  return index >= 0 ? { index, step: steps[index] } : undefined;
+}
+
+function checkRunRequirements(match, stepDescription, requirements) {
+  if (!match || typeof match.step?.run !== 'string') {
+    fail(`electric-release.yml must define ${stepDescription}`);
+    return;
+  }
+  for (const [literal, description, pattern] of requirements) {
+    if (pattern ? !pattern.test(match.step.run) : !match.step.run.includes(literal)) {
+      fail(`electric-release.yml ${stepDescription} must include ${description}`);
+    }
+  }
+}
+
 const failures = [];
 const fail = (message) => failures.push(message);
 
@@ -182,49 +200,67 @@ function checkReleaseWorkflow(workflows) {
     }
   });
 
-  const requiredText = [
-    ['electric/v', 'electric/v tag namespace'],
-    ['gitnexus-', '.tgz asset', /gitnexus-[^\s]*\.tgz/],
-    ['SHA256SUMS', 'SHA256SUMS asset'],
-    ['npm pack --dry-run', 'npm pack dry-run'],
-    [
-      'if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then',
-      'exact packaged-version equality check',
-    ],
-    ['internal-release', 'protected environment'],
+  const inspectStep = findNamedStep(
+    workflow?.jobs?.inspect,
+    'Verify release identity and manifest versions',
+  );
+  checkRunRequirements(inspectStep, 'manifest verification step', [
     ['refs/heads/main', 'main ref guard'],
-    ['TAG_EXISTS', 'exact-head tag resume guard'],
-    ['RELEASE_EXISTS', 'draft release resume guard'],
-    ['gh release create', 'draft release creation'],
-    ['--draft', 'draft release creation'],
-    ['gh release upload', 'release asset upload'],
-    ['--clobber', 'resumable asset upload'],
-    ['-F draft=false', 'publish the verified draft'],
+    ['electric/v', 'electric/v tag namespace'],
     ['gitnexus-claude-plugin/.claude-plugin/plugin.json', 'Claude plugin manifest verification'],
     ['gitnexus-claude-plugin/.codex-plugin/plugin.json', 'Codex plugin manifest verification'],
     ['.claude-plugin/marketplace.json', 'Claude marketplace manifest verification'],
     ['.agents/plugins/marketplace.json', 'Codex marketplace manifest verification'],
     ['manifest version mismatch', 'manifest mismatch failure'],
-  ];
-  for (const [literal, description, pattern] of requiredText) {
-    if (pattern ? !pattern.test(candidate.raw) : !candidate.raw.includes(literal)) {
-      fail(`electric-release.yml must include ${description}`);
-    }
-  }
+  ]);
 
-  const verifyPosition = candidate.raw.indexOf(
-    '- name: Verify release identity and manifest versions',
-  );
-  const mutationPositions = [
-    candidate.raw.indexOf('- name: Create annotated Electric tag when absent'),
-    candidate.raw.indexOf('- name: Create or resume draft release and upload assets'),
-  ].filter((position) => position >= 0);
-  if (
-    verifyPosition < 0 ||
-    mutationPositions.length === 0 ||
-    mutationPositions.some((position) => verifyPosition >= position)
-  ) {
+  const packageStep = findNamedStep(workflow?.jobs?.package, 'Pack and install isolated CLI');
+  checkRunRequirements(packageStep, 'package proof step', [
+    ['npm pack --dry-run', 'npm pack dry-run'],
+    [
+      'if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then',
+      'exact packaged-version equality check',
+    ],
+    ['SHA256SUMS', 'SHA256SUMS asset'],
+  ]);
+
+  const reverifyStep = findNamedStep(releaseJob, 'Reverify resumable release state');
+  checkRunRequirements(reverifyStep, 'reverify resumable release state step', [
+    ['TAG_EXISTS', 'fresh tag-state output'],
+    ['RELEASE_EXISTS', 'fresh release-state output'],
+  ]);
+
+  const tagStep = findNamedStep(releaseJob, 'Create annotated Electric tag when absent');
+  const upsertStep = findNamedStep(releaseJob, 'Create or resume draft release and upload assets');
+  checkRunRequirements(upsertStep, 'draft release step', [
+    ['gh release create', 'draft release creation'],
+    ['--draft', 'draft release creation'],
+    ['gh release upload', 'release asset upload'],
+    ['--clobber', 'resumable asset upload'],
+    ['gitnexus-', '.tgz asset', /gitnexus-[^\s]*\.tgz/],
+    ['SHA256SUMS', 'SHA256SUMS asset'],
+  ]);
+
+  const publishStep = findNamedStep(releaseJob, 'Verify assets and publish the draft');
+  checkRunRequirements(publishStep, 'publish the verified draft step', [
+    ['gh api --method PATCH', 'GitHub Release PATCH'],
+    ['-F draft=false', 'publish the verified draft'],
+  ]);
+
+  const releaseNeeds = Array.isArray(releaseJob?.needs) ? releaseJob.needs : [releaseJob?.needs];
+  if (!releaseNeeds.includes('inspect') || !releaseNeeds.includes('package')) {
     fail('electric-release.yml manifest verification must run before release mutation');
+  }
+  const orderedReleaseSteps = [reverifyStep, tagStep, upsertStep, publishStep];
+  if (
+    orderedReleaseSteps.some((match) => !match) ||
+    orderedReleaseSteps.some(
+      (match, index) => index > 0 && match.index <= orderedReleaseSteps[index - 1].index,
+    )
+  ) {
+    fail(
+      'electric-release.yml must reverify state before ordered tag, draft, and publish mutation',
+    );
   }
 }
 

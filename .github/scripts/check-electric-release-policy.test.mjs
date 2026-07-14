@@ -51,7 +51,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - run: |
+      - name: Pack and install isolated CLI
+        run: |
           npm pack --dry-run
           npm pack
           VERSION_OUTPUT="$EXPECTED_VERSION"
@@ -70,15 +71,23 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Create or resume draft release and upload assets
+      - name: Reverify resumable release state
+        run: |
+          echo "tag_exists=$TAG_EXISTS"
+          echo "release_exists=$RELEASE_EXISTS"
+      - name: Create annotated Electric tag when absent
         run: |
           if [ "$TAG_EXISTS" != "true" ]; then
             echo "create annotated tag"
           fi
+      - name: Create or resume draft release and upload assets
+        run: |
           if [ "$RELEASE_EXISTS" != "true" ]; then
             gh release create "$TAG" --draft --notes-file notes.md
           fi
           gh release upload "$TAG" --clobber gitnexus-*.tgz SHA256SUMS
+      - name: Verify assets and publish the draft
+        run: |
           gh api --method PATCH releases/1 -F draft=false
 `;
 
@@ -241,20 +250,36 @@ test('rejects a release flow without resumable draft and asset upload semantics'
   assert.match(result.stderr, /publish the verified draft/);
 });
 
+test('rejects a release flow without protected-job state re-verification', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '      - name: Reverify resumable release state\n        run: |\n          echo "tag_exists=$TAG_EXISTS"\n          echo "release_exists=$RELEASE_EXISTS"\n',
+    '',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reverify resumable release state/);
+});
+
 test('rejects missing manifest verification or release ordering', () => {
-  let workflow = replaceOnce(
+  const workflow = replaceOnce(
     validWorkflow,
     'gitnexus-claude-plugin/.codex-plugin/plugin.json',
     'missing-codex-plugin.json',
   );
-  workflow = replaceOnce(
-    workflow,
-    '      - name: Verify release identity and manifest versions',
-    '      - name: Create or resume draft release and upload assets',
-  );
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Codex plugin manifest verification/);
+});
+
+test('rejects release mutation that does not depend on manifest verification', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '  release:\n    needs: [inspect, package]',
+    '  release:\n    needs: [package]',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
   assert.match(result.stderr, /manifest verification must run before release mutation/);
 });
 
