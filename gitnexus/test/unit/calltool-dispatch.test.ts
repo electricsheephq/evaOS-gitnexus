@@ -412,6 +412,20 @@ describe('LocalBackend.callTool', () => {
     });
   });
 
+  it('removes blank api_impact lookup keys before dispatching a valid fallback', async () => {
+    const apiImpactSpy = vi
+      .spyOn(backend as any, 'apiImpact')
+      .mockResolvedValue({ status: 'file-selected' });
+
+    const result = await backend.callTool('api_impact', {
+      route: '   ',
+      file: ' src/routes.ts ',
+    });
+
+    expect(result).toEqual({ status: 'file-selected' });
+    expect(apiImpactSpy.mock.calls[0][1]).toEqual({ file: 'src/routes.ts' });
+  });
+
   it.each([
     ['impact', { target: 'validate', name: 'login', direction: 'upstream' }],
     ['impact', { name: 'validate', symbol: 'login', direction: 'upstream' }],

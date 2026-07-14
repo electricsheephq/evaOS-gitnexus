@@ -197,11 +197,18 @@ function normalizeToolParams(
   }
 
   const requiredGroup = TOOL_REQUIRED_STRING_GROUPS[method];
+  for (const key of requiredGroup?.keys ?? []) {
+    const value = normalized[key];
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed) normalized[key] = trimmed;
+    else delete normalized[key];
+  }
   if (
     requiredGroup &&
     !requiredGroup.keys.some((key) => {
       const value = normalized[key];
-      return typeof value === 'string' && value.trim().length > 0;
+      return typeof value === 'string' && value.length > 0;
     })
   ) {
     return { error: requiredGroup.error };
