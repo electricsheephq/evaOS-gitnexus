@@ -7,8 +7,9 @@
  * These are pure unit tests that mock the LadybugDB layer to test
  * the dispatch and error handling logic in isolation.
  */
-import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import fsPromises from 'fs/promises';
 import os from 'os';
 import path from 'path';
 
@@ -16,21 +17,16 @@ import path from 'path';
 // local-backend.ts imports from core/lbug/pool-adapter.js; the mcp/core/lbug-adapter.js
 // re-exports from the same module, so we mock the canonical source.
 // vi.hoisted runs before vi.mock hoisting, making the fns available to both factories.
-const { lbugMocks, platformMocks, rerankMocks } = vi.hoisted(() => ({
+const { lbugMocks, platformMocks } = vi.hoisted(() => ({
   lbugMocks: {
     initLbug: vi.fn().mockResolvedValue(undefined),
     executeQuery: vi.fn().mockResolvedValue([]),
     executeParameterized: vi.fn().mockResolvedValue([]),
     closeLbug: vi.fn().mockResolvedValue(undefined),
     isLbugReady: vi.fn().mockReturnValue(true),
-    ensureVectorExtensionForRepo: vi.fn().mockResolvedValue(true),
   },
   platformMocks: {
     isVectorExtensionSupportedByPlatform: vi.fn().mockReturnValue(true),
-  },
-  rerankMocks: {
-    resolveRerankConfig: vi.fn().mockReturnValue(null),
-    rerankDocuments: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -52,6 +48,14 @@ vi.mock('../../src/storage/repo-manager.js', async (importOriginal) => {
     listRegisteredRepos: vi.fn().mockResolvedValue([]),
     cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
     findSiblingClones: vi.fn().mockResolvedValue([]),
+    // U2: expose loadMeta as a spy that delegates to the REAL implementation by
+    // default (so branch-scope resolution, #2106, is unaffected). The
+    // impact-mode block overrides it per-test to stamp a READY PDG layer, so the
+    // U2 layer-presence probe falls THROUGH to the post-check surface (the
+    // `_runImpactPDG` delegate / ambiguous fan-out) those tests assert. The
+    // four-state degradation contract itself is covered in
+    // test/integration/impact-pdg-degradation.test.ts.
+    loadMeta: vi.fn(actual.loadMeta),
   };
 });
 
@@ -90,8 +94,11 @@ vi.mock('../../src/mcp/core/embedder.js', () => ({
   getEmbeddingDims: vi.fn().mockReturnValue(384),
 }));
 
-vi.mock('../../src/core/rerank/voyage-reranker.js', () => ({
-  ...rerankMocks,
+// #2175: lets the @group-forward path be exercised without real group.yaml infra.
+// No existing test in this file uses an @repo, so this mock is inert for them.
+const { resolveAtMemberMock } = vi.hoisted(() => ({ resolveAtMemberMock: vi.fn() }));
+vi.mock('../../src/core/group/resolve-at-member.js', () => ({
+  resolveAtGroupMemberRepoPath: resolveAtMemberMock,
 }));
 
 import {
@@ -99,7 +106,18 @@ import {
   REPO_ID_HASH_LENGTH,
   parseListReposPagination,
 } from '../../src/mcp/local/local-backend.js';
-import { listRegisteredRepos, cleanupOldKuzuFiles } from '../../src/storage/repo-manager.js';
+import {
+  betterBridgeEvidence,
+  pdgBridgeEvidenceForImpact,
+} from '../../src/mcp/local/pdg-impact.js';
+import { CALLEES_TRUNCATED_SENTINEL } from '../../src/core/ingestion/cfg/emit.js';
+import {
+  listRegisteredRepos,
+  cleanupOldKuzuFiles,
+  getStoragePaths,
+  loadMeta,
+  type RegistryEntry,
+} from '../../src/storage/repo-manager.js';
 import { getGitRoot } from '../../src/storage/git.js';
 import { _captureLogger } from '../../src/core/logger.js';
 import {
@@ -108,8 +126,8 @@ import {
   executeParameterized,
   isLbugReady,
   closeLbug,
-  ensureVectorExtensionForRepo,
 } from '../../src/mcp/core/lbug-adapter.js';
+import type { RerankRuntime } from '../../src/core/rerank/provider.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -121,12 +139,6 @@ const MOCK_REPO_ENTRY = {
   lastCommit: 'abc1234567890',
   stats: { files: 10, nodes: 50, edges: 100, communities: 3, processes: 5 },
 };
-
-beforeEach(() => {
-  rerankMocks.resolveRerankConfig.mockReturnValue(null);
-  rerankMocks.rerankDocuments.mockResolvedValue([]);
-  lbugMocks.ensureVectorExtensionForRepo.mockResolvedValue(true);
-});
 
 function setupSingleRepo() {
   (listRegisteredRepos as any).mockResolvedValue([MOCK_REPO_ENTRY]);
@@ -316,6 +328,85 @@ describe('LocalBackend.callTool', () => {
     );
   });
 
+  it.each(['name', 'symbol'] as const)(
+    'normalizes impact.%s to target once before local dispatch',
+    async (alias) => {
+      const impactSpy = vi
+        .spyOn(backend as any, 'impact')
+        .mockResolvedValue({ status: 'normalized' });
+
+      const result = await backend.callTool('impact', {
+        [alias]: ' validate ',
+        direction: 'upstream',
+      });
+
+      expect(result).toEqual({ status: 'normalized' });
+      const dispatched = impactSpy.mock.calls[0][1] as Record<string, unknown>;
+      expect(dispatched.target).toBe('validate');
+      expect(dispatched).not.toHaveProperty('name');
+      expect(dispatched).not.toHaveProperty('symbol');
+    },
+  );
+
+  it('normalizes context.file to file_path once before local dispatch', async () => {
+    const contextSpy = vi
+      .spyOn(backend as any, 'context')
+      .mockResolvedValue({ status: 'normalized' });
+
+    const result = await backend.callTool('context', {
+      name: 'validate',
+      file: ' src/auth.ts ',
+    });
+
+    expect(result).toEqual({ status: 'normalized' });
+    const dispatched = contextSpy.mock.calls[0][1] as Record<string, unknown>;
+    expect(dispatched.file_path).toBe('src/auth.ts');
+    expect(dispatched).not.toHaveProperty('file');
+  });
+
+  it('allows agreeing canonical and alias values after trimming', async () => {
+    const impactSpy = vi
+      .spyOn(backend as any, 'impact')
+      .mockResolvedValue({ status: 'normalized' });
+
+    await backend.callTool('impact', {
+      target: 'validate',
+      name: ' validate ',
+      symbol: 'validate',
+      direction: 'upstream',
+    });
+
+    expect(impactSpy.mock.calls[0][1]).toMatchObject({ target: 'validate' });
+  });
+
+  it.each([
+    ['impact', { target: 'validate', name: 'login', direction: 'upstream' }],
+    ['impact', { name: 'validate', symbol: 'login', direction: 'upstream' }],
+    ['context', { name: 'validate', file_path: 'src/auth.ts', file: 'src/login.ts' }],
+  ])('rejects conflicting %s aliases before repository resolution', async (method, params) => {
+    const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+
+    const result = await backend.callTool(method, params);
+
+    expect(result.error).toMatch(/conflicting mcp parameters/i);
+    expect(resolveSpy).not.toHaveBeenCalled();
+  });
+
+  it('normalizes impact aliases before @group forwarding', async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    const groupImpactSpy = vi
+      .spyOn(backend.getGroupService(), 'groupImpact')
+      .mockResolvedValue({ status: 'normalized' } as any);
+
+    await backend.callTool('impact', {
+      symbol: 'validate',
+      direction: 'upstream',
+      repo: '@grp',
+    });
+
+    expect(groupImpactSpy.mock.calls[0][0]).toMatchObject({ target: 'validate' });
+  });
+
   it('dispatches query tool', async () => {
     (executeParameterized as any).mockResolvedValue([]);
     const result = await backend.callTool('query', { query: 'auth' });
@@ -323,287 +414,154 @@ describe('LocalBackend.callTool', () => {
     expect(result).toHaveProperty('definitions');
   });
 
-  it('reranks merged query candidates when the premium repo gate is configured', async () => {
+  it('applies a deterministic optional reranker to query candidates', async () => {
     const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
     vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
-      ftsAvailable: true,
       results: [
-        { filePath: 'src/alpha.ts', nodeIds: ['node-alpha'], score: 10 },
-        { filePath: 'src/beta.ts', nodeIds: ['node-beta'], score: 9 },
+        { filePath: 'src/a.ts', name: 'A', type: 'File' },
+        { filePath: 'src/b.ts', name: 'B', type: 'File' },
       ],
+      ftsAvailable: true,
     });
-    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
-    rerankMocks.resolveRerankConfig.mockReturnValue({
-      baseUrl: 'https://api.voyageai.com/v1',
-      model: 'rerank-2.5',
-      apiKey: 'test-key',
-      candidates: 2,
-      maxDocChars: 3000,
-    });
-    rerankMocks.rerankDocuments.mockResolvedValueOnce([
-      { index: 1, relevance_score: 0.99 },
-      { index: 0, relevance_score: 0.25 },
-    ]);
-
-    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
-      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 0 }];
-      return [];
-    });
-    (executeParameterized as any).mockImplementation(
-      async (_repoId: string, cypher: string, params?: { nodeIds?: string[] }) => {
-        if (cypher.includes('RETURN n.id AS id')) {
-          return (params?.nodeIds ?? []).map((id) =>
-            id === 'node-alpha'
-              ? {
-                  id,
-                  name: 'Alpha',
-                  type: 'Function',
-                  filePath: 'src/alpha.ts',
-                  startLine: 1,
-                  endLine: 10,
-                }
-              : {
-                  id,
-                  name: 'Beta',
-                  type: 'Function',
-                  filePath: 'src/beta.ts',
-                  startLine: 20,
-                  endLine: 30,
-                },
-          );
-        }
-        if (cypher.includes('RETURN n.id AS nodeId, n.content AS content')) {
-          return (params?.nodeIds ?? []).map((id) => ({
-            nodeId: id,
-            content: id === 'node-alpha' ? 'alpha implementation' : 'beta implementation',
-          }));
-        }
-        return [];
+    const runtime: RerankRuntime = {
+      provider: {
+        id: 'deterministic-test',
+        rerank: vi.fn().mockResolvedValue([
+          { index: 1, score: 0.9 },
+          { index: 0, score: 0.1 },
+        ]),
       },
-    );
+      candidates: 2,
+      maxDocChars: 1000,
+      failurePolicy: 'fallback',
+    };
+    const rerankingBackend = new LocalBackend(() => runtime);
+    await rerankingBackend.init();
 
-    const result = await backend.callTool('query', { query: 'auth', limit: 1, max_symbols: 2 });
+    const result = await rerankingBackend.callTool('query', { search_query: 'needle' });
 
-    expect(rerankMocks.resolveRerankConfig).toHaveBeenCalledWith('test-project');
-    expect(rerankMocks.rerankDocuments).toHaveBeenCalledWith(
-      'auth',
-      expect.arrayContaining([
-        expect.stringContaining('alpha implementation'),
-        expect.stringContaining('beta implementation'),
-      ]),
-      expect.objectContaining({ model: 'rerank-2.5' }),
-    );
-    expect(result.definitions.map((definition: any) => definition.name)).toEqual(['Beta', 'Alpha']);
-    expect(result.timing).toHaveProperty('rerank');
+    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual(['b.ts', 'a.ts']);
+    expect(runtime.provider.rerank).toHaveBeenCalledTimes(1);
   });
 
-  it('skips premium rerank when query rerank is explicitly false', async () => {
+  it('does not invoke or expose reranking when the request disables it', async () => {
     const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
     vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
-      ftsAvailable: true,
       results: [
-        { filePath: 'src/alpha.ts', nodeIds: ['node-alpha'], score: 10 },
-        { filePath: 'src/beta.ts', nodeIds: ['node-beta'], score: 9 },
+        { filePath: 'src/a.ts', name: 'A', type: 'File' },
+        { filePath: 'src/b.ts', name: 'B', type: 'File' },
       ],
+      ftsAvailable: true,
     });
-    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
-    rerankMocks.resolveRerankConfig.mockReturnValue({
-      baseUrl: 'https://api.voyageai.com/v1',
-      model: 'rerank-2.5',
-      apiKey: 'test-key',
-      candidates: 2,
-      maxDocChars: 3000,
-    });
-
-    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
-      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 0 }];
-      return [];
-    });
-    (executeParameterized as any).mockImplementation(
-      async (_repoId: string, cypher: string, params?: { nodeIds?: string[] }) => {
-        if (cypher.includes('RETURN n.id AS id')) {
-          return (params?.nodeIds ?? []).map((id) =>
-            id === 'node-alpha'
-              ? {
-                  id,
-                  name: 'Alpha',
-                  type: 'Function',
-                  filePath: 'src/alpha.ts',
-                  startLine: 1,
-                  endLine: 10,
-                }
-              : {
-                  id,
-                  name: 'Beta',
-                  type: 'Function',
-                  filePath: 'src/beta.ts',
-                  startLine: 20,
-                  endLine: 30,
-                },
-          );
-        }
-        return [];
-      },
+    const resolver = vi.fn(
+      (): RerankRuntime => ({
+        provider: { id: 'unused-test', rerank: vi.fn() },
+        candidates: 2,
+        maxDocChars: 1000,
+        failurePolicy: 'fallback',
+      }),
     );
+    const bypassBackend = new LocalBackend(resolver);
+    await bypassBackend.init();
 
-    const result = await backend.callTool('query', {
-      query: 'auth',
-      limit: 1,
-      max_symbols: 2,
+    const result = await bypassBackend.callTool('query', {
+      search_query: 'needle',
       rerank: false,
     });
 
-    expect(rerankMocks.resolveRerankConfig).not.toHaveBeenCalled();
-    expect(rerankMocks.rerankDocuments).not.toHaveBeenCalled();
-    expect(result.definitions.map((definition: any) => definition.name)).toEqual(['Alpha', 'Beta']);
+    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual(['a.ts', 'b.ts']);
+    expect(resolver).not.toHaveBeenCalled();
     expect(result.timing).not.toHaveProperty('rerank');
+    expect(result.warning).toBeUndefined();
   });
 
-  it('filters malformed query candidates before rerank and output', async () => {
+  it('falls back explicitly to the original ordering when provider policy permits it', async () => {
     const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
     vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
-      ftsAvailable: true,
       results: [
-        {
-          filePath: 'src/client.ts',
-          nodeIds: ['node-good', 'node-corrupt'],
-          score: 10,
-        },
+        { filePath: 'src/a.ts', name: 'A', type: 'File' },
+        { filePath: 'src/b.ts', name: 'B', type: 'File' },
       ],
+      ftsAvailable: true,
     });
-    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
-    rerankMocks.resolveRerankConfig.mockReturnValue({
-      baseUrl: 'https://api.voyageai.com/v1',
-      model: 'rerank-2.5',
-      apiKey: 'test-key',
-      candidates: 2,
-      maxDocChars: 3000,
-    });
-
-    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
-      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 0 }];
-      return [];
-    });
-    (executeParameterized as any).mockImplementation(
-      async (_repoId: string, cypher: string, params?: { nodeIds?: string[] }) => {
-        if (cypher.includes('RETURN n.id AS id')) {
-          return (params?.nodeIds ?? []).map((id) =>
-            id === 'node-good'
-              ? {
-                  id,
-                  name: 'GoodClient',
-                  type: 'Function',
-                  filePath: 'src/client.ts',
-                  startLine: 1,
-                  endLine: 10,
-                }
-              : {
-                  id,
-                  name: 'Bad\u0000Client',
-                  type: 'Function',
-                  filePath: 'src/client.ts',
-                  startLine: 20,
-                  endLine: 30,
-                },
-          );
-        }
-        return [];
+    const fallbackBackend = new LocalBackend(() => ({
+      provider: {
+        id: 'failing-test',
+        rerank: vi.fn().mockRejectedValue(new Error('provider unavailable')),
       },
-    );
+      candidates: 2,
+      maxDocChars: 1000,
+      failurePolicy: 'fallback',
+    }));
+    await fallbackBackend.init();
 
-    const result = await backend.callTool('query', { query: 'client', limit: 1, max_symbols: 2 });
+    const result = await fallbackBackend.callTool('query', { search_query: 'needle' });
 
-    expect(rerankMocks.rerankDocuments).not.toHaveBeenCalled();
-    expect(result.definitions.map((definition: any) => definition.name)).toEqual(['GoodClient']);
+    expect(result.definitions.map((item: { name: string }) => item.name)).toEqual(['a.ts', 'b.ts']);
+    expect(result.warning).toMatch(/rerank unavailable.*existing bm25\/vector ranking/i);
   });
 
-  it('applies Voyage rerank scores to process ranking, not only standalone definitions', async () => {
+  it('propagates provider failure when policy is error', async () => {
     const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
     vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
-      ftsAvailable: true,
       results: [
-        { filePath: 'src/alpha.ts', nodeIds: ['node-alpha'], score: 10 },
-        { filePath: 'src/beta.ts', nodeIds: ['node-beta'], score: 9 },
+        { filePath: 'src/a.ts', name: 'A', type: 'File' },
+        { filePath: 'src/b.ts', name: 'B', type: 'File' },
       ],
+      ftsAvailable: true,
     });
-    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
-    rerankMocks.resolveRerankConfig.mockReturnValue({
-      baseUrl: 'https://api.voyageai.com/v1',
-      model: 'rerank-2.5',
-      apiKey: 'test-key',
+    const strictBackend = new LocalBackend(() => ({
+      provider: {
+        id: 'failing-test',
+        rerank: vi.fn().mockRejectedValue(new Error('provider unavailable')),
+      },
       candidates: 2,
-      maxDocChars: 3000,
-    });
-    rerankMocks.rerankDocuments.mockResolvedValueOnce([
-      { index: 1, relevance_score: 0.99 },
-      { index: 0, relevance_score: 0.25 },
+      maxDocChars: 1000,
+      failurePolicy: 'error',
+    }));
+    await strictBackend.init();
+
+    await expect(strictBackend.callTool('query', { search_query: 'needle' })).rejects.toThrow(
+      'provider unavailable',
+    );
+  });
+
+  it('checks cycles using only non-synthetic import edges', async () => {
+    (executeParameterized as any).mockResolvedValue([
+      { source: 'src/a.ts', target: 'src/b.ts' },
+      { source: 'src/b.ts', target: 'src/a.ts' },
     ]);
 
-    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
-      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 0 }];
-      return [];
+    const result = await backend.callTool('check', { cycles: true });
+
+    expect(result).toEqual({
+      status: 'cycles_found',
+      cycleCount: 1,
+      cycles: [{ files: ['src/a.ts', 'src/b.ts', 'src/a.ts'] }],
     });
-    (executeParameterized as any).mockImplementation(
-      async (_repoId: string, cypher: string, params?: { nodeIds?: string[] }) => {
-        if (cypher.includes('RETURN n.id AS id')) {
-          return (params?.nodeIds ?? []).map((id) =>
-            id === 'node-alpha'
-              ? {
-                  id,
-                  name: 'Alpha',
-                  type: 'Function',
-                  filePath: 'src/alpha.ts',
-                  startLine: 1,
-                  endLine: 10,
-                }
-              : {
-                  id,
-                  name: 'Beta',
-                  type: 'Function',
-                  filePath: 'src/beta.ts',
-                  startLine: 20,
-                  endLine: 30,
-                },
-          );
-        }
-        if (cypher.includes('STEP_IN_PROCESS')) {
-          return (params?.nodeIds ?? []).map((id) =>
-            id === 'node-alpha'
-              ? {
-                  nodeId: id,
-                  pid: 'proc-alpha',
-                  label: 'Alpha process',
-                  heuristicLabel: 'Alpha process',
-                  processType: 'execution_flow',
-                  stepCount: 1,
-                  step: 1,
-                }
-              : {
-                  nodeId: id,
-                  pid: 'proc-beta',
-                  label: 'Beta process',
-                  heuristicLabel: 'Beta process',
-                  processType: 'execution_flow',
-                  stepCount: 1,
-                  step: 1,
-                },
-          );
-        }
-        if (cypher.includes('RETURN n.id AS nodeId, c.cohesion AS cohesion')) return [];
-        if (cypher.includes('RETURN n.id AS nodeId, n.content AS content')) {
-          return (params?.nodeIds ?? []).map((id) => ({
-            nodeId: id,
-            content: id === 'node-alpha' ? 'alpha implementation' : 'beta implementation',
-          }));
-        }
-        return [];
-      },
-    );
+    const query = (executeParameterized as any).mock.calls.at(-1)[1] as string;
+    expect(query).toContain("r.reason <> 'swift-scope: implicit module visibility'");
+    expect(query).toContain("r.reason <> 'markdown-link'");
+    expect(query).toContain('LIMIT 100001');
+  });
 
-    const result = await backend.callTool('query', { query: 'auth', limit: 2, max_symbols: 2 });
+  it('uses the advertised cycles default when check arguments are omitted', async () => {
+    (executeParameterized as any).mockResolvedValue([]);
 
-    expect(result.processes.map((process: any) => process.id)).toEqual(['proc-beta', 'proc-alpha']);
-    expect(result.process_symbols.map((symbol: any) => symbol.name)).toEqual(['Beta', 'Alpha']);
+    await expect(backend.callTool('check', undefined)).resolves.toEqual({
+      status: 'clean',
+      cycleCount: 0,
+      cycles: [],
+    });
+  });
+
+  it('fails closed when the import-edge safety limit is reached', async () => {
+    (executeParameterized as any).mockResolvedValue({ length: 100_001 });
+
+    await expect(backend.callTool('check', { cycles: true })).resolves.toEqual({
+      error: 'Import graph exceeds the 100000 edge safety limit.',
+      truncated: true,
+    });
   });
 
   it('includes FTS-unavailable warning when ftsAvailable is false (#1403)', async () => {
@@ -632,12 +590,23 @@ describe('LocalBackend.callTool', () => {
     vi.mocked(searchFTSFromLbug).mockRejectedValueOnce(new Error('bm25Results is not iterable'));
     (executeParameterized as any).mockResolvedValue([]);
 
-    const result = await backend.callTool('query', { query: 'auth' });
+    const cap = _captureLogger();
+    try {
+      const result = await backend.callTool('query', { query: 'auth' });
 
-    // Should still return a valid result shape (semantic-only fallback)
-    expect(result).toHaveProperty('processes');
-    expect(result).toHaveProperty('definitions');
-    expect(result).not.toHaveProperty('error');
+      // Should still return a valid result shape (semantic-only fallback)
+      expect(result).toHaveProperty('processes');
+      expect(result).toHaveProperty('definitions');
+      expect(result).not.toHaveProperty('error');
+      // The FTS fallback is a gracefully-degraded result, not an operation failure:
+      // it must log at warn (40), never error (50), matching its sibling
+      // import-failure fallback. Pins the severity against regression.
+      const fts = cap.records().find((r) => /BM25\/FTS search failed/.test(String(r.msg ?? '')));
+      expect(fts).toBeDefined();
+      expect(fts?.level).toBe(40);
+    } finally {
+      cap.restore();
+    }
   });
 
   it('skips vector index query when VECTOR is unsupported by the platform', async () => {
@@ -689,36 +658,103 @@ describe('LocalBackend.callTool', () => {
     await backend.callTool('query', { query: 'auth' });
 
     const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
-    expect(ensureVectorExtensionForRepo).toHaveBeenCalledWith('/tmp/.gitnexus/test-project/lbug');
     expect(queries.some((cypher: string) => cypher.includes('QUERY_VECTOR_INDEX'))).toBe(true);
+    // The configured threshold must reach the WHERE clause (MCP default 0.6), guarding
+    // against a regression that drops the filter or re-hardcodes a different value.
+    expect(queries.some((cypher: string) => cypher.includes('distance < 0.6'))).toBe(true);
   });
 
-  it('falls back explicitly when VECTOR is supported but not loadable on the read connection', async () => {
+  it('warns once when VECTOR query failure falls back to exact scan', async () => {
     platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
-    lbugMocks.ensureVectorExtensionForRepo.mockResolvedValue(false);
     (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
       if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 1 }];
-      if (cypher.includes('MATCH (e:CodeEmbedding)')) return [];
+      if (cypher.includes('QUERY_VECTOR_INDEX')) throw new Error('HNSW index unavailable');
       return [];
     });
     (executeParameterized as any).mockResolvedValue([]);
+    const cap = _captureLogger();
 
-    const result = await backend.callTool('query', { query: 'auth' });
+    try {
+      await backend.callTool('query', { query: 'auth' });
+      await backend.callTool('query', { query: 'auth' });
 
-    const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
-    expect(ensureVectorExtensionForRepo).toHaveBeenCalledWith('/tmp/.gitnexus/test-project/lbug');
-    expect(queries.some((cypher: string) => cypher.includes('QUERY_VECTOR_INDEX'))).toBe(false);
-    expect(result.warning).toContain('VECTOR extension unavailable on the query path');
+      const warnings = cap
+        .records()
+        .filter((record) => String(record.msg).includes('using exact scan fallback'));
+      expect(warnings).toHaveLength(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('warns and refuses an exact scan above the configured safety limit', async () => {
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 2 }];
+      if (cypher.includes('QUERY_VECTOR_INDEX')) throw new Error('HNSW index unavailable');
+      return [];
+    });
+    (executeParameterized as any).mockResolvedValue([]);
+    const previous = process.env.GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT;
+    process.env.GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT = '1';
+    const cap = _captureLogger();
+
+    try {
+      await backend.callTool('query', { query: 'auth' });
+
+      expect(
+        cap
+          .records()
+          .some((record) =>
+            /exact scan refused.*2 chunks exceed.*limit of 1/i.test(String(record.msg)),
+          ),
+      ).toBe(true);
+      const queries = (executeQuery as any).mock.calls.map(
+        ([, cypher]: [string, string]) => cypher,
+      );
+      expect(queries.some((cypher: string) => cypher.includes('e.embedding AS embedding'))).toBe(
+        false,
+      );
+    } finally {
+      cap.restore();
+      if (previous === undefined) delete process.env.GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT;
+      else process.env.GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT = previous;
+    }
+  });
+
+  it('threads GITNEXUS_VECTOR_MAX_DISTANCE into the vector index WHERE clause', async () => {
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    vi.mocked(executeQuery).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 1 }];
+      return [];
+    });
+    vi.mocked(executeParameterized).mockResolvedValue([]);
+
+    const previous = process.env.GITNEXUS_VECTOR_MAX_DISTANCE;
+    process.env.GITNEXUS_VECTOR_MAX_DISTANCE = '0.42';
+    try {
+      await backend.callTool('query', { query: 'auth' });
+      const queries = vi
+        .mocked(executeQuery)
+        .mock.calls.map(([, cypher]: [string, string]) => cypher);
+      expect(queries.some((cypher: string) => cypher.includes('distance < 0.42'))).toBe(true);
+      expect(queries.some((cypher: string) => cypher.includes('distance < 0.6'))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_VECTOR_MAX_DISTANCE;
+      else process.env.GITNEXUS_VECTOR_MAX_DISTANCE = previous;
+    }
   });
 
   it('query tool returns error for empty query', async () => {
     const result = await backend.callTool('query', { query: '' });
-    expect(result.error).toContain('query parameter is required');
+    expect(result.error).toContain('search_query');
+    expect(result.error).toContain('parameter is required');
   });
 
   it('query tool returns error for whitespace-only query', async () => {
     const result = await backend.callTool('query', { query: '   ' });
-    expect(result.error).toContain('query parameter is required');
+    expect(result.error).toContain('search_query');
+    expect(result.error).toContain('parameter is required');
   });
 
   it('dispatches cypher tool and blocks write queries', async () => {
@@ -737,6 +773,231 @@ describe('LocalBackend.callTool', () => {
     expect(result).toHaveProperty('markdown');
     expect(result).toHaveProperty('row_count');
     expect(result.row_count).toBe(1);
+  });
+
+  // ── #2175: backward-compatible parameter-alias dispatch ──────────────────
+  // Claude Code drops a tool-call argument named exactly "query", so the query
+  // and cypher tools advertise search_query / statement. The handlers must accept
+  // the new names AND keep accepting the legacy "query" key (verified by the
+  // existing tests above, which still pass { query: ... }).
+
+  it('query tool accepts the new search_query parameter (#2175)', async () => {
+    (executeParameterized as any).mockResolvedValue([]);
+    const result = await backend.callTool('query', { search_query: 'auth' });
+    expect(result).toHaveProperty('processes');
+    expect(result).toHaveProperty('definitions');
+    expect(result).not.toHaveProperty('error');
+  });
+
+  it('query tool prefers search_query over the legacy query when both are given (#2175)', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    (executeParameterized as any).mockResolvedValue([]);
+
+    await backend.callTool('query', { search_query: 'newName', query: 'oldName' });
+
+    // bm25Search passes the resolved search text as arg 0 to searchFTSFromLbug.
+    const lastTerm = String(vi.mocked(searchFTSFromLbug).mock.calls.at(-1)?.[0] ?? '');
+    expect(lastTerm).toBe('newName');
+  });
+
+  it('query tool returns error when neither search_query nor query is provided (#2175)', async () => {
+    const result = await backend.callTool('query', {});
+    expect(result.error).toContain('search_query');
+    expect(result.error).toContain('parameter is required');
+  });
+
+  it('cypher tool accepts the new statement parameter (#2175)', async () => {
+    (executeParameterized as any).mockResolvedValue([{ name: 'test', filePath: 'src/test.ts' }]);
+    const result = await backend.callTool('cypher', {
+      statement: 'MATCH (n:Function) RETURN n.name AS name, n.filePath AS filePath LIMIT 5',
+    });
+    expect(result).toHaveProperty('markdown');
+    expect(result).toHaveProperty('row_count');
+    expect(result.row_count).toBe(1);
+  });
+
+  it('cypher tool prefers statement over the legacy query when both are given (#2175)', async () => {
+    (executeParameterized as any).mockResolvedValue([]);
+    await backend.callTool('cypher', {
+      statement: 'MATCH (a) RETURN a',
+      query: 'MATCH (b) RETURN b',
+    });
+    const passedCypher = (executeParameterized as any).mock.calls.at(-1)[1] as string;
+    expect(passedCypher).toBe('MATCH (a) RETURN a');
+  });
+
+  it('executeCypher (internal API) still works via the legacy query field (#2175)', async () => {
+    (executeParameterized as any).mockResolvedValue([{ name: 'x' }]);
+    const result = await backend.executeCypher('test-project', 'MATCH (n) RETURN n LIMIT 1');
+    expect(result).not.toHaveProperty('error');
+    const passedCypher = (executeParameterized as any).mock.calls.at(-1)[1] as string;
+    expect(passedCypher).toBe('MATCH (n) RETURN n LIMIT 1');
+  });
+
+  it('query tool returns error for empty search_query (new key) (#2175)', async () => {
+    const result = await backend.callTool('query', { search_query: '' });
+    expect(result.error).toContain('search_query');
+    expect(result.error).toContain('parameter is required');
+  });
+
+  it('query tool returns error for whitespace-only search_query (new key) (#2175)', async () => {
+    const result = await backend.callTool('query', { search_query: '   ' });
+    expect(result.error).toContain('search_query');
+    expect(result.error).toContain('parameter is required');
+  });
+
+  it('search legacy alias accepts the new search_query parameter (#2175)', async () => {
+    (executeParameterized as any).mockResolvedValue([]);
+    const result = await backend.callTool('search', { search_query: 'auth' });
+    expect(result).toHaveProperty('processes');
+    expect(result).not.toHaveProperty('error');
+  });
+
+  it('cypher tool returns a friendly required error when neither statement nor query is given (#2175)', async () => {
+    const result = await backend.callTool('cypher', {});
+    expect(result.error).toContain('statement');
+    expect(result.error).toContain('parameter is required');
+  });
+
+  // #2175 review: the @group-forward path reads `query` from the forwarded args, so it
+  // must resolve the search_query alias itself (new name wins, mirroring query()).
+  it('group-mode query forwards the resolved search_query alias (#2175)', async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    const groupQuerySpy = vi
+      .spyOn(backend.getGroupService(), 'groupQuery')
+      .mockResolvedValue({ ok: true } as any);
+
+    await backend.callTool('query', {
+      search_query: 'alias-wins',
+      query: 'legacy-loses',
+      repo: '@grp',
+    });
+
+    expect(groupQuerySpy).toHaveBeenCalledTimes(1);
+    expect((groupQuerySpy.mock.calls[0][0] as any).query).toBe('alias-wins');
+    groupQuerySpy.mockRestore();
+  });
+
+  it('group-mode query still forwards a legacy-only query (#2175)', async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    const groupQuerySpy = vi
+      .spyOn(backend.getGroupService(), 'groupQuery')
+      .mockResolvedValue({ ok: true } as any);
+
+    await backend.callTool('query', { query: 'legacy', repo: '@grp' });
+
+    expect((groupQuerySpy.mock.calls[0][0] as any).query).toBe('legacy');
+    groupQuerySpy.mockRestore();
+  });
+
+  // U3: `trace` with an @group repo routes to the cross-repo groupTrace path
+  // and forwards the trace params (incl. the experimental pdg/crossDepth flags).
+  it('group-mode trace routes to groupTrace and forwards trace params', async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    const groupTraceSpy = vi
+      .spyOn(backend.getGroupService(), 'groupTrace')
+      .mockResolvedValue({ status: 'ok' });
+
+    await backend.callTool('trace', {
+      from: 'A',
+      to: 'B',
+      pdg: true,
+      crossDepth: 3,
+      repo: '@grp',
+    });
+
+    expect(groupTraceSpy).toHaveBeenCalledTimes(1);
+    const args = groupTraceSpy.mock.calls[0][0] as Record<string, unknown>;
+    expect(args).toMatchObject({ name: 'grp', from: 'A', to: 'B', pdg: true, crossDepth: 3 });
+    groupTraceSpy.mockRestore();
+  });
+
+  // U3: a non-@group trace must NOT route to groupTrace — single-repo behavior
+  // is untouched (here it resolves to not_found against the empty mocked graph).
+  it('single-repo trace does not route to groupTrace', async () => {
+    const groupTraceSpy = vi.spyOn(backend.getGroupService(), 'groupTrace');
+    vi.mocked(executeParameterized).mockResolvedValue([]);
+
+    const result = await backend.callTool('trace', { from: 'A', to: 'B' });
+
+    expect(groupTraceSpy).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: 'not_found' });
+    groupTraceSpy.mockRestore();
+  });
+
+  // The destination trace (omit `to`) is a cross-repo @group feature; a single-repo
+  // trace without `to` must error clearly, not return an opaque "symbol not found".
+  it('single-repo trace without `to` returns an actionable error', async () => {
+    const result = await backend.callTool('trace', { from: 'A' });
+    expect(result).toMatchObject({
+      status: 'error',
+      error: expect.stringContaining('requires `to`'),
+    });
+  });
+
+  // #2175 review: the MCP envelope is not schema-validated, so a client can send a
+  // non-string value for a string param. Resolve it to a friendly required-param error
+  // rather than throwing TypeError on `.trim()` (query() and cypher() both).
+  it('query tool returns a friendly error (no throw) for a non-string search_query (#2175)', async () => {
+    const result = await backend.callTool('query', { search_query: 123 as any });
+    expect(result.error).toContain('search_query');
+    expect(result.error).toContain('parameter is required');
+  });
+
+  it('cypher tool returns a friendly error (no throw) for a non-string statement (#2175)', async () => {
+    const result = await backend.callTool('cypher', { statement: 123 as any });
+    expect(result.error).toContain('statement');
+    expect(result.error).toContain('parameter is required');
+  });
+
+  // #2175 review (PR #2186): resolution prefers the first NON-BLANK string, so a blank
+  // new-name value falls back to a valid legacy value instead of clobbering it.
+  it('query tool: a blank new search_query falls back to a valid legacy query (#2175)', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    (executeParameterized as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('query', { search_query: '', query: 'real' });
+
+    expect(result).not.toHaveProperty('error');
+    expect(result).toHaveProperty('processes');
+    const lastTerm = String(vi.mocked(searchFTSFromLbug).mock.calls.at(-1)?.[0] ?? '');
+    expect(lastTerm).toBe('real');
+  });
+
+  it('query tool: a whitespace-only new search_query falls back to a valid legacy query (#2175)', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    (executeParameterized as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('query', { search_query: '   ', query: 'real' });
+
+    expect(result).not.toHaveProperty('error');
+    const lastTerm = String(vi.mocked(searchFTSFromLbug).mock.calls.at(-1)?.[0] ?? '');
+    expect(lastTerm).toBe('real');
+  });
+
+  it('query tool: both keys blank still returns the required error (#2175)', async () => {
+    const result = await backend.callTool('query', { search_query: '', query: '   ' });
+    expect(result.error).toContain('search_query');
+    expect(result.error).toContain('parameter is required');
+  });
+
+  it('cypher tool: a blank statement falls back to a valid legacy query (#2175)', async () => {
+    (executeParameterized as any).mockResolvedValue([]);
+    await backend.callTool('cypher', { statement: '', query: 'MATCH (n) RETURN n LIMIT 1' });
+    const passedCypher = (executeParameterized as any).mock.calls.at(-1)[1] as string;
+    expect(passedCypher).toBe('MATCH (n) RETURN n LIMIT 1');
+  });
+
+  it('group-mode query: a blank new search_query falls back to the legacy query (#2175)', async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    const groupQuerySpy = vi
+      .spyOn(backend.getGroupService(), 'groupQuery')
+      .mockResolvedValue({ ok: true } as any);
+
+    await backend.callTool('query', { search_query: '', query: 'real', repo: '@grp' });
+
+    expect((groupQuerySpy.mock.calls[0][0] as any).query).toBe('real');
+    groupQuerySpy.mockRestore();
   });
 
   it('dispatches context tool', async () => {
@@ -830,35 +1091,6 @@ describe('LocalBackend.callTool', () => {
     // picking the App.tsx candidate in either case (via mock-relaxed DB
     // pre-filter or via scoring promotion). The dedicated scoring-promotion
     // path is covered by the next `it()` block below.
-    expect(result.status).toBe('found');
-    expect(result.symbol.filePath).toBe('src/App.tsx');
-  });
-
-  it('context tool normalizes symbol/file aliases before dispatch', async () => {
-    (executeParameterized as any).mockResolvedValue([
-      {
-        id: 'func:handleConnect:1',
-        name: 'handleConnect',
-        type: 'Function',
-        filePath: 'src/lib/socket.ts',
-        startLine: 10,
-        endLine: 20,
-      },
-      {
-        id: 'func:handleConnect:2',
-        name: 'handleConnect',
-        type: 'Function',
-        filePath: 'src/App.tsx',
-        startLine: 42,
-        endLine: 60,
-      },
-    ]);
-
-    const result = await backend.callTool('context', {
-      symbol: 'handleConnect',
-      file: 'App.tsx',
-    });
-
     expect(result.status).toBe('found');
     expect(result.symbol.filePath).toBe('src/App.tsx');
   });
@@ -1026,47 +1258,6 @@ describe('LocalBackend.callTool', () => {
     for (const [, cypher] of calls) {
       expect(cypher).not.toMatch(/WHERE n\.name = \$symName/);
     }
-  });
-
-  it('impact tool normalizes name alias and defaults direction to upstream', async () => {
-    (executeParameterized as any).mockResolvedValue([
-      {
-        id: 'func:login',
-        name: 'login',
-        type: 'Function',
-        filePath: 'src/auth.ts',
-        startLine: 5,
-        endLine: 15,
-      },
-    ]);
-    (executeQuery as any).mockResolvedValue([]);
-
-    const result = await backend.callTool('impact', { name: 'login' });
-
-    expect(result.target.name).toBe('login');
-    expect(result.direction).toBe('upstream');
-  });
-
-  it('impact tool normalizes symbol alias before dispatch', async () => {
-    (executeParameterized as any).mockResolvedValue([
-      {
-        id: 'func:logout',
-        name: 'logout',
-        type: 'Function',
-        filePath: 'src/auth.ts',
-        startLine: 20,
-        endLine: 30,
-      },
-    ]);
-    (executeQuery as any).mockResolvedValue([]);
-
-    const result = await backend.callTool('impact', {
-      symbol: 'logout',
-      direction: 'downstream',
-    });
-
-    expect(result.target.name).toBe('logout');
-    expect(result.direction).toBe('downstream');
   });
 
   it('dispatches impact tool', async () => {
@@ -1387,6 +1578,59 @@ describe('LocalBackend.callTool', () => {
     expect(result.error).toContain('Either symbol_name or symbol_uid');
   });
 
+  it('rename: a swallowed apply-edit write failure degrades to status:partial + failed_files (#2283)', async () => {
+    // Resolve the definition, no graph refs. readFile succeeds (so a def edit is
+    // recorded), but writeFile fails on apply — the failure is swallowed via
+    // logQueryError. The result must NOT report a clean success: it degrades to
+    // 'partial' and lists the unwritten file, instead of status:'success'.
+    (executeParameterized as any)
+      .mockResolvedValueOnce([
+        {
+          id: 'func:oldName',
+          name: 'oldName',
+          type: 'Function',
+          filePath: 'src/target.ts',
+          startLine: 1,
+          endLine: 5,
+        },
+      ])
+      .mockResolvedValue([]);
+    const repoDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-rename-'));
+    (listRegisteredRepos as any).mockResolvedValue([
+      { ...MOCK_REPO_ENTRY, path: repoDir, storagePath: path.join(repoDir, '.gitnexus') },
+    ]);
+    backend = new LocalBackend();
+    await backend.init();
+
+    // The symbol is stored at 0-based startLine 1; context() presents it 1-based
+    // (line 2) and rename subtracts 1 to recover the 0-based file index (1), so
+    // `oldName` must sit on the file's 0-based line 1 for the definition edit to
+    // fire. (#2380: the mock previously put it on line 0, which stopped matching
+    // once context() went 1-based.)
+    const readSpy = vi
+      .spyOn(fsPromises, 'readFile')
+      .mockResolvedValue('\nfunction oldName() {}\n' as unknown as Buffer);
+    const writeSpy = vi
+      .spyOn(fsPromises, 'writeFile')
+      .mockRejectedValue(new Error('EACCES: permission denied'));
+    try {
+      const result = await backend.callTool('rename', {
+        symbol_name: 'oldName',
+        new_name: 'newName',
+        dry_run: false,
+      });
+      expect(result.status).toBe('partial');
+      expect(result.failed_files).toContain('src/target.ts');
+      // It DID attempt to apply (not a dry run) — `applied` stays true; the
+      // honest signal is the 'partial' status + failed_files, not `applied`.
+      expect(result.applied).toBe(true);
+    } finally {
+      readSpy.mockRestore();
+      writeSpy.mockRestore();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
   // api_impact tool
   it('dispatches api_impact tool with route param', async () => {
     (executeParameterized as any).mockResolvedValue([
@@ -1500,6 +1744,234 @@ describe('LocalBackend.callTool', () => {
     expect(result.total).toBe(2);
   });
 
+  // ── #2308: same-URL multi-verb route contract ──
+  // After #2302 a same URL exposes one Route node per HTTP verb. A bare-URL (or
+  // bare-file) api_impact lookup therefore returns the wrapped { routes, total }
+  // form; passing `method` collapses it back to the singular shape.
+  const verbRow = (
+    method: string | null,
+    routeName: string,
+    handlerFile: string,
+    middleware: string[] | null = null,
+  ) => ({
+    routeId: `Route:${method ? `${method} ` : ''}${routeName}`,
+    routeName,
+    method,
+    handlerFile,
+    responseKeys: null,
+    errorKeys: null,
+    middleware,
+    consumerName: null,
+    consumerFile: null,
+    fetchReason: null,
+  });
+  const ordersVerbRows = [
+    verbRow('GET', '/api/orders', 'api/orders.ts'),
+    verbRow('POST', '/api/orders', 'api/orders.ts'),
+  ];
+
+  it('api_impact returns the wrapped form for same-URL multi-verb routes, each with its method', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue(ordersVerbRows);
+    const result = await backend.callTool('api_impact', { route: '/api/orders' });
+    expect(result.total).toBe(2);
+    expect(result.routes).toHaveLength(2);
+    expect(result.routes.map((r: { method: string | null }) => r.method).sort()).toEqual([
+      'GET',
+      'POST',
+    ]);
+    expect(result.routes).toMatchObject([{ route: '/api/orders' }, { route: '/api/orders' }]);
+  });
+
+  it('api_impact narrows a multi-verb URL to one route when method is given', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue(ordersVerbRows);
+    const result = await backend.callTool('api_impact', { route: '/api/orders', method: 'POST' });
+    expect(result.method).toBe('POST');
+    expect(result.route).toBe('/api/orders');
+    expect(result.routes).toBeUndefined();
+    expect(result.total).toBeUndefined();
+  });
+
+  it('api_impact matches the method selector case-insensitively', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue(ordersVerbRows);
+    const result = await backend.callTool('api_impact', { route: '/api/orders', method: 'post' });
+    expect(result.method).toBe('POST');
+    expect(result.routes).toBeUndefined();
+  });
+
+  it('api_impact returns a verb-not-found error when method matches no route at the URL', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue(ordersVerbRows);
+    const result = await backend.callTool('api_impact', { route: '/api/orders', method: 'delete' });
+    expect(result.error).toContain('/api/orders');
+    expect(result.error).toContain('DELETE');
+    expect(result.routes).toBeUndefined();
+  });
+
+  it('api_impact omits the verb clause when the URL itself does not exist', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([]);
+    const result = await backend.callTool('api_impact', {
+      route: '/does/not/exist',
+      method: 'GET',
+    });
+    expect(result.error).toContain('/does/not/exist');
+    expect(result.error).not.toContain('with method');
+  });
+
+  // #2308: the shared `method` field also surfaces on route_map and shape_check
+  // (same fetchRoutesWithConsumers query), so both are documented + covered here.
+  it('route_map surfaces each route method', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([
+      verbRow('GET', '/api/orders', 'api/orders.ts'),
+      verbRow('POST', '/api/orders', 'api/orders.ts'),
+    ]);
+    const result = await backend.callTool('route_map', { route: '/api/orders' });
+    expect(result.routes.map((r: { method: string | null }) => r.method).sort()).toEqual([
+      'GET',
+      'POST',
+    ]);
+  });
+
+  it('route_map surfaces a null method for verbless routes', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([
+      verbRow(null, '/blog/[slug]', 'app/blog/[slug]/route.ts'),
+    ]);
+    const result = await backend.callTool('route_map', { route: '/blog/[slug]' });
+    expect(result.routes[0].method).toBeNull();
+  });
+
+  it('shape_check surfaces each route method', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([
+      {
+        ...verbRow('GET', '/api/orders', 'api/orders.ts'),
+        responseKeys: ['data', 'total'],
+        consumerName: 'OrdersList',
+        consumerFile: 'src/OrdersList.tsx',
+        fetchReason: 'fetch-url-match|keys:data',
+      },
+    ]);
+    const result = await backend.callTool('shape_check', { route: '/api/orders' });
+    expect(result.routes[0].method).toBe('GET');
+  });
+
+  // The partial-middleware warning is driven by a per-handler verb count taken
+  // from the UNFILTERED match, so a method-scoped query on a multi-verb handler
+  // still flags partial middleware. Counting the filtered set would drop it.
+  it('api_impact keeps middlewareDetection partial under a method filter', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([
+      verbRow('GET', '/api/orders', 'api/orders.ts', ['withAuth']),
+      verbRow('POST', '/api/orders', 'api/orders.ts', ['withAuth']),
+    ]);
+    const result = await backend.callTool('api_impact', { route: '/api/orders', method: 'GET' });
+    expect(result.method).toBe('GET');
+    expect(result.middlewareDetection).toBe('partial');
+    expect(result.middlewareNote).toContain('route exports');
+  });
+
+  it('api_impact returns the wrapped form for a same-handler multi-verb file lookup', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([
+      verbRow('GET', '/api/orders', 'app/api/orders/route.ts'),
+      verbRow('POST', '/api/orders', 'app/api/orders/route.ts'),
+    ]);
+    const result = await backend.callTool('api_impact', { file: 'app/api/orders/route.ts' });
+    expect(result.total).toBe(2);
+    expect(result.routes.map((r: { method: string | null }) => r.method).sort()).toEqual([
+      'GET',
+      'POST',
+    ]);
+  });
+
+  it('api_impact surfaces a null method for method-less (verbless) routes', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([
+      verbRow(null, '/blog/[slug]', 'app/blog/[slug]/route.ts'),
+    ]);
+    const result = await backend.callTool('api_impact', { route: '/blog/[slug]' });
+    expect(result.method).toBeNull();
+    expect(result.route).toBe('/blog/[slug]');
+    expect(result.routes).toBeUndefined();
+  });
+
+  it('api_impact narrows a multi-verb file lookup to one route when method is given', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([
+      verbRow('GET', '/api/orders', 'app/api/orders/route.ts'),
+      verbRow('POST', '/api/orders', 'app/api/orders/route.ts'),
+    ]);
+    const result = await backend.callTool('api_impact', {
+      file: 'app/api/orders/route.ts',
+      method: 'POST',
+    });
+    expect(result.method).toBe('POST');
+    expect(result.route).toBe('/api/orders');
+    expect(result.routes).toBeUndefined();
+  });
+
+  it('api_impact excludes verbless routes from a method selector', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([
+      verbRow(null, '/api/orders', 'api/orders.ts'),
+      verbRow('GET', '/api/orders', 'api/orders.ts'),
+    ]);
+    const result = await backend.callTool('api_impact', { route: '/api/orders', method: 'GET' });
+    expect(result.method).toBe('GET');
+    expect(result.route).toBe('/api/orders');
+    expect(result.routes).toBeUndefined();
+  });
+
+  // A method-agnostic route persists with method '*' (Django function views) and
+  // handles every verb — unlike a verbless (null) route, a method selector MUST
+  // match it, or api_impact reports a false "no routes" for a live handler.
+  it('api_impact matches a wildcard (*) route against a specific method selector', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([verbRow('*', '/django/view', 'views.py')]);
+    const result = await backend.callTool('api_impact', { route: '/django/view', method: 'POST' });
+    expect(result.method).toBe('*');
+    expect(result.route).toBe('/django/view');
+    expect(result.error).toBeUndefined();
+    expect(result.routes).toBeUndefined();
+  });
+
+  it('api_impact matches a wildcard (*) route case-insensitively for any verb', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([verbRow('*', '/django/view', 'views.py')]);
+    const result = await backend.callTool('api_impact', { route: '/django/view', method: 'get' });
+    expect(result.method).toBe('*');
+    expect(result.error).toBeUndefined();
+    expect(result.routes).toBeUndefined();
+  });
+
+  it('api_impact includes a wildcard (*) route alongside a concrete verb under a selector', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue([
+      verbRow('*', '/api/orders', 'api/orders.ts'),
+      verbRow('GET', '/api/orders', 'api/orders.ts'),
+    ]);
+    const result = await backend.callTool('api_impact', { route: '/api/orders', method: 'GET' });
+    expect(result.total).toBe(2);
+    expect(result.routes.map((r: { method: string | null }) => r.method).sort()).toEqual([
+      '*',
+      'GET',
+    ]);
+  });
+
+  // The `method` param is not schema-validated at the transport, so api_impact
+  // must reject a non-string verb with a structured error (not a thrown
+  // TypeError) and treat empty/whitespace as no selector.
+  it('api_impact returns a structured error for a non-string method', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue(ordersVerbRows);
+    const result = await backend.callTool('api_impact', { route: '/api/orders', method: 5 });
+    expect(result.error).toContain('method');
+    expect(result.error).toContain('string');
+    expect(result.routes).toBeUndefined();
+  });
+
+  it('api_impact treats an empty-string method as no selector', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue(ordersVerbRows);
+    const result = await backend.callTool('api_impact', { route: '/api/orders', method: '' });
+    expect(result.total).toBe(2);
+    expect(result.error).toBeUndefined();
+  });
+
+  it('api_impact treats a whitespace-only method as no selector', async () => {
+    vi.mocked(executeParameterized).mockResolvedValue(ordersVerbRows);
+    const result = await backend.callTool('api_impact', { route: '/api/orders', method: '  ' });
+    expect(result.total).toBe(2);
+    expect(result.error).toBeUndefined();
+  });
+
   it('api_impact HIGH risk for 10+ consumers', async () => {
     const rows = [];
     for (let i = 0; i < 10; i++) {
@@ -1543,6 +2015,702 @@ describe('LocalBackend.callTool', () => {
     // explore calls context — which may return found or ambiguous depending on mock
     expect(result).toBeDefined();
     expect(result.status === 'found' || result.symbol || result.error === undefined).toBeTruthy();
+  });
+});
+
+// ─── impact mode param (KTD1/KTD5/KTD12 — U1) ───────────────────────
+//
+// The MCP JSON-schema enum is advisory only (server forwards args
+// unvalidated, callTool is reachable directly), so the backend `mode`
+// validation is load-bearing. These tests pin: callgraph is the unchanged
+// default, pdg routes to the extracted traversal plus interprocedural symbol
+// reach, invalid modes hard-error, and the remaining incompatible params /
+// @group targets are rejected.
+
+describe('LocalBackend impact mode (KTD1/KTD5/KTD12)', () => {
+  let backend: LocalBackend;
+
+  // Resolve the target to a single Function so impact reaches the single-branch
+  // dispatch (callgraph BFS or the PDG traversal). The callgraph BFS then issues
+  // executeQuery for its frontier; the PDG path delegates to runImpactPDG.
+  function resolveSingleTarget() {
+    (executeParameterized as any).mockResolvedValue([
+      { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+    ]);
+    (executeQuery as any).mockResolvedValue([]);
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    // U2: stamp a READY PDG layer (both caps) so the layer-presence probe in
+    // `_impactImpl` falls THROUGH to the mode-dispatch surface these tests pin
+    // (the `_runImpactPDG` delegate / the ambiguous fan-out under `mode:'pdg'`).
+    // Degraded-layer behavior is owned by the integration degradation suite.
+    vi.mocked(loadMeta).mockResolvedValue({
+      pdg: { maxCdgEdgesPerFunction: 0, maxReachingDefEdgesPerFunction: 0 },
+    } as any);
+    backend = new LocalBackend();
+    setupSingleRepo();
+    await backend.init();
+  });
+
+  it('mode absent → callgraph result (target populated, no mode-error, BFS runs)', async () => {
+    resolveSingleTarget();
+    const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+    const result = await backend.callTool('impact', { target: 'main', direction: 'upstream' });
+    // A clean callgraph result carries no mode error and runs the BFS.
+    expect(result.error ?? '').not.toMatch(/Invalid "mode"/);
+    expect(result.error ?? '').not.toMatch(/not yet implemented/);
+    expect(result.target).toBeDefined();
+    expect(bfsSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("mode:'callgraph' and mode:undefined are byte-identical to absent (regression guard)", async () => {
+    resolveSingleTarget();
+    const absent = await backend.callTool('impact', { target: 'main', direction: 'upstream' });
+    const callgraph = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      mode: 'callgraph',
+    });
+    const undef = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      mode: undefined,
+    });
+    expect(callgraph).toEqual(absent);
+    expect(undef).toEqual(absent);
+  });
+
+  it("mode:'pdg' routes to the PDG traversal and attaches interprocedural symbol reach", async () => {
+    resolveSingleTarget();
+    const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      mode: 'pdg',
+    });
+    // The call reaches the real `_runImpactPDG` traversal, then composes the
+    // interprocedural symbol reach into the same pdg result.
+    expect(result.error).toBeUndefined();
+    expect(result.mode).toBe('pdg');
+    expect(Array.isArray(result.reachableBlocks)).toBe(true);
+    expect(result.pdgInterprocedural).toBeDefined();
+    expect(bfsSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("mode:'pdg' labels interprocedural symbols as a callgraph bridge", async () => {
+    resolveSingleTarget();
+    vi.spyOn(backend as any, '_runImpactBFS').mockResolvedValueOnce({
+      target: { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+      direction: 'downstream',
+      impactedCount: 1,
+      risk: 'LOW',
+      summary: { direct: 1, processes_affected: 0, modules_affected: 0 },
+      byDepthCounts: { 1: 1 },
+      affected_processes: [],
+      affected_modules: [],
+      byDepth: {
+        1: [
+          {
+            depth: 1,
+            id: 'func:callee',
+            name: 'callee',
+            type: 'Function',
+            filePath: 'src/callee.ts',
+          },
+        ],
+      },
+    });
+
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'downstream',
+      mode: 'pdg',
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.mode).toBe('pdg');
+    expect(result.pdgInterprocedural.evidence).toBe('callgraph-bridge');
+    expect(result.pdgInterprocedural.evidenceCounts['callgraph-bridge']).toBe(1);
+    expect(result.pdgEvidence.interprocedural).toBe('callgraph-bridge');
+    expect(result.interproceduralByDepth[1][0].pdgEvidence).toBe('callgraph-bridge');
+    expect(result.note).toContain('labeled as a PDG evidence bridge');
+  });
+
+  it("mode:'pdg' preserves unproven bridge evidence when call-site proof is unavailable", async () => {
+    resolveSingleTarget();
+    vi.spyOn(backend as any, '_runImpactBFS').mockResolvedValueOnce({
+      target: { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+      direction: 'downstream',
+      impactedCount: 1,
+      risk: 'LOW',
+      summary: { direct: 1, processes_affected: 0, modules_affected: 0 },
+      byDepthCounts: { 1: 1 },
+      affected_processes: [],
+      affected_modules: [],
+      byDepth: {
+        1: [
+          {
+            depth: 1,
+            id: 'func:callee',
+            name: 'callee',
+            type: 'Function',
+            filePath: 'src/callee.ts',
+            pdgEvidence: 'unproven-bridge',
+          },
+        ],
+      },
+    });
+
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'downstream',
+      mode: 'pdg',
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.mode).toBe('pdg');
+    expect(result.pdgInterprocedural.evidence).toBe('unproven-bridge');
+    expect(result.pdgInterprocedural.evidenceCounts['unproven-bridge']).toBe(1);
+    expect(result.pdgEvidence.interprocedural).toBe('unproven-bridge');
+    expect(result.note).toContain('labeled unproven-bridge');
+  });
+
+  it.each([['PDG'], ['pgd'], [''], [0], [null]])(
+    'invalid mode %j → structured {error}, never a callgraph result (KTD5 anti-silent-fallback)',
+    async (bad) => {
+      resolveSingleTarget();
+      const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+      const result = await backend.callTool('impact', {
+        target: 'main',
+        direction: 'upstream',
+        mode: bad as any,
+      });
+      expect(result.error).toMatch(/Invalid "mode"/);
+      expect(result.risk).toBe('UNKNOWN');
+      // A typo'd mode must NEVER quietly run callgraph.
+      expect(bfsSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([['callgraph'], [undefined]])(
+    'line param with mode:%j → structured {error} (line is PDG-only), never a callgraph result',
+    async (mode) => {
+      resolveSingleTarget();
+      const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+      const result = await backend.callTool('impact', {
+        target: 'main',
+        direction: 'upstream',
+        mode: mode as any,
+        line: 8,
+      });
+      expect(result.error).toMatch(/'line' is only supported with mode:'pdg'/);
+      expect(result.risk).toBe('UNKNOWN');
+      // A PDG-only param on the callgraph path must NOT silently run the BFS.
+      expect(bfsSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  // #2279: some MCP client/agent adapters serialize an *omitted* optional
+  // numeric field as `0`. On the callgraph path `line` is meaningless, so a
+  // literal `line: 0` must be tolerated as omitted (NOT the PDG-only error) and
+  // route to the normal BFS — distinct from a genuine positive `line` (above),
+  // which stays a hard error.
+  it.each<['callgraph' | undefined]>([['callgraph'], [undefined]])(
+    'mode:%j + adapter-materialized line:0 is treated as omitted and runs the BFS (#2279)',
+    async (mode) => {
+      resolveSingleTarget();
+      const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+      const result = await backend.callTool('impact', {
+        target: 'main',
+        direction: 'upstream',
+        mode,
+        line: 0,
+      });
+      // No PDG-only error, no positive-integer error — line:0 is swallowed.
+      expect(result.error ?? '').not.toMatch(/'line' is only supported with mode:'pdg'/);
+      expect(result.error ?? '').not.toMatch(/'line' must be a positive integer/);
+      expect(result.target).toBeDefined();
+      expect(bfsSpy).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each<['callgraph' | undefined]>([['callgraph'], [undefined]])(
+    'mode:%j + line:-1 still errors — the line:0 coercion is narrow, only literal 0 (#2279)',
+    async (mode) => {
+      resolveSingleTarget();
+      const result = await backend.callTool('impact', {
+        target: 'main',
+        direction: 'upstream',
+        mode,
+        line: -1,
+      });
+      // A negative line is a real mistake, not an adapter-materialized "omitted":
+      // it must NOT be swallowed like line:0, and stays the PDG-only hard error.
+      expect(result.error).toMatch(/'line' is only supported with mode:'pdg'/);
+    },
+  );
+
+  it("mode:'callgraph'/undefined + line:0 is byte-identical to omitting line (#2279)", async () => {
+    resolveSingleTarget();
+    const omitted = await backend.callTool('impact', { target: 'main', direction: 'upstream' });
+    const callgraphZero = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      mode: 'callgraph',
+      line: 0,
+    });
+    const undefZero = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      mode: undefined,
+      line: 0,
+    });
+    // The normalization must leave the callgraph result indistinguishable from a
+    // call that never carried `line` — the spurious 0 must not leak into output.
+    expect(callgraphZero).toEqual(omitted);
+    expect(undefZero).toEqual(omitted);
+  });
+
+  it.each([[0], [-1], [1.5]])(
+    "mode:'pdg' + non-positive-integer line %j → structured {error}, never routed to traversal",
+    async (badLine) => {
+      resolveSingleTarget();
+      const pdgSpy = vi.spyOn(backend as any, '_runImpactPDG');
+      const result = await backend.callTool('impact', {
+        target: 'main',
+        direction: 'upstream',
+        mode: 'pdg',
+        line: badLine as any,
+      });
+      expect(result.error).toMatch(/'line' must be a positive integer/);
+      expect(result.risk).toBe('UNKNOWN');
+      // The validation fires BEFORE the traversal — a bad line never seeds a slice.
+      expect(pdgSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it("mode:'pdg' + downstream line:8 routes to the PDG traversal and seeds bridge evidence", async () => {
+    resolveSingleTarget();
+    // The target-resolution row doubles as the calleesOfBlocks row: `callees`
+    // ('callee') is the leaf name persisted on the slice's BasicBlock, the
+    // statement-precise substrate the bridge keys on.
+    (executeParameterized as any).mockResolvedValue([
+      {
+        id: 'func:main',
+        name: 'main',
+        type: 'Function',
+        filePath: 'src/index.ts',
+        callees: 'callee',
+      },
+    ]);
+    // A line-seeded downstream slice with one reachable block → the dispatch
+    // queries that block's callees and seeds the bridge with them.
+    const pdgSpy = vi.spyOn(backend as any, '_runImpactPDG').mockResolvedValueOnce({
+      mode: 'pdg',
+      target: { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+      direction: 'downstream',
+      risk: 'UNKNOWN',
+      impactedCount: 0,
+      epistemic: 'pdg-intra-procedural',
+      reachableBlocks: ['BasicBlock:src/index.ts:8:0:1'],
+      // Intra-only slice (no inter-procedural hop) ⇒ the intra reach the bridge
+      // keys on equals reachableBlocks (FIX 6: bridge keys on intraReachableBlocks).
+      intraReachableBlocks: ['BasicBlock:src/index.ts:8:0:1'],
+      blockCount: 1,
+      affectedStatements: [{ line: 8, filePath: 'src/index.ts', text: 'callee()' }],
+      affectedStatementCount: 1,
+      criterionLine: 8,
+    });
+    const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'downstream',
+      mode: 'pdg',
+      line: 8,
+    });
+    // A valid line routes cleanly into the PDG engine — no line/mode error.
+    expect(result.error).toBeUndefined();
+    expect(result.mode).toBe('pdg');
+    expect(pdgSpy).toHaveBeenCalledTimes(1);
+    expect(bfsSpy).toHaveBeenCalledTimes(1);
+    const bridge = bfsSpy.mock.calls[0][4].pdgBridge;
+    // The bridge now carries the slice's callee names (statement-precise reach),
+    // resolved from BasicBlock.callees — not the dead call-site-line keys.
+    expect(bridge).toBeDefined();
+    expect([...bridge.sliceCalleeNames]).toContain('callee');
+    expect(result.pdgInterprocedural).toBeDefined();
+  });
+
+  it("mode:'pdg' downstream: a callee invoked ON the seeded line is proven even with no downstream dependents", async () => {
+    // Regression for the PR #2227 tri-review P2: the seed block is excluded from
+    // `reachableBlocks` (seed-minus-reachable convention), so a callee called
+    // directly on the changed line — with NO downstream-dependent block — used to
+    // be dropped from the statement-precise set. The dispatch now unions the seed
+    // block's callees, so it must be proven.
+    resolveSingleTarget();
+    (executeParameterized as any).mockResolvedValue([
+      {
+        id: 'func:main',
+        name: 'main',
+        type: 'Function',
+        filePath: 'src/index.ts',
+        callees: 'seedCallee',
+      },
+    ]);
+    // reachableBlocks EMPTY (line N has no downstream dependents) but seedBlocks
+    // carries the changed line's own block — the case that regressed.
+    vi.spyOn(backend as any, '_runImpactPDG').mockResolvedValueOnce({
+      mode: 'pdg',
+      target: { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+      direction: 'downstream',
+      risk: 'UNKNOWN',
+      impactedCount: 0,
+      epistemic: 'pdg-intra-procedural',
+      reachableBlocks: [],
+      intraReachableBlocks: [],
+      seedBlocks: ['BasicBlock:src/index.ts:8:0:0'],
+      blockCount: 0,
+      affectedStatements: [],
+      affectedStatementCount: 0,
+      criterionLine: 8,
+    });
+    const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+    await backend.callTool('impact', {
+      target: 'main',
+      direction: 'downstream',
+      mode: 'pdg',
+      line: 8,
+    });
+    const bridge = bfsSpy.mock.calls[0][4].pdgBridge;
+    // The bridge is seeded from the seed block (not just reachableBlocks), so the
+    // seed-line callee is provable.
+    expect(bridge).toBeDefined();
+    expect([...bridge.sliceCalleeNames]).toContain('seedCallee');
+  });
+
+  it('betterBridgeEvidence keeps callgraph-bridge regardless of parent order (U3 order-independence)', () => {
+    const proven = { evidence: 'callgraph-bridge' as const, basis: 'in slice' };
+    const unproven = { evidence: 'unproven-bridge' as const, basis: 'not in slice' };
+    // A node reached from a proven and an unproven parent is proven either way —
+    // the diamond label does not depend on which edge the BFS visits first.
+    expect(betterBridgeEvidence(unproven, proven).evidence).toBe('callgraph-bridge');
+    expect(betterBridgeEvidence(proven, unproven).evidence).toBe('callgraph-bridge');
+    // First verdict wins when neither is stronger; undefined existing takes the candidate.
+    expect(betterBridgeEvidence(undefined, unproven).evidence).toBe('unproven-bridge');
+    expect(betterBridgeEvidence(unproven, unproven).evidence).toBe('unproven-bridge');
+  });
+
+  it('pdgBridgeEvidenceForImpact treats a truncated-slice (sentinel) as callee-unknown → proven', () => {
+    // A slice block that hit the per-statement site cap has an incomplete callee
+    // list; the sentinel forces callgraph-equal so an absent-but-real callee is
+    // not under-proven.
+    const truncated = pdgBridgeEvidenceForImpact({
+      bridge: {
+        sliceCalleeNames: new Set([CALLEES_TRUNCATED_SENTINEL, 'foo']),
+        sliceCalleeIds: new Set(),
+      },
+      depth: 1,
+      calleeName: 'unrelatedNotInSlice',
+    });
+    expect(truncated.evidence).toBe('callgraph-bridge');
+    // Without the sentinel, a callee not in the slice is unproven.
+    const notTruncated = pdgBridgeEvidenceForImpact({
+      bridge: { sliceCalleeNames: new Set(['foo']), sliceCalleeIds: new Set() },
+      depth: 1,
+      calleeName: 'unrelatedNotInSlice',
+    });
+    expect(notTruncated.evidence).toBe('unproven-bridge');
+  });
+
+  it("mode:'pdg' degrades gracefully when the slice-callees query fails (no bridge, no throw)", async () => {
+    // calleesOfBlocks swallows a DB error and returns an empty set, so the bridge
+    // is not built and the inter-procedural reach falls back to callgraph-equal —
+    // never surfacing the error or producing a partial proven/unproven labeling.
+    resolveSingleTarget();
+    // The slice-callees query (RETURN b.callees) throws; every other query (target
+    // resolution) returns the resolved symbol row.
+    vi.mocked(executeParameterized).mockImplementation(async (_repo, query) => {
+      if (query.includes('RETURN b.callees')) throw new Error('slice-callees query failed');
+      return [{ id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' }];
+    });
+    // A line-seeded downstream slice so calleesOfBlocks is attempted.
+    vi.spyOn(backend as any, '_runImpactPDG').mockResolvedValueOnce({
+      mode: 'pdg',
+      target: { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+      direction: 'downstream',
+      risk: 'UNKNOWN',
+      impactedCount: 0,
+      epistemic: 'pdg-intra-procedural',
+      reachableBlocks: ['BasicBlock:src/index.ts:8:0:1'],
+      intraReachableBlocks: ['BasicBlock:src/index.ts:8:0:1'],
+      seedBlocks: ['BasicBlock:src/index.ts:8:0:0'],
+      blockCount: 1,
+      affectedStatements: [{ line: 8, filePath: 'src/index.ts', text: 'callee()' }],
+      affectedStatementCount: 1,
+      criterionLine: 8,
+    });
+    const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+    const cap = _captureLogger();
+    try {
+      const result = await backend.callTool('impact', {
+        target: 'main',
+        direction: 'downstream',
+        mode: 'pdg',
+        line: 8,
+      });
+      // The error was swallowed: no bridge passed to the BFS, and no error surfaced.
+      expect(result.error).toBeUndefined();
+      expect(bfsSpy.mock.calls[0][4].pdgBridge).toBeUndefined();
+      // The swallowed, gracefully-degraded query failure is logged at warn (40),
+      // never error (50): it degraded to a safe fallback and is not an operation
+      // failure. Pinning the severity guards against a regression to a false
+      // ERROR alarm that would drown genuine, operation-aborting failures.
+      const slice = cap.records().find((r) => r.context === 'impact:pdg-slice-callees');
+      expect(slice).toBeDefined();
+      expect(slice?.level).toBe(40);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("mode:'pdg' slice-callees failing with a benign missing-table error logs at debug, not warn", async () => {
+    // A repo analyzed without the optional column/table (e.g. a pre-v3 PDG index
+    // missing `calleeIds`, or a BasicBlock table that simply isn't there) makes the
+    // slice-callees query fail with a benign "missing optional data" error. That is a
+    // normal configuration, not a degradation, so logQueryError routes it to debug —
+    // suppressed at the default info level. We capture AT debug so the record is
+    // visible: the assertion is that it was emitted AND at debug (level 10), which
+    // distinguishes "logged at debug" from "not logged at all" — an info-level
+    // absence check could not tell those apart and would pass vacuously if the
+    // logQueryError call were deleted.
+    resolveSingleTarget();
+    vi.mocked(executeParameterized).mockImplementation(async (_repo, query) => {
+      if (query.includes('RETURN b.callees')) throw new Error('Table BasicBlock does not exist');
+      return [{ id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' }];
+    });
+    vi.spyOn(backend as any, '_runImpactPDG').mockResolvedValueOnce({
+      mode: 'pdg',
+      target: { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+      direction: 'downstream',
+      risk: 'UNKNOWN',
+      impactedCount: 0,
+      epistemic: 'pdg-intra-procedural',
+      reachableBlocks: ['BasicBlock:src/index.ts:8:0:1'],
+      intraReachableBlocks: ['BasicBlock:src/index.ts:8:0:1'],
+      seedBlocks: ['BasicBlock:src/index.ts:8:0:0'],
+      blockCount: 1,
+      affectedStatements: [{ line: 8, filePath: 'src/index.ts', text: 'callee()' }],
+      affectedStatementCount: 1,
+      criterionLine: 8,
+    });
+    const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+    const cap = _captureLogger('debug');
+    try {
+      const result = await backend.callTool('impact', {
+        target: 'main',
+        direction: 'downstream',
+        mode: 'pdg',
+        line: 8,
+      });
+      // Still degrades cleanly to no bridge / no surfaced error.
+      expect(result.error).toBeUndefined();
+      expect(bfsSpy.mock.calls[0][4].pdgBridge).toBeUndefined();
+      // The benign failure was emitted at debug (20) — NOT warn (40)/error (50).
+      // Capturing at debug proves the call fired and chose the suppressed level.
+      const slice = cap.records().find((r) => r.context === 'impact:pdg-slice-callees');
+      expect(slice).toBeDefined();
+      expect(slice?.level).toBe(20);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("mode:'pdg' slice-callees failing with a non-schema 'not found' error logs at warn, not debug (#2283)", async () => {
+    // "Symbol not found" is an operation failure, not a benign missing optional
+    // table — isBenignMissingTableError must NOT match an unscoped "not found"
+    // (only "<table|column|property|…> … not found"), so it stays visible at warn
+    // rather than being demoted to the suppressed debug level.
+    resolveSingleTarget();
+    vi.mocked(executeParameterized).mockImplementation(async (_repo, query) => {
+      if (query.includes('RETURN b.callees')) throw new Error('Symbol not found');
+      return [{ id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' }];
+    });
+    vi.spyOn(backend as any, '_runImpactPDG').mockResolvedValueOnce({
+      mode: 'pdg',
+      target: { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+      direction: 'downstream',
+      risk: 'UNKNOWN',
+      impactedCount: 0,
+      epistemic: 'pdg-intra-procedural',
+      reachableBlocks: ['BasicBlock:src/index.ts:8:0:1'],
+      intraReachableBlocks: ['BasicBlock:src/index.ts:8:0:1'],
+      seedBlocks: ['BasicBlock:src/index.ts:8:0:0'],
+      blockCount: 1,
+      affectedStatements: [{ line: 8, filePath: 'src/index.ts', text: 'callee()' }],
+      affectedStatementCount: 1,
+      criterionLine: 8,
+    });
+    vi.spyOn(backend as any, '_runImpactBFS');
+    const cap = _captureLogger();
+    try {
+      await backend.callTool('impact', {
+        target: 'main',
+        direction: 'downstream',
+        mode: 'pdg',
+        line: 8,
+      });
+      const slice = cap.records().find((r) => r.context === 'impact:pdg-slice-callees');
+      expect(slice).toBeDefined();
+      expect(slice?.level).toBe(40);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("mode:'pdg' + crossDepth → hard {error} (single-repo PDG impact)", async () => {
+    resolveSingleTarget();
+    const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      mode: 'pdg',
+      crossDepth: 2,
+    });
+    expect(result.error).toMatch(/not supported with mode:'pdg'/);
+    expect(result.error).toContain('crossDepth');
+    expect(bfsSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['relationTypes', { relationTypes: ['CALLS'] }, (opts: any) => opts.relationTypes],
+    ['minConfidence', { minConfidence: 0.5 }, (opts: any) => opts.minConfidence],
+  ])("mode:'pdg' + %s feeds the interprocedural symbol reach", async (_label, extra, readOpt) => {
+    resolveSingleTarget();
+    const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS').mockResolvedValueOnce({
+      target: { id: 'func:main', name: 'main', type: 'Function', filePath: 'src/index.ts' },
+      direction: 'upstream',
+      impactedCount: 0,
+      risk: 'LOW',
+      summary: { direct: 0, processes_affected: 0, modules_affected: 0 },
+      byDepthCounts: {},
+      affected_processes: [],
+      affected_modules: [],
+      byDepth: {},
+    });
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      mode: 'pdg',
+      ...extra,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.mode).toBe('pdg');
+    expect(bfsSpy).toHaveBeenCalledTimes(1);
+    expect(readOpt(bfsSpy.mock.calls[0][4])).toBeDefined();
+  });
+
+  it("ambiguous target under mode:'pdg' never invokes interprocedural fan-out (KTD5 ambiguous trap)", async () => {
+    // Two same-name Functions → resolver returns ambiguous.
+    (executeParameterized as any).mockResolvedValue([
+      {
+        id: 'func:login:1',
+        name: 'login',
+        type: 'Function',
+        filePath: 'src/auth.ts',
+        startLine: 5,
+      },
+      {
+        id: 'func:login:2',
+        name: 'login',
+        type: 'Function',
+        filePath: 'src/admin/login.ts',
+        startLine: 8,
+      },
+    ]);
+    const bfsSpy = vi.spyOn(backend as any, '_runImpactBFS');
+    const result = await backend.callTool('impact', {
+      target: 'login',
+      direction: 'upstream',
+      mode: 'pdg',
+    });
+    expect(result.status).toBe('ambiguous');
+    expect(result.mode).toBe('pdg');
+    expect(result.candidates).toHaveLength(2);
+    expect(result.impactedCount).toBe(0);
+    expect(result.risk).toBe('UNKNOWN');
+    // The callgraph per-candidate probe fan-out MUST NOT run under pdg.
+    expect(bfsSpy).not.toHaveBeenCalled();
+    // No per-candidate blast radius is computed yet (U4), so the candidate
+    // entries carry no impactedCount field from a callgraph probe.
+    for (const c of result.candidates) {
+      expect(c.impactedCount).toBeUndefined();
+    }
+  });
+
+  it("unknown target with mode:'pdg' returns the normalized PDG error envelope", async () => {
+    (executeParameterized as any).mockResolvedValue([]);
+    const result = await backend.callTool('impact', {
+      target: 'missingSymbol',
+      direction: 'upstream',
+      mode: 'pdg',
+    });
+    expect(result.error).toMatch(/not found/);
+    expect(result.mode).toBe('pdg');
+    expect(result.target).toEqual({ name: 'missingSymbol' });
+    expect(result.direction).toBe('upstream');
+    expect(result.impactedCount).toBe(0);
+    expect(result.risk).toBe('UNKNOWN');
+  });
+
+  it("runtime failures with mode:'pdg' return the normalized PDG error envelope", async () => {
+    const failing = new Error('pdg query failed');
+    const implSpy = vi.spyOn(backend as any, '_impactImpl').mockRejectedValueOnce(failing);
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'downstream',
+      mode: 'pdg',
+    });
+    expect(result.error).toBe('pdg query failed');
+    expect(result.mode).toBe('pdg');
+    expect(result.target).toEqual({ name: 'main' });
+    expect(result.direction).toBe('downstream');
+    expect(result.impactedCount).toBe(0);
+    expect(result.risk).toBe('UNKNOWN');
+    expect(result.suggestion).toMatch(/context/);
+    implSpy.mockRestore();
+  });
+
+  it("@group target with mode:'pdg' is rejected (KTD12 — PDG is single-repo)", async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      mode: 'pdg',
+      repo: '@grp',
+    });
+    expect(result.error).toMatch(/not supported for @group targets/);
+    expect(result.mode).toBe('pdg');
+    expect(result.target).toEqual({ name: 'main' });
+    expect(result.direction).toBe('upstream');
+    expect(result.impactedCount).toBe(0);
+    expect(result.risk).toBe('UNKNOWN');
+  });
+
+  it("@group target with mode:'callgraph' still forwards to group impact (unchanged)", async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    // groupImpact is reached only if the mode gate passes; we don't assert its
+    // payload (group infra is stubbed), only that no mode-error short-circuited.
+    const result = await backend.callTool('impact', {
+      target: 'main',
+      direction: 'upstream',
+      mode: 'callgraph',
+      repo: '@grp',
+    });
+    expect(result?.error ?? '').not.toMatch(/not supported for @group targets/);
+    expect(result?.error ?? '').not.toMatch(/Invalid "mode"/);
   });
 });
 
@@ -2551,6 +3719,24 @@ describe('cypher result formatting', () => {
     expect(result.row_count).toBe(2);
   });
 
+  it('keeps one markdown line per row when a cell value contains newlines (#2310)', async () => {
+    // A multi-line `content` value must not split its row across physical lines —
+    // otherwise the rendered table is corrupt and the CLI `--limit` line-slice
+    // keeps the wrong number of rows.
+    (executeParameterized as any).mockResolvedValue([
+      { name: 'a', content: 'export function a() {\n  return 1;\n}' },
+      { name: 'b', content: 'line1\nline2' },
+    ]);
+    const result = await backend.callTool('cypher', {
+      query: 'MATCH (n:Function) RETURN n.name AS name, n.content AS content',
+    });
+    const lines = result.markdown.split('\n');
+    // header + separator + exactly one line per data row, no embedded newlines.
+    expect(lines).toHaveLength(2 + result.row_count);
+    expect(result.row_count).toBe(2);
+    expect(result.markdown).not.toMatch(/\n[^|]/);
+  });
+
   it('returns empty array as-is', async () => {
     (executeParameterized as any).mockResolvedValue([]);
     const result = await backend.callTool('cypher', {
@@ -2566,5 +3752,269 @@ describe('cypher result formatting', () => {
     });
     expect(result).toHaveProperty('error');
     expect(result.error).toContain('Syntax error');
+  });
+});
+
+// ─── resolveRepo branch scope (#2106) ────────────────────────────────
+
+describe('LocalBackend.resolveRepo branch scope (#2106)', () => {
+  let backend: LocalBackend;
+
+  // Per-run unique dir: a fixed shared os.tmpdir() path lets concurrent
+  // vitest runs on one host rm each other's materialized sub-index stub
+  // mid-test (the documented parallel-agents workflow).
+  const MULTI_DIR = mkdtempSync(path.join(os.tmpdir(), 'gnx-2106-multi-'));
+  const BRANCH_ENTRY = {
+    name: 'multi',
+    path: MULTI_DIR,
+    storagePath: path.join(MULTI_DIR, '.gitnexus'),
+    indexedAt: '2026-06-10T12:00:00Z',
+    lastCommit: 'mainsha',
+    branch: 'main',
+    branches: [{ branch: 'feature/x', indexedAt: '2026-06-10T13:00:00Z', lastCommit: 'featsha' }],
+    stats: { files: 1, nodes: 1 },
+  };
+
+  const flatLbug = path.join(BRANCH_ENTRY.storagePath, 'lbug');
+  // The pinned sub-index must exist on disk: applyBranchScope serves a
+  // branches[] summary only when its lbug is really there (#2364 review F1
+  // arm ii — a stale summary must not route to an adopt-deleted dir).
+  const branchLbug = getStoragePaths(BRANCH_ENTRY.path, 'feature/x').lbugPath;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mkdirSync(path.dirname(branchLbug), { recursive: true });
+    writeFileSync(branchLbug, 'stub');
+    backend = new LocalBackend();
+    (listRegisteredRepos as any).mockResolvedValue([BRANCH_ENTRY]);
+    await backend.init();
+  });
+
+  afterEach(() => {
+    rmSync(BRANCH_ENTRY.storagePath, { recursive: true, force: true });
+  });
+
+  afterAll(() => {
+    rmSync(MULTI_DIR, { recursive: true, force: true });
+  });
+
+  it('no branch param resolves the flat workspace lbug', async () => {
+    const handle = await backend.resolveRepo('multi');
+    expect(handle.lbugPath).toBe(flatLbug);
+  });
+
+  it('the workspace-recorded branch name resolves the flat lbug', async () => {
+    const handle = await backend.resolveRepo('multi', 'main');
+    expect(handle.lbugPath).toBe(flatLbug);
+  });
+
+  it('an indexed pinned branch resolves a branches/<slug> lbug', async () => {
+    const handle = await backend.resolveRepo('multi', 'feature/x');
+    expect(handle.lbugPath).not.toBe(flatLbug);
+    expect(handle.lbugPath).toContain(path.join('.gitnexus', 'branches'));
+    expect(path.basename(handle.lbugPath)).toBe('lbug');
+    // The branch handle reports the branch's own commit, not the primary's.
+    expect(handle.lastCommit).toBe('featsha');
+  });
+
+  it('an un-indexed branch throws a clear error', async () => {
+    await expect(backend.resolveRepo('multi', 'nope')).rejects.toThrow(/not indexed/i);
+    // Post-#2354 guidance: a bare `analyze --branch <X>` refuses unless X is
+    // checked out, so the message must lead with the checkout (#2364 F6).
+    await expect(backend.resolveRepo('multi', 'nope')).rejects.toThrow(
+      /workspace index follows the checked-out branch/,
+    );
+    await expect(backend.resolveRepo('multi', 'nope')).rejects.toThrow(
+      /check out "nope" and re-run: gitnexus analyze/,
+    );
+  });
+
+  it('a legacy entry with no top-level branch still routes an indexed branch', async () => {
+    // Pre-#2106 entries have no `branch` field; branch routing must still work
+    // off branches[] alone.
+    (listRegisteredRepos as any).mockResolvedValue([{ ...BRANCH_ENTRY, branch: undefined }]);
+    await backend.init();
+    const handle = await backend.resolveRepo('multi', 'feature/x');
+    expect(handle.lbugPath).toContain(path.join('.gitnexus', 'branches'));
+  });
+
+  it('a legacy entry resolves --branch <workspace-branch> via the flat meta (#2106 R4)', async () => {
+    // Pre-#2106 flat index: registry entry has no `branch`/`branches`, but the
+    // flat meta.json records the workspace branch. `--branch <that branch>`
+    // must resolve to the flat handle (read from meta), while an unindexed
+    // branch still errors.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2106-legacy-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({ repoPath: dir, lastCommit: 'abc', indexedAt: 'now', branch: 'main' }),
+    );
+    try {
+      (listRegisteredRepos as any).mockResolvedValue([
+        { name: 'legacy', path: dir, storagePath, indexedAt: 'now', lastCommit: 'abc' },
+      ]);
+      await backend.init();
+      const handle = await backend.resolveRepo('legacy', 'main');
+      expect(handle.lbugPath).toBe(path.join(storagePath, 'lbug'));
+      await expect(backend.resolveRepo('legacy', 'feature')).rejects.toThrow(/not indexed/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a stale cached handle still resolves the restamped workspace branch via flat meta (#2354)', async () => {
+    // The flat workspace slot follows the checked-out working tree: a plain
+    // analyze after a branch switch restamps the flat meta.json without any
+    // repo-resolution miss that would refresh a long-lived server's handle.
+    // The cached handle still says branch 'main'; the on-disk flat meta is the
+    // truth ('feature/z') and must win over a stale "not indexed" error.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2354-restamp-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({ repoPath: dir, lastCommit: 'zzz', indexedAt: 'now', branch: 'feature/z' }),
+    );
+    try {
+      (listRegisteredRepos as any).mockResolvedValue([
+        {
+          name: 'flipped',
+          path: dir,
+          storagePath,
+          indexedAt: 'now',
+          lastCommit: 'aaa',
+          branch: 'main',
+        },
+      ]);
+      await backend.init();
+      const handle = await backend.resolveRepo('flipped', 'feature/z');
+      expect(handle.lbugPath).toBe(path.join(storagePath, 'lbug'));
+      // A genuinely unindexed branch still errors (never serves the wrong DB).
+      await expect(backend.resolveRepo('flipped', 'nope')).rejects.toThrow(/not indexed/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a stale cached label errors instead of serving the flat handle (#2364 F1 arm i)', async () => {
+    // Long-lived server cached branch 'main'; a plain analyze on feature/z
+    // restamped the flat meta (and the pool reinit will hot-swap content).
+    // Requesting the OLD label must error — the flat DB no longer holds main.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2364-stale-label-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({ repoPath: dir, lastCommit: 'zzz', indexedAt: 'now', branch: 'feature/z' }),
+    );
+    try {
+      const entry: RegistryEntry = {
+        name: 'flipped',
+        path: dir,
+        storagePath,
+        indexedAt: 'now',
+        lastCommit: 'aaa',
+        branch: 'main',
+      };
+      vi.mocked(listRegisteredRepos).mockResolvedValue([entry]);
+      await backend.init();
+      const callsBefore = vi.mocked(listRegisteredRepos).mock.calls.length;
+      await expect(backend.resolveRepo('flipped', 'main')).rejects.toThrow(/not indexed/i);
+      // Exactly one refreshRepos fired for cache coherence (observed via its
+      // unconditional first call — refreshRepos itself is private).
+      expect(vi.mocked(listRegisteredRepos).mock.calls.length - callsBefore).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a stale summary whose sub-index was adopted falls through to the flat handle (#2364 F1 arm ii)', async () => {
+    // The cached branches[] summary still lists feature/z, but adopt deleted
+    // branches/<slug>/ and the flat slot now owns the label: serve flat.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2364-adopted-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({ repoPath: dir, lastCommit: 'zzz', indexedAt: 'now', branch: 'feature/z' }),
+    );
+    try {
+      const entry: RegistryEntry = {
+        name: 'adopted',
+        path: dir,
+        storagePath,
+        indexedAt: 'now',
+        lastCommit: 'aaa',
+        branch: 'main',
+        branches: [{ branch: 'feature/z', indexedAt: 'now', lastCommit: 'zzz' }],
+      };
+      vi.mocked(listRegisteredRepos).mockResolvedValue([entry]);
+      await backend.init();
+      const handle = await backend.resolveRepo('adopted', 'feature/z');
+      expect(handle.lbugPath).toBe(path.join(storagePath, 'lbug'));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a dangling summary with a disagreeing flat meta errors honestly (#2364 F3 window)', async () => {
+    // Partial fast-path failure: adopt deleted the sub-index but the flat
+    // meta was never restamped (saveMeta runs last). The degraded state must
+    // yield the not-indexed error — no ghost route, no wrong data.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2364-dangling-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({ repoPath: dir, lastCommit: 'aaa', indexedAt: 'now', branch: 'main' }),
+    );
+    try {
+      const entry: RegistryEntry = {
+        name: 'dangling',
+        path: dir,
+        storagePath,
+        indexedAt: 'now',
+        lastCommit: 'aaa',
+        branch: 'main',
+        branches: [{ branch: 'feature/z', indexedAt: 'now', lastCommit: 'zzz' }],
+      };
+      vi.mocked(listRegisteredRepos).mockResolvedValue([entry]);
+      await backend.init();
+      const callsBefore = vi.mocked(listRegisteredRepos).mock.calls.length;
+      await expect(backend.resolveRepo('dangling', 'feature/z')).rejects.toThrow(/not indexed/i);
+      expect(vi.mocked(listRegisteredRepos).mock.calls.length - callsBefore).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('callTool threads the branch param through resolveRepo (un-indexed branch errors)', async () => {
+    // If callTool dropped `branch` from repoParams, this would resolve the flat
+    // handle and NOT throw — so the rejection proves the param is threaded.
+    await expect(backend.callTool('query', { repo: 'multi', branch: 'nope' })).rejects.toThrow(
+      /not indexed/i,
+    );
+  });
+
+  it('callTool resolves an indexed branch without error', async () => {
+    const res = await backend.callTool('query', {
+      query: 'auth',
+      repo: 'multi',
+      branch: 'feature/x',
+    });
+    expect(res).toBeDefined();
+    expect(res).not.toHaveProperty('error');
+  });
+
+  it('evicts an opened branch pool when the repo leaves the registry (#2106 R3)', async () => {
+    // Open the branch pool via a tool call (ensureInitialized records its key).
+    await backend.callTool('query', { query: 'auth', repo: 'multi', branch: 'feature/x' });
+    lbugMocks.closeLbug.mockClear();
+    // Unregister the repo, then trigger a refresh (init re-reads the registry).
+    (listRegisteredRepos as any).mockResolvedValue([]);
+    await backend.init();
+    const closedPaths = lbugMocks.closeLbug.mock.calls.map((c: any[]) => String(c[0]));
+    expect(closedPaths.some((p) => p.includes(path.join('.gitnexus', 'branches')))).toBe(true);
   });
 });

@@ -12,8 +12,6 @@ import {
   formatCypherResult,
   formatDetectChangesResult,
   formatListReposResult,
-  formatHealthPayload,
-  isBearerAuthorized,
   MAX_BODY_SIZE,
   validateHost,
 } from '../../src/cli/eval-server.js';
@@ -79,32 +77,6 @@ describe('validateHost', () => {
 describe('MAX_BODY_SIZE', () => {
   it('is 1MB', () => {
     expect(MAX_BODY_SIZE).toBe(1024 * 1024);
-  });
-});
-
-describe('eval-server auth helpers', () => {
-  it('allows requests when auth is disabled', () => {
-    expect(isBearerAuthorized(null, undefined)).toBe(true);
-  });
-
-  it('requires an exact bearer token when auth is enabled', () => {
-    expect(isBearerAuthorized('secret', 'Bearer secret')).toBe(true);
-    expect(isBearerAuthorized('secret', undefined)).toBe(false);
-    expect(isBearerAuthorized('secret', 'Bearer wrong')).toBe(false);
-  });
-
-  it('redacts repo names from unauthenticated health payloads', () => {
-    expect(formatHealthPayload(['repo-a'], false)).toEqual({
-      status: 'ok',
-      auth: 'required',
-    });
-  });
-
-  it('includes repo names in authenticated health payloads', () => {
-    expect(formatHealthPayload(['repo-a'], true)).toEqual({
-      status: 'ok',
-      repos: ['repo-a'],
-    });
   });
 });
 
@@ -239,6 +211,162 @@ describe('formatContextResult', () => {
 describe('formatImpactResult', () => {
   it('returns error message for error input', () => {
     expect(formatImpactResult({ error: 'bad request' })).toContain('Error: bad request');
+  });
+
+  it('surfaces per-candidate blast radius for an ambiguous result, never the "isolated" headline (#2129)', () => {
+    const result = formatImpactResult({
+      status: 'ambiguous',
+      target: { name: 'classifyCard' },
+      direction: 'upstream',
+      impactedCount: 0,
+      risk: 'UNKNOWN',
+      maxImpactedCount: 3,
+      maxRisk: 'MEDIUM',
+      candidates: [
+        {
+          uid: 'Function:src/sync-logic.ts:classifyCard',
+          name: 'classifyCard',
+          kind: 'Function',
+          filePath: 'src/sync-logic.ts',
+          line: 1,
+          impactedCount: 3,
+          risk: 'MEDIUM',
+        },
+        {
+          uid: 'Function:src/ui-helpers.ts:classifyCard',
+          name: 'classifyCard',
+          kind: 'Function',
+          filePath: 'src/ui-helpers.ts',
+          line: 1,
+          impactedCount: 1,
+          risk: 'LOW',
+        },
+      ],
+    });
+    // Must NOT print the false-safe "isolated" headline.
+    expect(result).not.toContain('isolated');
+    expect(result).toContain('AMBIGUOUS');
+    expect(result).toContain('Max blast radius 3');
+    // Both candidates + their real counts are visible.
+    expect(result).toContain('src/sync-logic.ts');
+    expect(result).toContain('[3 upstream');
+    expect(result).toContain('--uid');
+    // No probe failed here → no lower-bound warning.
+    expect(result).not.toContain('candidate probes failed');
+  });
+
+  it('warns that the max is a lower bound when a candidate probe failed (#2129 review F1)', () => {
+    const result = formatImpactResult({
+      status: 'ambiguous',
+      target: { name: 'classifyCard' },
+      direction: 'upstream',
+      impactedCount: 0,
+      risk: 'UNKNOWN',
+      maxImpactedCount: 2,
+      maxRisk: 'LOW',
+      partialProbe: true,
+      candidates: [
+        {
+          uid: 'A',
+          name: 'classifyCard',
+          kind: 'Function',
+          filePath: 'src/a.ts',
+          line: 1,
+          impactedCount: 2,
+          risk: 'LOW',
+        },
+        {
+          uid: 'B',
+          name: 'classifyCard',
+          kind: 'Function',
+          filePath: 'src/b.ts',
+          line: 1,
+          impactedCount: 0,
+          risk: 'UNKNOWN',
+        },
+      ],
+    });
+    expect(result).not.toContain('isolated');
+    expect(result).toContain('candidate probes failed');
+    expect(result).toContain('lower bound');
+    // The honest max is still shown.
+    expect(result).toContain('Max blast radius 2');
+  });
+
+  it('reports the full match count when the candidate list is truncated (#2129 review F11)', () => {
+    const result = formatImpactResult({
+      status: 'ambiguous',
+      target: { name: 'handle' },
+      direction: 'upstream',
+      impactedCount: 0,
+      risk: 'UNKNOWN',
+      maxImpactedCount: 5,
+      maxRisk: 'HIGH',
+      totalCandidates: 9,
+      candidatesTruncated: true,
+      candidates: Array.from({ length: 6 }, (_, i) => ({
+        uid: `U${i}`,
+        name: 'handle',
+        kind: 'Function',
+        filePath: `src/h${i}.ts`,
+        line: 1,
+        impactedCount: i,
+        risk: 'LOW',
+      })),
+    });
+    // Full count (9), not the truncated array length (6).
+    expect(result).toContain('9 symbols');
+    expect(result).toContain('showing 6');
+  });
+
+  it('shows a plain count when the candidate list is not truncated', () => {
+    const result = formatImpactResult({
+      status: 'ambiguous',
+      target: { name: 'foo' },
+      direction: 'upstream',
+      impactedCount: 0,
+      risk: 'UNKNOWN',
+      maxImpactedCount: 1,
+      maxRisk: 'LOW',
+      totalCandidates: 2,
+      candidates: [
+        {
+          uid: 'A',
+          name: 'foo',
+          kind: 'Function',
+          filePath: 'src/a.ts',
+          line: 1,
+          impactedCount: 1,
+          risk: 'LOW',
+        },
+        {
+          uid: 'B',
+          name: 'foo',
+          kind: 'Function',
+          filePath: 'src/b.ts',
+          line: 1,
+          impactedCount: 0,
+          risk: 'LOW',
+        },
+      ],
+    });
+    expect(result).toContain('2 symbols');
+    expect(result).not.toContain('showing');
+  });
+
+  it('surfaces the lower-bound boundary note when epistemic is lower-bound (#1858)', () => {
+    const result = formatImpactResult({
+      target: { kind: 'Class', name: 'EmailLogger' },
+      direction: 'upstream',
+      impactedCount: 0,
+      risk: 'LOW',
+      epistemic: 'lower-bound',
+      boundaries: ['Logger is an interface with 2 implementations; callers bind via DI.'],
+      byDepth: {},
+    });
+    expect(result).not.toContain('isolated');
+    expect(result.toLowerCase()).toContain('lower bound');
+    expect(result).toContain('Logger is an interface');
   });
 
   it('returns error with suggestion when provided', () => {

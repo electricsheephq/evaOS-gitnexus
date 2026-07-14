@@ -55,7 +55,7 @@ import type { ParseWorkerResult } from '../core/ingestion/workers/parse-worker.j
 // the main thread (the #1983 OOM). Because the two stores share this version,
 // any future change to the `ParsedFile` serialization shape MUST bump
 // SCHEMA_BUMP so both invalidate in lockstep.
-const SCHEMA_BUMP = 4;
+const SCHEMA_BUMP = 13; // Durable ParsedFile chunk directories now replace one complete generation instead of accumulating worker shards across cache-miss analyses. Invalidate once so existing unbounded stores are rebuilt under the bounded contract. (12 = #2391 follow-up: Python module constant extraction semantics changed.)
 const GITNEXUS_PKG_VERSION = (() => {
   try {
     // package.json sits at gitnexus/package.json — two levels up from
@@ -141,12 +141,72 @@ export const fileContentHash = (content: Buffer | string): string => sha256Hex(c
  * in the chunk. We sort by filePath before hashing so chunks composed of
  * the same files in different order produce the same key.
  */
+/** PDG/CFG cache namespace (#2081 M1) — every input that changes the
+ *  WORKER-EMITTED `cfgSideChannel` must be folded into the chunk key, and
+ *  ONLY those. The classification test for a future option: does the worker
+ *  see it (workerData) and does it change the bytes the worker writes to the
+ *  shard? `pdgMaxEdgesPerFunction` famously fails that test — it is applied
+ *  at EMIT time on the main thread (scope-resolution run.ts), the worker
+ *  never receives it, and the cached output is byte-identical across cap
+ *  values; folding it in (as a prior review round did) only forced a
+ *  spurious full re-parse on every cap change (#2099 F3). Options that
+ *  change the PERSISTED GRAPH but not the shard belong in the RepoMeta pdg
+ *  stamp (incremental-eligibility), not here. */
+export interface PdgCacheKey {
+  readonly pdg?: boolean;
+  /** Per-function source-line cap (changes WHICH functions get a CFG —
+   *  applied in the worker, so it shapes the cached shard). Callers must
+   *  pass the RESOLVED value (the production call site in parse-impl.ts
+   *  applies the worker's default before folding) so an explicit-default
+   *  run shares the default run's keys — this function folds whatever it
+   *  is given verbatim. */
+  readonly maxFunctionLines?: number;
+}
+
 export const computeChunkHash = (
   entries: Array<{ filePath: string; contentHash: string }>,
+  pdg: boolean | PdgCacheKey = false,
 ): string => {
   const sorted = [...entries].sort((a, b) => (a.filePath < b.filePath ? -1 : 1));
   const joined = sorted.map((e) => `${e.filePath}:${e.contentHash}`).join('\n');
-  return sha256Hex(joined);
+  const opts: PdgCacheKey = typeof pdg === 'boolean' ? { pdg } : pdg;
+  // pdg-off path keeps its pre-#2081 chunk-KEY format verbatim. Note this does
+  // NOT mean caches survive the M1 upgrade: SCHEMA_BUMP 4→5 changed
+  // PARSE_CACHE_VERSION, and both loadParseCache (below) and the durable
+  // parsedfile-store index hard-invalidate on it — every user pays one full
+  // cold re-parse on upgrade regardless of --pdg. Keeping the key format
+  // stable only means no SECOND invalidation class is introduced here.
+  if (!opts.pdg) return sha256Hex(joined);
+  // Fold the worker-visible --pdg configuration into the key: the boolean
+  // plus `maxFunctionLines` (decides which functions get a CFG at all, in the
+  // worker). Without it a warm chunk built under one cap is served to a run
+  // with a different cap → a stale/under-built CFG: the #2038-class
+  // option-blind-key trap. `def` marks an unset (default) value so two
+  // default-cap runs share a key. The emit-time edge cap is deliberately
+  // absent — see the PdgCacheKey doc comment.
+  //
+  // NAMESPACE VERSION (`pdg:5`): bumped when the worker-emitted
+  // `cfgSideChannel` SHAPE changes for pdg-mode runs only — pdg:1→2 in #2083
+  // M3 U1 (TsHarvester emits taint `sites` on StatementFacts); pdg:2→3 in the
+  // #2227 follow-up U1 (every C-family / TS harvester now stamps the call-site
+  // anchor `SiteRecord.at`, which the resolved-callee-id join reads); pdg:3→4 in
+  // the #2227 tri-review-2 U4 (the Rust harvester now emits a `kind:'new'` site
+  // for `struct_expression`, a new worker-output site the join consumes); pdg:4→5
+  // in the FU-C call-summary soundness fix (the TS harvester now stamps
+  // `BindingEntry.formalIndex` on param bindings so the PDG call-summary keys
+  // return-flow on the enclosing FORMAL position, not the flattened binding
+  // ordinal — a warm chunk lacking it would route the harvest to its conservative
+  // empty-summary fallback). A warm chunk built by a worker predating the relevant
+  // change carries a stale site shape, so the join skips it and
+  // `BasicBlock.calleeIds` is silently empty (or missing the struct constructor)
+  // even though `callees` is populated — exactly the #2225-class shape skew this
+  // version token exists to prevent. Invalidates pdg-mode chunks and their durable
+  // parsedfile-cache entries; flag-off chunk keys never reach this line and stay
+  // byte-identical, so non-pdg users pay nothing. Deliberately NOT a SCHEMA_BUMP —
+  // that gates the whole cache version and would force a full cold re-parse on
+  // EVERY user (the M1 bump comment above records that cost).
+  const ns = `pdg:5;maxFn=${opts.maxFunctionLines ?? 'def'}`;
+  return sha256Hex(`${ns}\n${joined}`);
 };
 
 /**

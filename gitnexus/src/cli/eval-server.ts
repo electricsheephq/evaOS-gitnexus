@@ -16,7 +16,7 @@
  * Usage:
  *   gitnexus eval-server                        # default port 4848, binds 127.0.0.1
  *   gitnexus eval-server --port 4848            # explicit port
- *   gitnexus eval-server --host 0.0.0.0         # reachable from other VMs / containers
+ *   GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0
  *   gitnexus eval-server --idle-timeout 300     # auto-shutdown after 300s idle
  *
  * READY signal format: GITNEXUS_EVAL_SERVER_READY:<host>:<port>
@@ -30,6 +30,7 @@
  */
 
 import http from 'http';
+import crypto from 'node:crypto';
 import { isIPv4, isIPv6 } from 'node:net';
 import { writeSync } from 'node:fs';
 import {
@@ -40,7 +41,6 @@ import {
 import { logger } from '../core/logger.js';
 import { cliInfo, cliWarn, cliError } from './cli-message.js';
 import { formatDetectChangesResult } from './detect-changes-format.js';
-import { parseMaxTokens, truncateToTokenBudget } from './token-budget.js';
 
 export { formatDetectChangesResult } from './detect-changes-format.js';
 
@@ -60,6 +60,40 @@ export function validateHost(raw: string): string | null {
   if (raw === 'localhost') return raw;
   if (isIPv4(raw) || isIPv6(raw)) return raw;
   return null;
+}
+
+/** Resolve the eval-server bearer token without retaining surrounding shell whitespace. */
+export function resolveEvalServerAuthToken(env: NodeJS.ProcessEnv): string | undefined {
+  return env.GITNEXUS_AUTH_TOKEN?.trim() || undefined;
+}
+
+/** True only for bind hosts that are local to this machine. */
+export function isEvalServerLoopbackHost(host: string): boolean {
+  return host === 'localhost' || host === '::1' || (isIPv4(host) && host.startsWith('127.'));
+}
+
+/** Refuse exposure of the eval-server query surface without authentication. */
+export function assertSecureEvalServerBinding(host: string, authToken: string | undefined): void {
+  if (!authToken && !isEvalServerLoopbackHost(host)) {
+    throw new Error(
+      `Refusing to start eval-server on non-loopback host ${host} without authentication. ` +
+        'Set GITNEXUS_AUTH_TOKEN or bind to 127.0.0.1, localhost, or ::1.',
+    );
+  }
+}
+
+/** Validate the exact Bearer header while keeping token comparison constant-time. */
+export function isEvalServerBearerAuthorized(
+  authorization: string | string[] | undefined,
+  authToken: string | undefined,
+): boolean {
+  if (!authToken) return true;
+
+  const expected = Buffer.from(`Bearer ${authToken}`, 'utf8');
+  const supplied = typeof authorization === 'string' ? Buffer.from(authorization, 'utf8') : null;
+  const sameLength = supplied?.length === expected.length;
+  const candidate = sameLength && supplied ? supplied : Buffer.alloc(expected.length);
+  return crypto.timingSafeEqual(candidate, expected) && sameLength;
 }
 
 // ─── Text Formatters ──────────────────────────────────────────────────
@@ -179,6 +213,18 @@ export function formatContextResult(result: any): string {
   return lines.join('\n').trim();
 }
 
+function formatTruncationSuffix(result: {
+  truncatedBy?: unknown;
+  truncatedByReasons?: unknown;
+}): string {
+  const label = Array.isArray(result.truncatedByReasons)
+    ? result.truncatedByReasons.join(', ')
+    : typeof result.truncatedBy === 'string'
+      ? result.truncatedBy
+      : '';
+  return label ? ` (by ${label})` : '';
+}
+
 export function formatImpactResult(result: any): string {
   if (result.error) {
     const suggestion = result.suggestion ? `\nSuggestion: ${result.suggestion}` : '';
@@ -190,7 +236,267 @@ export function formatImpactResult(result: any): string {
   const byDepth = result.byDepth || {};
   const total = result.impactedCount || 0;
 
+  // #2129 — an ambiguous bare name must not print the "isolated / safe to
+  // refactor" headline. Surface the per-candidate blast radius + the maximum,
+  // mirroring formatContextResult, so the real impact under whichever symbol the
+  // caller meant is visible on the text surface, not just in the JSON.
+  if (result.status === 'ambiguous') {
+    if (result.mode === 'pdg') {
+      const shown = result.candidates?.length ?? 0;
+      const totalCandidates = result.totalCandidates ?? shown;
+      const countPhrase =
+        totalCandidates > shown
+          ? `${totalCandidates} symbols (showing ${shown})`
+          : `${totalCandidates} symbols`;
+      const lines = [
+        `${target?.name || '?'}: AMBIGUOUS — ${countPhrase} share this name. ` +
+          `PDG impact was not computed until the target is disambiguated. ` +
+          `Use --uid, file_path, or kind for one authoritative PDG result.`,
+      ];
+      if (result.message) lines.push(String(result.message));
+      for (const c of result.candidates || []) {
+        const score = typeof c.score === 'number' ? ` score ${c.score}` : '';
+        lines.push(
+          `  ${c.kind} ${c.name} → ${c.filePath}:${c.line || '?'}${score}  (uid: ${c.uid})`,
+        );
+      }
+      return lines.join('\n');
+    }
+
+    // #2129 review F11 — report the FULL match count (`totalCandidates`), not the
+    // truncated `candidates[]` length; note when the candidate list is capped.
+    const shown = result.candidates?.length ?? 0;
+    const total = result.totalCandidates ?? shown;
+    const countPhrase = total > shown ? `${total} symbols (showing ${shown})` : `${total} symbols`;
+    const lines = [
+      `${target?.name || '?'}: AMBIGUOUS — ${countPhrase} share this name. ` +
+        `Max blast radius ${result.maxImpactedCount ?? 0} (${result.maxRisk ?? 'UNKNOWN'} risk). ` +
+        `Disambiguate with --uid for one authoritative result:`,
+    ];
+    for (const c of result.candidates || []) {
+      lines.push(
+        `  ${c.kind} ${c.name} → ${c.filePath}:${c.line || '?'}  ` +
+          `[${c.impactedCount ?? 0} ${direction}, risk ${c.risk ?? 'UNKNOWN'}]  (uid: ${c.uid})`,
+      );
+    }
+    // #2129 review F1 — a failed per-candidate probe makes the max a lower bound.
+    if (result.partialProbe) {
+      lines.push(
+        '  ⚠️  One or more candidate probes failed — max blast radius / risk are lower bounds.',
+      );
+    }
+    return lines.join('\n');
+  }
+
+  // ─── PDG mode (mode:'pdg') ────────────────────────────────────────────
+  // KTD8 presentation half. PDG results are intra-procedural Program
+  // Dependence Graph blast radii: the single collapsed `byDepth[1]` bucket
+  // has NO call-hop depth meaning (block-hops ≠ call-hops), so we must NOT
+  // reuse the callgraph "depth N / WILL BREAK (direct)" framing, the
+  // callgraph DI/dynamic-dispatch lower-bound copy, or the confident
+  // "isolated" zero. A degraded / no-body PDG result is INCONCLUSIVE, not
+  // safe-to-refactor — it gets the explicit caveat + remediation, never an
+  // empty blast radius. Detect on `mode:'pdg'` (every PDG return path —
+  // findings, degradation, no-body, no-dependence — carries it). Ambiguous
+  // PDG results carry `status:'ambiguous'` and are handled above; they never
+  // reach here.
+  if (result.mode === 'pdg') {
+    const name = target?.name || '?';
+    const appendPdgInterproceduralSymbols = (lines: string[]): boolean => {
+      const byDepth =
+        result.interproceduralByDepth || result.pdgInterprocedural?.byDepth || result.byDepth || {};
+      const byDepthCounts =
+        result.interproceduralByDepthCounts ||
+        result.pdgInterprocedural?.byDepthCounts ||
+        result.byDepthCounts ||
+        {};
+      const depthKeys = Array.from(
+        new Set([...Object.keys(byDepthCounts), ...Object.keys(byDepth)]),
+      )
+        .map((d) => Number(d))
+        .filter((d) => Number.isFinite(d))
+        .sort((a, b) => a - b);
+      const hasReach = depthKeys.some((depth) => {
+        const items = byDepth[depth] || byDepth[String(depth)] || [];
+        const count = byDepthCounts[depth] ?? byDepthCounts[String(depth)] ?? items.length;
+        return count > 0;
+      });
+      if (!hasReach) return false;
+
+      const totalSymbols =
+        result.pdgInterprocedural?.impactedCount ??
+        (typeof result.impactedCount === 'number' ? result.impactedCount : 0);
+      lines.push('');
+      lines.push(`Inter-procedural symbol reach (${totalSymbols}):`);
+      for (const depth of depthKeys) {
+        const items = byDepth[depth] || byDepth[String(depth)] || [];
+        const count = byDepthCounts[depth] ?? byDepthCounts[String(depth)] ?? items.length;
+        if (count <= 0) continue;
+        lines.push(`  d=${depth} (${count})`);
+        const shown = Math.min(items.length, 12);
+        for (const item of items.slice(0, shown)) {
+          const flags: string[] = [];
+          if (item.unresolved) flags.push('unresolved');
+          if (item.ambiguous) flags.push('ambiguous');
+          const flagStr = flags.length ? ` [${flags.join(', ')}]` : '';
+          lines.push(`    ${item.type || ''} ${item.name} → ${item.filePath}${flagStr}`);
+        }
+        if (count > shown) lines.push(`    ... and ${count - shown} more`);
+      }
+      return true;
+    };
+
+    // (1) Degradation — the PDG layer (or a sub-layer) is absent/unreadable.
+    // `pdgLayer` is the non-'ready' state from `pdgLayerStatus`. Print the
+    // honest remediation, NOT a zero/empty blast radius.
+    if (result.pdgLayer) {
+      const subLayer = result.missingSubLayer
+        ? ` (missing sub-layer: ${result.missingSubLayer})`
+        : '';
+      return (
+        `${name}: PDG impact unavailable — the index has no usable PDG layer ` +
+        `[${result.pdgLayer}]${subLayer}. This is NOT "no impact". ` +
+        `Re-index with \`gitnexus analyze --pdg\` to build the control/data ` +
+        `dependence layer, or use \`--mode callgraph\` for the call-graph blast radius.` +
+        (result.note ? `\n${result.note}` : '')
+      );
+    }
+
+    // (2) No-body symbol (KTD6) — interface / type alias / abstract / ambient
+    // member / one-line declaration with no CFG. Show the caveat, never
+    // "isolated / no dependencies".
+    if (result.epistemic === 'no-pdg-body') {
+      const noBodyLines = [
+        `${name}: local PDG slice not applicable to this symbol — it has no PDG body ` +
+          `(no control/data dependence edges; e.g. an interface, type alias, ` +
+          `abstract/ambient member, or a one-line declaration). This is NOT a ` +
+          `confident "no impact".`,
+      ];
+      appendPdgInterproceduralSymbols(noBodyLines);
+      if (result.note) noBodyLines.push(result.note);
+      return noBodyLines.join('\n');
+    }
+
+    // (2b) STATEMENT-ANCHORED SLICE (mode:'pdg' + line). When `criterionLine` is
+    // present the result is a statement slice: the seeded line plus the list of
+    // dependent statements (`affectedStatements: {line,filePath,text}[]`). Render
+    // those statements directly — this IS the useful output of statement mode —
+    // rather than the symbol-projection bucket below. Empty cases:
+    //   - `pdg-no-block-at-line`: the line is blank / a comment / outside the
+    //     body (no statement block) — print the steering note.
+    //   - empty `affectedStatements` with `pdg-intra-procedural`: the line has no
+    //     dependents in this direction — print the steering note.
+    // Each non-empty case also surfaces truncation honestly.
+    if (typeof result.criterionLine === 'number') {
+      const slice: any[] = Array.isArray(result.affectedStatements)
+        ? result.affectedStatements
+        : [];
+      const count =
+        typeof result.affectedStatementCount === 'number'
+          ? result.affectedStatementCount
+          : slice.length;
+      // File anchor for the heading — the seeded statement's file (every slice
+      // statement shares the function's file). Fall back to the target's file.
+      const anchorFile = slice[0]?.filePath || target?.filePath || name;
+
+      if (count === 0 || slice.length === 0) {
+        // No statement block at the line, or no dependents in this direction.
+        // Print the honest note (pdg-no-block-at-line or the no-dependence note)
+        // verbatim — never an empty "isolated" headline.
+        const emptySliceLines = [
+          `No statements ${direction}-dependent on ${anchorFile}:${result.criterionLine}.`,
+        ];
+        if (result.truncated) {
+          const by = formatTruncationSuffix(result);
+          emptySliceLines.push(
+            `⚠️  Truncated${by} — the dependence slice was bounded; deeper PDG-dependent statements may exist.`,
+          );
+        }
+        appendPdgInterproceduralSymbols(emptySliceLines);
+        if (result.note) emptySliceLines.push(result.note);
+        return emptySliceLines.join('\n');
+      }
+
+      const slLines: string[] = [];
+      slLines.push(
+        `Statements ${direction}-dependent on ${anchorFile}:${result.criterionLine} (${count}):`,
+      );
+      for (const s of slice) {
+        const text = typeof s.text === 'string' ? s.text : '';
+        slLines.push(`  L${s.line}: ${text}`);
+      }
+      // Truncation honesty — the slice may be a lower bound (depth or per-step
+      // LIMIT bound). Surface it the same way the symbol render does.
+      if (result.truncated) {
+        const by = formatTruncationSuffix(result);
+        slLines.push(
+          `⚠️  Truncated${by} — the dependence slice was bounded; deeper PDG-dependent statements may exist.`,
+        );
+      }
+      appendPdgInterproceduralSymbols(slLines);
+      if (result.note) {
+        slLines.push('');
+        slLines.push(`ℹ️  ${result.note}`);
+      }
+      return slLines.join('\n').trim();
+    }
+
+    const pdgLines: string[] = [];
+
+    if (!appendPdgInterproceduralSymbols(pdgLines)) {
+      pdgLines.push(
+        `${name} (${direction}): no inter-procedural symbols reached. ` +
+          `The local PDG statement slice may still report affectedStatements when seeded with line:<N>.`,
+      );
+    }
+
+    // The assembled note carries the local-PDG framing plus the unified
+    // inter-procedural symbol-reach contract; surface it verbatim so the CLI
+    // reader sees the same honesty the JSON consumer does.
+    if (result.note) {
+      pdgLines.push('');
+      pdgLines.push(`ℹ️  ${result.note}`);
+    } else {
+      pdgLines.push('');
+      pdgLines.push(
+        'ℹ️  Program Dependence Graph result — statement reach is reported in affectedStatements and inter-procedural symbol reach in interproceduralByDepth/byDepth.',
+      );
+    }
+
+    // Honest incompleteness signals (block-attribution + truncation).
+    if (result.ambiguousProjectionCount > 0) {
+      pdgLines.push(
+        `⚠️  ${result.ambiguousProjectionCount} block(s) could not be attributed to a ` +
+          `unique owning symbol (same-line functions) — all colliding symbols are shown.`,
+      );
+    }
+    if (result.unresolvedBlockCount > 0) {
+      pdgLines.push(
+        `⚠️  ${result.unresolvedBlockCount} dependence block(s) map to no owning ` +
+          `Function/Method/Constructor (top-level statement / closure) — surfaced under their file.`,
+      );
+    }
+    if (result.truncated) {
+      const by = formatTruncationSuffix(result);
+      pdgLines.push(
+        `⚠️  Truncated${by} — the dependence traversal was bounded; deeper PDG impacts may exist.`,
+      );
+    }
+
+    return pdgLines.join('\n').trim();
+  }
+
   if (total === 0) {
+    // #1858 — "isolated" is a confident claim. If an interface / indirection
+    // boundary is on the path, the true count is a lower bound, not zero;
+    // callers binding via DI / dynamic dispatch were not traced. Say so instead.
+    if (result.epistemic === 'lower-bound') {
+      const lines = [
+        `${target?.name || '?'}: no direct ${direction} dependencies traced, but this is a LOWER BOUND — unresolved indirection on the path (actual impact may be higher):`,
+      ];
+      for (const b of result.boundaries || []) lines.push(`    • ${b}`);
+      return lines.join('\n');
+    }
     return `${target?.name || '?'}: No ${direction} dependencies found. This symbol appears isolated.`;
   }
 
@@ -202,6 +508,14 @@ export function formatImpactResult(result: any): string {
   );
   if (result.partial) {
     lines.push('⚠️  Partial results — graph traversal was interrupted. Deeper impacts may exist.');
+  }
+  // #1858 — an interface / indirection boundary on the path makes this a lower
+  // bound; surface it so the count is not read as exhaustive.
+  if (result.epistemic === 'lower-bound') {
+    lines.push(
+      '⚠️  Lower bound — unresolved indirection on the path (callers binding via DI / dynamic dispatch are not traced; actual impact may be higher):',
+    );
+    for (const b of result.boundaries || []) lines.push(`    • ${b}`);
   }
   lines.push('');
 
@@ -329,7 +643,7 @@ function formatToolResult(toolName: string, result: any): string {
 // Guide the agent to the logical next tool call.
 // Critical for tool chaining: query → context → impact → fix.
 
-function getNextStepHint(toolName: string): string {
+export function getNextStepHint(toolName: string, result?: any): string {
   switch (toolName) {
     case 'query':
       return '\n---\nNext: Pick a symbol above and run gitnexus-context "<name>" to see all its callers, callees, and execution flows.';
@@ -338,6 +652,15 @@ function getNextStepHint(toolName: string): string {
       return '\n---\nNext: To check what breaks if you change this, run gitnexus-impact "<name>" upstream';
 
     case 'impact':
+      if (
+        result?.error ||
+        result?.status === 'ambiguous' ||
+        result?.mode === 'pdg' ||
+        result?.pdgLayer ||
+        typeof result?.criterionLine === 'number'
+      ) {
+        return '';
+      }
       return '\n---\nNext: Review d=1 items first (WILL BREAK). Read the source with cat to understand the code, then make your fix.';
 
     case 'cypher':
@@ -354,25 +677,6 @@ function getNextStepHint(toolName: string): string {
   }
 }
 
-export function isBearerAuthorized(
-  authToken: string | null,
-  authHeader: string | undefined,
-): boolean {
-  return !authToken || authHeader === `Bearer ${authToken}`;
-}
-
-export function formatHealthPayload(
-  repoNames: string[],
-  includeRepos: boolean,
-): {
-  status: 'ok';
-  repos?: string[];
-  auth?: 'required';
-} {
-  if (includeRepos) return { status: 'ok', repos: repoNames };
-  return { status: 'ok', auth: 'required' };
-}
-
 // ─── Server ───────────────────────────────────────────────────────────
 
 export async function evalServerCommand(options?: EvalServerOptions): Promise<void> {
@@ -387,11 +691,21 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
         `  Must be an IP address or "localhost".\n\n` +
         `  Examples:\n` +
         `    gitnexus eval-server --host 127.0.0.1    (loopback only, default)\n` +
-        `    gitnexus eval-server --host 0.0.0.0      (all network interfaces)\n` +
-        `    gitnexus eval-server --host 192.168.1.5  (specific interface)\n` +
+        `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0\n` +
+        `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 192.168.1.5\n` +
         `    gitnexus eval-server --host localhost     (OS-resolved loopback)\n`,
       { flag: '--host', value: rawHost },
     );
+    process.exit(1);
+  }
+
+  const authToken = resolveEvalServerAuthToken(process.env);
+  try {
+    assertSecureEvalServerBinding(host, authToken);
+  } catch (error) {
+    cliError(error instanceof Error ? error.message : 'Refusing insecure eval-server binding.', {
+      host,
+    });
     process.exit(1);
   }
 
@@ -414,12 +728,6 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
     'GitNexus eval-server: repos loaded',
   );
 
-  // Bearer token auth — if GITNEXUS_AUTH_TOKEN is set, mutating/tool requests must authenticate.
-  const authToken = process.env.GITNEXUS_AUTH_TOKEN || null;
-  if (authToken) {
-    cliInfo('GitNexus eval-server: Bearer token auth enabled');
-  }
-
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   function resetIdleTimer() {
@@ -432,38 +740,42 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
     }, idleTimeoutSec * 1000);
   }
 
+  // Startup-generated shutdown token: a `POST /shutdown` must present it in the
+  // X-Shutdown-Token header. The local agent that launches the server reads it
+  // from the GITNEXUS_EVAL_SERVER_SHUTDOWN_TOKEN line on fd 1 (next to the READY
+  // signal); a client on another VM under `--host 0.0.0.0` cannot guess it, so it
+  // can no longer kill the server. (SIGINT/SIGTERM and the idle timeout still
+  // shut down locally without a token.)
+  const shutdownToken = crypto.randomBytes(24).toString('hex');
+
   const server = http.createServer(async (req, res) => {
+    if (!isEvalServerBearerAuthorized(req.headers.authorization, authToken)) {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('WWW-Authenticate', 'Bearer');
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
     resetIdleTimer();
-    const authorized = isBearerAuthorized(authToken, req.headers.authorization);
 
     try {
       // Health check
       if (req.method === 'GET' && req.url === '/health') {
         res.setHeader('Content-Type', 'application/json');
         res.writeHead(200);
-        res.end(
-          JSON.stringify(
-            formatHealthPayload(
-              repos.map((r) => r.name),
-              authorized,
-            ),
-          ),
-        );
-        return;
-      }
-
-      // Auth check — if GITNEXUS_AUTH_TOKEN is set, all non-health requests must authenticate.
-      if (!authorized) {
-        res.setHeader('Content-Type', 'application/json');
-        res.writeHead(401);
-        res.end(
-          JSON.stringify({ error: 'Unauthorized — set Authorization: Bearer <token> header' }),
-        );
+        res.end(JSON.stringify({ status: 'ok', repos: repos.map((r) => r.name) }));
         return;
       }
 
       // Shutdown
       if (req.method === 'POST' && req.url === '/shutdown') {
+        if (req.headers['x-shutdown-token'] !== shutdownToken) {
+          res.setHeader('Content-Type', 'application/json');
+          res.writeHead(403);
+          res.end(JSON.stringify({ error: 'forbidden: missing or invalid X-Shutdown-Token' }));
+          return;
+        }
         res.setHeader('Content-Type', 'application/json');
         res.writeHead(200);
         res.end(JSON.stringify({ status: 'shutting_down' }));
@@ -479,6 +791,14 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       const toolMatch = req.url?.match(/^\/tool\/(\w+)$/);
       if (req.method === 'POST' && toolMatch) {
         const toolName = toolMatch[1];
+        if (!EVAL_SERVER_TOOLS.has(toolName)) {
+          res.setHeader('Content-Type', 'text/plain');
+          res.writeHead(400);
+          res.end(
+            `Error: unsupported tool '${toolName}'. Supported: ${[...EVAL_SERVER_TOOLS].sort().join(', ')}`,
+          );
+          return;
+        }
 
         const body = await readBody(req);
         let args: Record<string, any> = {};
@@ -494,27 +814,13 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
         }
 
         // Call tool, format result as text, append next-step hint
-        const maxTokens = parseMaxTokens(args.maxTokens);
-        delete args.maxTokens; // Don't pass to backend
-        if (maxTokens.error) {
-          res.setHeader('Content-Type', 'text/plain');
-          res.writeHead(400);
-          res.end(`Error: ${maxTokens.error}`);
-          return;
-        }
         const result = await backend.callTool(toolName, args);
-        let formatted = formatToolResult(toolName, result);
-        const hint = getNextStepHint(toolName);
-        formatted = formatted + hint;
-
-        // Apply token budget if specified
-        if (maxTokens.value) {
-          formatted = truncateToTokenBudget(formatted, maxTokens.value);
-        }
+        const formatted = formatToolResult(toolName, result);
+        const hint = getNextStepHint(toolName, result);
 
         res.setHeader('Content-Type', 'text/plain');
         res.writeHead(200);
-        res.end(formatted);
+        res.end(formatted + hint);
         return;
       }
 
@@ -553,7 +859,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
               `  Run \`ip addr\` (Linux) or \`ipconfig\` (Windows) to list available addresses.\n\n`) +
           `  Common fixes:\n` +
           `    gitnexus eval-server --host 127.0.0.1  (loopback, this machine only)\n` +
-          `    gitnexus eval-server --host 0.0.0.0    (all interfaces, reachable from other VMs)\n`,
+          `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0\n`,
         { code: err.code, port, host },
       );
     } else if (err.code === 'EACCES') {
@@ -602,6 +908,9 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       `  GET  /health        — health check`,
       `  POST /shutdown      — graceful shutdown`,
     ];
+    if (authToken) {
+      bannerLines.push('  Bearer authentication enabled');
+    }
     if (idleTimeoutSec > 0) {
       bannerLines.push(`  Auto-shutdown after ${idleTimeoutSec}s idle`);
     }
@@ -609,6 +918,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
       port: boundPort,
       host,
       idleTimeoutSec: idleTimeoutSec > 0 ? idleTimeoutSec : undefined,
+      authEnabled: Boolean(authToken),
       endpoints: [
         'POST /tool/query',
         'POST /tool/context',
@@ -621,6 +931,8 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
     try {
       // Use fd 1 directly — LadybugDB captures process.stdout (#324)
       writeSync(1, `GITNEXUS_EVAL_SERVER_READY:${displayHost}:${boundPort}\n`);
+      // The launching agent reads this to authorize POST /shutdown.
+      writeSync(1, `GITNEXUS_EVAL_SERVER_SHUTDOWN_TOKEN:${shutdownToken}\n`);
     } catch {
       // stdout may not be available (e.g., broken pipe)
     }
@@ -638,6 +950,21 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
+
+/**
+ * Tools the eval-server exposes over HTTP — the read-only query surface the
+ * banner advertises. `LocalBackend.callTool` ALSO dispatches write-side / heavier
+ * tools (rename, shape_check, tool_map, …); the allowlist keeps a stray
+ * `POST /tool/<name>` from reaching those through this Docker/eval-harness server.
+ */
+export const EVAL_SERVER_TOOLS: ReadonlySet<string> = new Set([
+  'query',
+  'context',
+  'impact',
+  'cypher',
+  'detect_changes',
+  'list_repos',
+]);
 
 export const MAX_BODY_SIZE = 1024 * 1024; // 1MB
 

@@ -27,116 +27,21 @@ import { GITNEXUS_TOOLS } from './tools.js';
 import { installGlobalStdoutSentinel } from './stdio-context.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
-import { parseMaxTokens, truncateToTokenBudget } from '../cli/token-budget.js';
-import { defaultRepo, mcpReadOnlyMode, repoAllowed, validateMcpConfig } from './config.js';
-
-const MCP_READ_ONLY_TOOLS = new Set([
-  'list_repos',
-  'query',
-  'context',
-  'impact',
-  'detect_changes',
-  'cypher',
-]);
-const BUDGETED_TOOLS = new Set(['query', 'context', 'impact']);
-const MCP_QUERY_LIMIT_MAX = 20;
-const MCP_QUERY_SYMBOLS_MAX = 50;
-const MCP_IMPACT_DEPTH_MAX = 8;
-const MCP_IMPACT_TIMEOUT_MAX = 60_000;
-
-function clampPositiveInteger(raw: unknown, max: number): number | undefined {
-  if (raw === undefined || raw === null || raw === '') return undefined;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value <= 0) return undefined;
-  return Math.min(value, max);
-}
-
-function normalizeArgsForMcp(toolName: string, args: any): any {
-  const normalized = { ...(args || {}) };
-  if (toolName !== 'list_repos' && !normalized.repo && defaultRepo()) {
-    normalized.repo = defaultRepo();
-  }
-  if (toolName === 'query') {
-    normalized.limit = clampPositiveInteger(normalized.limit, MCP_QUERY_LIMIT_MAX);
-    normalized.max_symbols = clampPositiveInteger(normalized.max_symbols, MCP_QUERY_SYMBOLS_MAX);
-  }
-  if (toolName === 'impact') {
-    normalized.maxDepth = clampPositiveInteger(normalized.maxDepth, MCP_IMPACT_DEPTH_MAX);
-    normalized.crossDepth = clampPositiveInteger(normalized.crossDepth, MCP_IMPACT_DEPTH_MAX);
-    normalized.timeoutMs = clampPositiveInteger(
-      normalized.timeoutMs ?? normalized.timeout,
-      MCP_IMPACT_TIMEOUT_MAX,
-    );
-    normalized.timeout = undefined;
-  }
-  return normalized;
-}
-
-function readOnlyResourceTemplateAllowed(uriTemplate: string): boolean {
-  return !mcpReadOnlyMode() || !uriTemplate.startsWith('gitnexus://group/');
-}
-
-function assertMcpReadOnlyResource(uri: string): void {
-  if (!mcpReadOnlyMode()) return;
-  const match = /^gitnexus:\/\/repo\/([^/]+)/u.exec(uri);
-  if (match && !repoAllowed(decodeURIComponent(match[1]!))) {
-    throw new Error(
-      `Resource repo "${decodeURIComponent(match[1]!)}" is not in the GitNexus MCP allow-list.`,
-    );
-  }
-  if (/^gitnexus:\/\/group\//u.test(uri)) {
-    throw new Error('Group resources are not available in GitNexus MCP read-only mode.');
-  }
-}
-
-function assertMcpReadOnlyTool(toolName: string): void {
-  if (!mcpReadOnlyMode()) return;
-  if (MCP_READ_ONLY_TOOLS.has(toolName)) return;
-  throw new Error(`Tool "${toolName}" is not available in GitNexus MCP read-only mode.`);
-}
-
-function scrubReadOnlyDescription(description: string): string {
-  return description
-    .replace(/\nGROUP MODE:[\s\S]*?(?=\n\n[A-Z][A-Z ]*:|$)/gu, '')
-    .replace(/\nSERVICE:[\s\S]*?(?=\n\n[A-Z][A-Z ]*:|$)/gu, '');
-}
-
-function scrubReadOnlyInputSchema<T>(inputSchema: T): T {
-  if (!inputSchema || typeof inputSchema !== 'object') return inputSchema;
-  const cloned = JSON.parse(JSON.stringify(inputSchema)) as any;
-  const properties = cloned.properties;
-  if (!properties || typeof properties !== 'object') return cloned;
-  if (properties.repo && typeof properties.repo.description === 'string') {
-    properties.repo.description =
-      'Indexed repository name or path. Group-mode repo values beginning with @ are unavailable in read-only MCP mode.';
-  }
-  delete properties.service;
-  delete properties.subgroup;
-  delete properties.crossDepth;
-  return cloned;
-}
-
-function toolForMcp(tool: (typeof GITNEXUS_TOOLS)[number]): (typeof GITNEXUS_TOOLS)[number] {
-  if (!mcpReadOnlyMode()) return tool;
-  if (!['query', 'context', 'impact', 'detect_changes', 'cypher'].includes(tool.name)) return tool;
-  const repoText = defaultRepo()
-    ? `This read-only MCP defaults omitted repo parameters to ${defaultRepo()}.`
-    : 'This read-only MCP requires an explicit repo parameter when more than one repo is allowed.';
-  return {
-    ...tool,
-    description: `${scrubReadOnlyDescription(tool.description)}\n\nGITNEXUS MCP: ${repoText} Group mode is unavailable in read-only MCP mode. Use maxTokens on query/context/impact for bounded retrieval slices.`,
-    inputSchema: scrubReadOnlyInputSchema(tool.inputSchema),
-  };
-}
-
-function applyTokenBudget(toolName: string, args: any, text: string): string {
-  if (!BUDGETED_TOOLS.has(toolName)) return text;
-  const rawMaxTokens =
-    args?.maxTokens ?? (process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS || undefined);
-  const parsed = parseMaxTokens(rawMaxTokens);
-  if (parsed.error) throw new Error(`maxTokens ${parsed.error}`);
-  return parsed.value ? truncateToTokenBudget(text, parsed.value) : text;
-}
+import { applyMcpMaxTokens, resolveMcpMaxTokens, withoutMcpBudgetArg } from './output-budget.js';
+import {
+  assertMcpReadOnlyResource,
+  assertMcpReadOnlyToolCall,
+  filterMcpReadOnlyResourceContent,
+  MCP_READ_ONLY_TOOLS,
+  readOnlyResourceTemplateAllowed,
+  resolveMcpReadOnlyMode,
+  toolForReadOnlyMcp,
+} from './read-only-policy.js';
+import {
+  createMcpRepositoryPolicy,
+  McpRepositoryPolicy,
+  mcpRepositoryPolicyConfigured,
+} from './repository-policy.js';
 
 /**
  * Next-step hints appended to tool responses.
@@ -191,8 +96,16 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
  * Create a configured MCP Server with all handlers registered.
  * Transport-agnostic — caller connects the desired transport.
  */
-export function createMCPServer(backend: LocalBackend): Server {
-  validateMcpConfig();
+export function createMCPServer(
+  backend: LocalBackend,
+  options: { repositoryPolicy?: McpRepositoryPolicy } = {},
+): Server {
+  const readOnly = resolveMcpReadOnlyMode();
+  if (!options.repositoryPolicy && mcpRepositoryPolicyConfigured()) {
+    throw new Error('Configured MCP repository policy must be validated before server creation.');
+  }
+  const repositoryPolicy = options.repositoryPolicy ?? McpRepositoryPolicy.unrestricted();
+  const scopedBackend = repositoryPolicy.scopeBackend(backend);
   const require = createRequire(import.meta.url);
   const pkgVersion: string = require('../../package.json').version;
   const server = new Server(
@@ -224,8 +137,10 @@ export function createMCPServer(backend: LocalBackend): Server {
 
   // Handle list resource templates request (for dynamic resources)
   server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-    const templates = getResourceTemplates().filter((template) =>
-      readOnlyResourceTemplateAllowed(template.uriTemplate),
+    const templates = getResourceTemplates().filter(
+      (template) =>
+        readOnlyResourceTemplateAllowed(template.uriTemplate, readOnly) &&
+        repositoryPolicy.resourceTemplateAllowed(template.uriTemplate),
     );
     return {
       resourceTemplates: templates.map((t) => ({
@@ -242,8 +157,12 @@ export function createMCPServer(backend: LocalBackend): Server {
     const { uri } = request.params;
 
     try {
-      assertMcpReadOnlyResource(uri);
-      const content = await readResource(uri, backend);
+      assertMcpReadOnlyResource(uri, readOnly);
+      repositoryPolicy.assertResourceUri(uri);
+      const content = filterMcpReadOnlyResourceContent(
+        await readResource(uri, scopedBackend),
+        readOnly,
+      );
       return {
         contents: [
           {
@@ -268,8 +187,13 @@ export function createMCPServer(backend: LocalBackend): Server {
 
   // Handle list tools request
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: GITNEXUS_TOOLS.filter((tool) => !mcpReadOnlyMode() || MCP_READ_ONLY_TOOLS.has(tool.name))
-      .map((tool) => toolForMcp(tool))
+    tools: GITNEXUS_TOOLS.filter(
+      (tool) =>
+        (!readOnly || MCP_READ_ONLY_TOOLS.has(tool.name)) &&
+        repositoryPolicy.toolAllowed(tool.name),
+    )
+      .map((tool) => toolForReadOnlyMcp(tool, readOnly))
+      .map((tool) => repositoryPolicy.toolForMcp(tool))
       .map((tool) => ({
         name: tool.name,
         description: tool.description,
@@ -281,20 +205,21 @@ export function createMCPServer(backend: LocalBackend): Server {
   // Handle tool calls — append next-step hints to guide agent workflow
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    let maxTokens: number | undefined;
 
     try {
-      assertMcpReadOnlyTool(name);
-      const normalizedArgs = normalizeArgsForMcp(name, args);
-      const result = await backend.callTool(name, normalizedArgs);
+      const typedArgs = args as Record<string, unknown> | undefined;
+      assertMcpReadOnlyToolCall(name, typedArgs, readOnly);
+      maxTokens = resolveMcpMaxTokens(name, typedArgs);
+      const result = await scopedBackend.callTool(name, withoutMcpBudgetArg(typedArgs));
       const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-      const hint = getNextStepHint(name, normalizedArgs as Record<string, any> | undefined);
-      const responseText = applyTokenBudget(name, normalizedArgs, resultText + hint);
+      const hint = getNextStepHint(name, args as Record<string, any> | undefined);
 
       return {
         content: [
           {
             type: 'text',
-            text: responseText,
+            text: applyMcpMaxTokens(resultText + hint, maxTokens),
           },
         ],
       };
@@ -304,7 +229,7 @@ export function createMCPServer(backend: LocalBackend): Server {
         content: [
           {
             type: 'text',
-            text: `Error: ${message}`,
+            text: applyMcpMaxTokens(`Error: ${message}`, maxTokens),
           },
         ],
         isError: true,
@@ -434,8 +359,12 @@ export function installSignalShutdown(
   on('SIGTERM', () => void shutdown(SHUTDOWN_EXIT_CODES.SIGTERM));
 }
 
-export async function startMCPServer(backend: LocalBackend): Promise<void> {
-  const server = createMCPServer(backend);
+export async function startMCPServer(
+  backend: LocalBackend,
+  repositoryPolicy?: McpRepositoryPolicy,
+): Promise<void> {
+  const validatedRepositoryPolicy = repositoryPolicy ?? (await createMcpRepositoryPolicy(backend));
+  const server = createMCPServer(backend, { repositoryPolicy: validatedRepositoryPolicy });
 
   // Idempotent global sentinel install. cli/mcp.ts calls this first thing
   // (before warnMissingOptionalGrammars / backend.init can emit to stdout);
@@ -456,20 +385,6 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
     },
   });
   const transport = new CompatibleStdioServerTransport(process.stdin, safeStdout);
-
-  // Orphan guard: if the client process that launched this stdio server dies,
-  // self-terminate. This is independent of stdin EOF / SIGTERM delivery, which
-  // can be missed when the parent is killed hard. The interval is unref'd so it
-  // never keeps an otherwise-idle MCP process alive.
-  const launchedByPid = process.ppid;
-  const orphanGuard = setInterval(() => {
-    try {
-      process.kill(launchedByPid, 0); // signal 0 = liveness probe, no signal delivered
-    } catch {
-      process.exit(0);
-    }
-  }, 3000);
-  orphanGuard.unref();
 
   // Surface the redirect counter on shutdown so users see the volume of
   // stray writes even when individual payloads were truncated/suppressed.

@@ -147,27 +147,27 @@ body {
 /* ═══════════════════════════════════════════════════════════════
    CUSTOM SCROLLBAR
 ═══════════════════════════════════════════════════════════════ */
-@utility scrollbar-thin {
+.scrollbar-thin {
   scrollbar-width: thin;
   scrollbar-color: #2a2a3a #0a0a10;
+}
 
-  &::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-  }
+.scrollbar-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
 
-  &::-webkit-scrollbar-track {
-    background: var(--color-deep);
-  }
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: var(--color-deep);
+}
 
-  &::-webkit-scrollbar-thumb {
-    background: var(--color-border-default);
-    border-radius: 4px;
-  }
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: var(--color-border-default);
+  border-radius: 4px;
+}
 
-  &::-webkit-scrollbar-thumb:hover {
-    background: var(--color-text-muted);
-  }
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
 }
 
 /* ═══════════════════════════════════════════════════════════════

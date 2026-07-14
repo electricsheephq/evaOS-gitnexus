@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Full history needed for the on-push full-history scan; on PRs the
           # action diffs against the base ref so the cost is bounded by the PR.
@@ -38,25 +38,52 @@ jobs:
           # steps (and Gitleaks itself) don't need it for repo operations.
           persist-credentials: false
 
-      # gitleaks-action builds `base^..head` for pull_request events; both SHAs
-      # must exist locally (fork PRs and shallow checkouts otherwise fail with
-      # "unknown revision" — see gitleaks/gitleaks-action#199).
+      # Both SHAs must exist locally so the CLI can scan exactly the PR range.
       - name: Fetch PR refs for gitleaks range
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           git fetch --no-tags origin "$BASE_SHA"
-          git fetch --no-tags origin "$HEAD_SHA" || git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+          git fetch --no-tags origin "$HEAD_SHA"
 
-      # No GITLEAKS_LICENSE secret is required for OSS / public-repo usage.
-      # If this repo becomes private, the action will require a license key.
+      # The Gitleaks Action wrapper requires a license for organization-owned
+      # repositories. Run the official CLI image directly so secret scanning
+      # remains local, deterministic, and independent of an external license.
       - name: Gitleaks
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
-          GITLEAKS_ENABLE_SUMMARY: true
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          log_opts="--all"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            log_opts="${BASE_SHA}..${HEAD_SHA}"
+          fi
+
+          # Gitleaks can otherwise report success after a Git discovery error.
+          # Verify a non-empty range inside the same container before scanning.
+          docker run --rm \
+            --network none \
+            --user "$(id -u):$(id -g)" \
+            --env GIT_CONFIG_COUNT=1 \
+            --env GIT_CONFIG_KEY_0=safe.directory \
+            --env GIT_CONFIG_VALUE_0=/repo \
+            --volume "$PWD:/repo:ro" \
+            --workdir /repo \
+            --entrypoint /bin/sh \
+            ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            -eu -c '
+              range="$1"
+              if [ "$range" = "--all" ]; then
+                commit_count="$(git rev-list --count --all)"
+              else
+                commit_count="$(git rev-list --count "$range")"
+              fi
+              if [ "$commit_count" -eq 0 ]; then
+                echo "gitleaks preflight refused an empty commit range" >&2
+                exit 2
+              fi
+              exec gitleaks git --redact --verbose --exit-code 1 --log-opts="$range" .
+            ' sh "$log_opts"

@@ -8,6 +8,7 @@ import { accumulateExportedTypesFromParsedNode, type ExportedTypeMap } from './c
 import type { ParsedFile } from 'gitnexus-shared';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { SkippedPath } from './workers/clone-safety.js';
+import type { CfgSkipCounts } from './cfg/collect.js';
 import { logger } from '../logger.js';
 import type {
   ParseWorkerResult,
@@ -15,16 +16,19 @@ import type {
   ExtractedRoute,
   ExtractedFetchCall,
   ExtractedDecoratorRoute,
+  ExtractedModuleConstants,
   ExtractedToolDef,
   FileScopeBindings,
   ExtractedORMQuery,
   FetchWrapperDef,
 } from './workers/parse-worker.js';
 import type {
+  ExtractedRouterConstructorPrefix,
   ExtractedRouterImport,
   ExtractedRouterInclude,
   ExtractedRouterModuleAlias,
 } from './route-extractors/fastapi-router-bindings.js';
+import type { SharedSpringType } from './route-extractors/spring-shared.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
 
@@ -35,9 +39,14 @@ export interface WorkerExtractedData {
   decoratorRoutes: ExtractedDecoratorRoute[];
   routerIncludes: ExtractedRouterInclude[];
   routerImports: ExtractedRouterImport[];
+  routerConstructorPrefixes: ExtractedRouterConstructorPrefix[];
   routerModuleAliases: ExtractedRouterModuleAlias[];
+  /** Per-file Python module constants for cross-file route-path resolution (#2391). */
+  moduleConstants: ExtractedModuleConstants[];
   toolDefs: ExtractedToolDef[];
   ormQueries: ExtractedORMQuery[];
+  /** Project-wide Spring class/interface views for the #2288 inheritance pass. */
+  springTypes: SharedSpringType[];
   fileScopeBindings: FileScopeBindings[];
   /**
    * Per-file `ParsedFile` artifacts from the new scope-based resolution
@@ -76,7 +85,10 @@ export const mergeChunkResults = (
   const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
   const allRouterIncludes: ExtractedRouterInclude[] = [];
   const allRouterImports: ExtractedRouterImport[] = [];
+  const allRouterConstructorPrefixes: ExtractedRouterConstructorPrefix[] = [];
   const allRouterModuleAliases: ExtractedRouterModuleAlias[] = [];
+  const allModuleConstants: ExtractedModuleConstants[] = [];
+  const allSpringTypes: SharedSpringType[] = [];
   const allToolDefs: ExtractedToolDef[] = [];
   const allORMQueries: ExtractedORMQuery[] = [];
   const fileScopeBindingsByFile: FileScopeBindings[] = [];
@@ -104,6 +116,7 @@ export const mergeChunkResults = (
         templateArguments: sym.templateArguments,
         ownerId: sym.ownerId,
         qualifiedName: sym.qualifiedName,
+        isDeleted: sym.isDeleted,
       });
     }
     if (exportedTypeMap) {
@@ -117,7 +130,12 @@ export const mergeChunkResults = (
     for (const item of result.decoratorRoutes) allDecoratorRoutes.push(item);
     for (const item of result.routerIncludes ?? []) allRouterIncludes.push(item);
     for (const item of result.routerImports ?? []) allRouterImports.push(item);
+    for (const item of result.routerConstructorPrefixes ?? []) {
+      allRouterConstructorPrefixes.push(item);
+    }
     for (const item of result.routerModuleAliases ?? []) allRouterModuleAliases.push(item);
+    for (const item of result.moduleConstants ?? []) allModuleConstants.push(item);
+    for (const item of result.springTypes ?? []) allSpringTypes.push(item);
     for (const item of result.toolDefs) allToolDefs.push(item);
     if (result.ormQueries) for (const item of result.ormQueries) allORMQueries.push(item);
     if (result.fileScopeBindings)
@@ -132,9 +150,12 @@ export const mergeChunkResults = (
     decoratorRoutes: allDecoratorRoutes,
     routerIncludes: allRouterIncludes,
     routerImports: allRouterImports,
+    routerConstructorPrefixes: allRouterConstructorPrefixes,
     routerModuleAliases: allRouterModuleAliases,
+    moduleConstants: allModuleConstants,
     toolDefs: allToolDefs,
     ormQueries: allORMQueries,
+    springTypes: allSpringTypes,
     fileScopeBindings: fileScopeBindingsByFile,
     parsedFiles: allParsedFiles,
   };
@@ -195,6 +216,31 @@ export const dispatchChunkParse = async (
       .map(([lang, count]) => `${lang}: ${count}`)
       .join(', ');
     logger.warn(`  Skipped unsupported languages: ${summary}`);
+  }
+
+  // Per-language CFG skip telemetry (#2195): functions skipped during the worker
+  // CFG walk, bucketed by reason. Only surfaced for a `--pdg` run (otherwise
+  // `cfgSkipped` is empty). Warn ONLY when a robustness-relevant bucket
+  // (too-deeply-nested / build-error) is non-zero — a too-many-lines skip is the
+  // expected, benign minified/generated-code case and would otherwise be spam.
+  const cfgSkipped = new Map<string, CfgSkipCounts>();
+  for (const result of chunkResults) {
+    for (const [lang, counts] of Object.entries(result.cfgSkipped ?? {})) {
+      const prev = cfgSkipped.get(lang) ?? { tooManyLines: 0, tooDeeplyNested: 0, buildError: 0 };
+      cfgSkipped.set(lang, {
+        tooManyLines: prev.tooManyLines + counts.tooManyLines,
+        tooDeeplyNested: prev.tooDeeplyNested + counts.tooDeeplyNested,
+        buildError: prev.buildError + counts.buildError,
+      });
+    }
+  }
+  for (const [lang, c] of cfgSkipped) {
+    if (c.tooDeeplyNested > 0 || c.buildError > 0) {
+      logger.warn(
+        `  CFG functions skipped (${lang}): ${c.tooDeeplyNested} too-deeply-nested, ` +
+          `${c.buildError} build-error(s), ${c.tooManyLines} over line cap`,
+      );
+    }
   }
 
   // Clone-safety telemetry (#2112): files whose parse output carried a value

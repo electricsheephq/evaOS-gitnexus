@@ -102,9 +102,14 @@ describe('LadybugDB Schema', () => {
       }
     });
 
-    it('includes Vue component event edge types', () => {
-      expect(REL_TYPES).toContain('BINDS_EVENT_HANDLER');
-      expect(REL_TYPES).toContain('EMITS_EVENT');
+    it('includes the control-dependence edge types (issue #2085 M5)', () => {
+      for (const t of ['CDG', 'POST_DOMINATE']) {
+        expect(REL_TYPES).toContain(t);
+      }
+    });
+
+    it('includes the DI collection-injection edge type (#2200)', () => {
+      expect(REL_TYPES).toContain('INJECTS');
     });
   });
 
@@ -195,11 +200,6 @@ describe('LadybugDB Schema', () => {
 
     it('connects BasicBlock to BasicBlock (taint/PDG substrate edges, #2080)', () => {
       expect(RELATION_SCHEMA).toContain('FROM BasicBlock TO BasicBlock');
-    });
-
-    it('connects handler symbols to component files for Vue event edges', () => {
-      expect(RELATION_SCHEMA).toContain('FROM Function TO File');
-      expect(RELATION_SCHEMA).toContain('FROM Method TO File');
     });
 
     it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {

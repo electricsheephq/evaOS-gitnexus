@@ -1242,6 +1242,70 @@ describe('C++ overload disambiguation by parameter types', () => {
 
 // ── Phase P: Same-arity overloads — cross-file + chain resolution ─────────
 
+describe('C++ braced-init-list overload disambiguation (#1899 A8 conservative)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-braced-init-list-overload'),
+      () => {},
+    );
+  }, 60000);
+
+  const callsFrom = (source: string, target: string) =>
+    getRelationships(result, 'CALLS').filter(
+      (edge) => edge.source === source && edge.target === target,
+    );
+
+  const singleTargetParameterTypes = (source: string, target: string) => {
+    const calls = callsFrom(source, target);
+    expect(calls).toHaveLength(1);
+    const [call] = calls;
+    expect(call).toBeDefined();
+    return call === undefined
+      ? undefined
+      : result.graph.getNode(call.rel.targetId)?.properties.parameterTypes;
+  };
+
+  it('resolves homogeneous literal braces to initializer_list overloads', () => {
+    expect(singleTargetParameterTypes('callHomogeneousInitList', 'consume')).toEqual([
+      'std::initializer_list<int>',
+    ]);
+  });
+
+  it('resolves homogeneous literal braces to container overloads', () => {
+    expect(singleTargetParameterTypes('callHomogeneousVector', 'consumeVector')).toEqual([
+      'std::vector<int>',
+    ]);
+  });
+
+  it('prefers a scalar overload for single-element braced-init lists', () => {
+    expect(singleTargetParameterTypes('callSingleElementScalar', 'consumeScalarOrVector')).toEqual([
+      'int',
+    ]);
+  });
+
+  it('rejects container overloads whose value type cannot accept the braced elements', () => {
+    expect(callsFrom('callStringVectorMismatch', 'consumeStringVectorMismatch')).toHaveLength(0);
+  });
+
+  it('suppresses heterogeneous braced-init lists instead of guessing an element type', () => {
+    expect(callsFrom('callHeterogeneousInitList', 'consumeMixed')).toHaveLength(0);
+  });
+
+  it('suppresses empty braced-init lists instead of guessing an element type', () => {
+    expect(callsFrom('callEmptyInitList', 'consumeEmpty')).toHaveLength(0);
+  });
+
+  it('preserves single-overload heterogeneous braced-init recall', () => {
+    expect(callsFrom('callSingleHeterogeneousInitList', 'consumeSingleMixed')).toHaveLength(1);
+  });
+
+  it('preserves single-overload empty braced-init recall', () => {
+    expect(callsFrom('callSingleEmptyInitList', 'consumeSingleEmpty')).toHaveLength(1);
+  });
+});
+
 describe('C++ same-arity overload cross-file and chain resolution', () => {
   let result: PipelineResult;
 
@@ -4395,5 +4459,80 @@ describe('C++ root-anchored base ignores enclosing-relative type (issue #1982)',
     // is `Struct:main.cpp:Outer.Wrap.A.Inner`. KTD3: discriminate on the node id.
     expect(e!.rel.targetId).toContain('A.Inner');
     expect(e!.rel.targetId).not.toContain('Wrap');
+  });
+});
+
+describe('C++ deleted overload selection (#1893 A2)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'cpp-deleted-overload'), () => {});
+  }, 60000);
+
+  const callsFrom = (source: string, target: string) =>
+    getRelationships(result, 'CALLS').filter(
+      (edge) => edge.source === source && edge.target === target,
+    );
+  const targetParameterTypes = (source: string, target: string) => {
+    const edge = callsFrom(source, target);
+    expect(edge).toHaveLength(1);
+    return result.graph.getNode(edge[0]!.rel.targetId)?.properties.parameterTypes;
+  };
+
+  it('keeps a live free-function winner callable', () => {
+    expect(callsFrom('call_live_free', 'choose')).toHaveLength(1);
+  });
+
+  it('suppresses a deleted best free-function match instead of rerouting', () => {
+    expect(callsFrom('call_deleted_free', 'choose')).toHaveLength(0);
+  });
+
+  it('keeps a live member winner callable', () => {
+    expect(targetParameterTypes('call_live_member', 'touch')).toEqual(['int']);
+  });
+
+  it('suppresses a deleted best member match instead of rerouting', () => {
+    expect(callsFrom('call_deleted_member', 'touch')).toHaveLength(0);
+  });
+
+  it('keeps a defaulted constructor callable', () => {
+    expect(callsFrom('call_defaulted_constructor', 'Gadget')).toHaveLength(1);
+  });
+
+  it('ranks a live base-qualified overload declared after a deleted sibling', () => {
+    expect(targetParameterTypes('call_base_qualified_live', 'select')).toEqual(['int']);
+  });
+
+  it('ranks inherited overloads before applying deleted suppression', () => {
+    expect(targetParameterTypes('call_inherited_live', 'select')).toEqual(['int']);
+    expect(callsFrom('call_inherited_deleted', 'select')).toHaveLength(0);
+  });
+
+  it('ranks class-qualified static overloads before applying deleted suppression', () => {
+    expect(targetParameterTypes('call_static_live', 'select')).toEqual(['int']);
+    expect(callsFrom('call_static_deleted', 'select')).toHaveLength(0);
+  });
+
+  it('ranks namespace-qualified overloads before applying deleted suppression', () => {
+    expect(targetParameterTypes('call_namespace_live', 'select')).toEqual(['int']);
+    expect(callsFrom('call_namespace_deleted', 'select')).toHaveLength(0);
+  });
+
+  it('keeps a same-arity defaulted copy constructor callable', () => {
+    expect(callsFrom('call_same_arity_defaulted_constructor', 'DefaultedChoice')).toHaveLength(1);
+  });
+
+  it('records every deleted-winner suppression explicitly', () => {
+    const outcomes = getResolutionOutcomes(result).filter(
+      (outcome) => outcome.kind === 'suppressed' && outcome.reason === 'selected-callable-deleted',
+    );
+    expect(outcomes).toHaveLength(5);
+    expect(outcomes.map((outcome) => outcome.name).sort()).toEqual([
+      'choose',
+      'select',
+      'select',
+      'select',
+      'touch',
+    ]);
   });
 });

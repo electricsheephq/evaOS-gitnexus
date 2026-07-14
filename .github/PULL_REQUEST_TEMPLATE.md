@@ -41,32 +41,9 @@
 - [ ] `cd gitnexus-web && npx tsc -b --noEmit` *(if web changed)*
 - [ ] Manual / Playwright E2E *(note environment — see `gitnexus-web/e2e/`)*
 
-## PR lifecycle
-
-- [ ] Current-head review threads queried: `total=`, `currentActionable=`, `outdated=`
-- [ ] Top-level bot comments, skipped-review/rate-limit notices, and check annotations reviewed separately from review threads
-- [ ] CI/check state reviewed:
-- [ ] Review bot status reviewed:
-- [ ] All P0-P2 actionable review threads fixed, proven false-positive, or explicitly escalated
-- [ ] P3/advisory review threads have terminal disposition
-- [ ] Evidence path / next-agent notes:
-
 ## Risk & rollout
 
 <!-- Breaking changes, migrations, index refresh (`npx gitnexus analyze`), release notes -->
-
-- Release-note impact:
-  - [ ] Human-readable release-note entry included below
-  - [ ] No release-note impact; rationale:
-- Release-proof tier:
-  - [ ] Not release-affecting
-  - [ ] Dev proof
-  - [ ] Release proof
-- User/operator release note:
-  - Outcome summary:
-  - Highlights / changes / fixes:
-  - Breaking changes / migration notes:
-  - Verification and evidence:
 
 ## Checklist
 

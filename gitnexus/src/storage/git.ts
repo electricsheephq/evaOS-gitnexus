@@ -4,6 +4,8 @@ import path from 'path';
 
 // Git utilities for repository detection, commit tracking, and diff analysis
 
+const chompGitOutput = (value: Buffer): string => value.toString().replace(/\r?\n$/, '');
+
 export const isGitRepo = (repoPath: string): boolean => {
   try {
     execSync('git rev-parse --is-inside-work-tree', {
@@ -40,7 +42,7 @@ export const getCurrentCommit = (repoPath: string): string => {
  * Get a stable canonical identifier for the repo's `origin` remote, if any.
  *
  * Used to fingerprint two on-disk clones as the same logical repository
- * (issue #XXX — silent graph drift across sibling clones). `path` alone
+ * (prevents silent graph drift across sibling clones — see #2054). `path` alone
  * is unreliable: worktrees, "clean clone for indexing" hygiene, and
  * multi-agent workspaces routinely have the same repo at multiple
  * absolute paths. The remote URL is the only on-disk signal that
@@ -101,15 +103,21 @@ export const getRemoteUrl = (repoPath: string): string | undefined => {
  * Find the git repository root from any path inside the repo
  */
 export const getGitRoot = (fromPath: string): string | null => {
+  const resolved = path.resolve(fromPath);
+  // Avoid git rev-parse --show-toplevel trimming trailing spaces from the
+  // repository root on Windows; callers that need identity keys canonicalize
+  // this value with realpath before comparing it.
+  if (hasGitDir(resolved)) return resolved;
+
   try {
-    const raw = execSync('git rev-parse --show-toplevel', {
-      cwd: fromPath,
-      // Suppress stderr -- see getCurrentCommit comment and #1172.
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-    })
-      .toString()
-      .trim();
+    const raw = chompGitOutput(
+      execSync('git rev-parse --show-toplevel', {
+        cwd: fromPath,
+        // Suppress stderr -- see getCurrentCommit comment and #1172.
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      }),
+    );
     // On Windows, git returns /d/Projects/Foo — path.resolve normalizes to D:\Projects\Foo
     return path.resolve(raw);
   } catch {
@@ -146,13 +154,13 @@ export const getGitRoot = (fromPath: string): string | null => {
  */
 export const getCanonicalRepoRoot = (fromPath: string): string | null => {
   try {
-    const commonDir = execSync('git rev-parse --path-format=absolute --git-common-dir', {
-      cwd: fromPath,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-    })
-      .toString()
-      .trim();
+    const commonDir = chompGitOutput(
+      execSync('git rev-parse --path-format=absolute --git-common-dir', {
+        cwd: fromPath,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      }),
+    );
     if (!commonDir) return null;
     // Common dir is `<repo>/.git` for both the main checkout and all
     // linked worktrees. Its parent is the canonical repo root.
@@ -287,6 +295,33 @@ export const getDefaultBranch = (repoPath: string): string | null => {
       .trim();
     if (!ref) return null;
     return ref.startsWith('origin/') ? ref.slice('origin/'.length) : ref;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Name of the currently checked-out branch, or `null` when HEAD is detached
+ * (CI checkouts, `git checkout <sha>`), the directory is not a git worktree, or
+ * git is unavailable.
+ *
+ * `git rev-parse --abbrev-ref HEAD` prints the literal `HEAD` for a detached
+ * checkout. We map that (and empty output) to `null` so callers fall back to the
+ * flat/default index rather than ever creating a branch literally named
+ * "HEAD" (#2106).
+ */
+export const getCurrentBranch = (repoPath: string): string | null => {
+  try {
+    const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+      cwd: repoPath,
+      // Suppress stderr -- see getCurrentCommit comment and #1172.
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+      .toString()
+      .trim();
+    if (!branch || branch === 'HEAD') return null;
+    return branch;
   } catch {
     return null;
   }

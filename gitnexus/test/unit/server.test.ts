@@ -12,7 +12,7 @@
  * NOTE: We test the server handler logic by calling the request handlers
  * directly through the MCP Server's handler dispatch.
  */
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -23,10 +23,6 @@ import {
   SHUTDOWN_EXIT_CODES,
 } from '../../src/mcp/server.js';
 import { GITNEXUS_TOOLS } from '../../src/mcp/tools.js';
-
-afterEach(() => {
-  vi.unstubAllEnvs();
-});
 
 // ─── Mock backend ──────────────────────────────────────────────────
 
@@ -45,6 +41,27 @@ function createMockBackend(overrides: Record<string, any> = {}): any {
     disconnect: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
+}
+
+async function callToolThroughServer(
+  backend: ReturnType<typeof createMockBackend>,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<{ text: string; isError: boolean }> {
+  const server = createMCPServer(backend);
+  const client = new Client({ name: 'budget-test-client', version: '0.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+  try {
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const response = await client.callTool({ name, arguments: args });
+    const text = response.content.find((item) => item.type === 'text')?.text;
+    if (typeof text !== 'string') throw new Error('Expected an MCP text response');
+    return { text, isError: response.isError === true };
+  } finally {
+    await client.close();
+    await server.close();
+  }
 }
 
 // ─── createMCPServer ─────────────────────────────────────────────────
@@ -87,211 +104,6 @@ describe('createMCPServer', () => {
       await server.close();
     }
   });
-
-  it('tools/list exposes maxTokens schemas on bounded read tools', async () => {
-    const backend = createMockBackend();
-    const server = createMCPServer(backend);
-    const client = new Client({ name: 'test-client', version: '0.0.0' });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-
-      const response = await client.listTools();
-      for (const name of ['query', 'context', 'impact']) {
-        const tool = response.tools.find((candidate) => candidate.name === name)!;
-        const maxTokens = (tool.inputSchema as any).properties.maxTokens;
-        expect(maxTokens).toEqual({
-          type: 'integer',
-          description: 'Truncate output to N estimated tokens',
-          minimum: 1,
-        });
-      }
-      const queryTool = response.tools.find((candidate) => candidate.name === 'query')!;
-      expect((queryTool.inputSchema as any).properties.rerank).toEqual({
-        type: 'boolean',
-        description:
-          'Use premium reranking when configured for this repo (default: true). Set false for broad state/session/workspace/event discovery or low-overlap retries.',
-        default: true,
-      });
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  it('applies MCP default maxTokens when callers omit maxTokens', async () => {
-    vi.stubEnv('GITNEXUS_MCP_DEFAULT_MAX_TOKENS', '4');
-    const backend = createMockBackend({
-      callTool: vi.fn().mockResolvedValue({
-        message: 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz',
-      }),
-    });
-    const server = createMCPServer(backend);
-    const client = new Client({ name: 'test-client', version: '0.0.0' });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-
-      const response = await client.callTool({
-        name: 'query',
-        arguments: { query: 'auth' },
-      });
-      const text = (response.content as any[])[0].text as string;
-      expect(text).toContain('... (truncated,');
-      expect(text.length).toBeLessThan(120);
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  it('lets explicit maxTokens override the MCP default maxTokens', async () => {
-    vi.stubEnv('GITNEXUS_MCP_DEFAULT_MAX_TOKENS', '4');
-    const backend = createMockBackend({
-      callTool: vi.fn().mockResolvedValue({
-        message: 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz',
-      }),
-    });
-    const server = createMCPServer(backend);
-    const client = new Client({ name: 'test-client', version: '0.0.0' });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-
-      const response = await client.callTool({
-        name: 'query',
-        arguments: { query: 'auth', maxTokens: 100 },
-      });
-      const text = (response.content as any[])[0].text as string;
-      expect(text).toContain('abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz');
-      expect(text).not.toContain('... (truncated,');
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  it('scrubs rejected group routes from the read-only MCP tool surface', async () => {
-    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
-    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'test');
-    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', 'test');
-    const backend = createMockBackend();
-    const server = createMCPServer(backend);
-    const client = new Client({ name: 'test-client', version: '0.0.0' });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-
-      const response = await client.listTools();
-      for (const name of ['query', 'context', 'impact']) {
-        const tool = response.tools.find((candidate) => candidate.name === name)!;
-        expect(tool.description).not.toContain('GROUP MODE');
-        expect(tool.description).not.toContain('@<groupName>');
-        expect(tool.description).toContain('Group mode is unavailable in read-only MCP mode.');
-        const properties = (tool.inputSchema as any).properties;
-        expect(properties.repo.description).toContain('unavailable in read-only MCP mode');
-        expect(properties.repo.description).not.toContain('@<groupName>');
-        expect(properties.maxTokens).toEqual({
-          type: 'integer',
-          description: 'Truncate output to N estimated tokens',
-          minimum: 1,
-        });
-        if (name === 'query') {
-          expect(properties.rerank).toEqual({
-            type: 'boolean',
-            description:
-              'Use premium reranking when configured for this repo (default: true). Set false for broad state/session/workspace/event discovery or low-overlap retries.',
-            default: true,
-          });
-        }
-        expect(properties.service).toBeUndefined();
-        expect(properties.subgroup).toBeUndefined();
-        expect(properties.crossDepth).toBeUndefined();
-      }
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  it('filters group resource templates from read-only MCP listings', async () => {
-    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
-    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'test');
-    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', 'test');
-    const backend = createMockBackend();
-    const server = createMCPServer(backend);
-    const client = new Client({ name: 'test-client', version: '0.0.0' });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-
-      const response = await client.listResourceTemplates();
-      expect(response.resourceTemplates.map((template) => template.uriTemplate)).not.toContain(
-        'gitnexus://group/{name}/contracts',
-      );
-      expect(response.resourceTemplates.map((template) => template.uriTemplate)).not.toContain(
-        'gitnexus://group/{name}/status',
-      );
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  it('rejects hidden write tools before backend dispatch in read-only mode', async () => {
-    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
-    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'test');
-    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', 'test');
-    const backend = createMockBackend();
-    const server = createMCPServer(backend);
-    const client = new Client({ name: 'test-client', version: '0.0.0' });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-
-      const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).not.toContain('rename');
-
-      const response = await client.callTool({
-        name: 'rename',
-        arguments: { oldName: 'oldSymbol', newName: 'newSymbol' },
-      });
-      expect(response.isError).toBe(true);
-      expect((response.content as any[])[0].text).toContain(
-        'Tool "rename" is not available in GitNexus MCP read-only mode.',
-      );
-      expect(backend.callTool).not.toHaveBeenCalled();
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  it('rejects a read-only default repo outside the configured allowlist', () => {
-    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
-    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'gitnexus');
-    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', 'stale-openclaw');
-    const backend = createMockBackend();
-
-    expect(() => createMCPServer(backend)).toThrow(
-      'GitNexus MCP default repo "stale-openclaw" is not in the read-only allow-list.',
-    );
-  });
-
-  it('allows an absolute default repo path through the read-only startup guard', () => {
-    vi.stubEnv('GITNEXUS_MCP_READ_ONLY', '1');
-    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'gitnexus');
-    vi.stubEnv('GITNEXUS_MCP_DEFAULT_REPO', '/Volumes/LEXAR/repos/GitNexus');
-    const backend = createMockBackend();
-
-    expect(() => createMCPServer(backend)).not.toThrow();
-  });
 });
 
 // ─── getNextStepHint (tested indirectly via server tool handler) ──────
@@ -306,12 +118,112 @@ describe('getNextStepHint (via tool call response)', () => {
       callTool: vi.fn().mockResolvedValue({ processes: [], definitions: [] }),
     });
     const server = createMCPServer(backend);
-    expect(server).toBeTruthy();
 
     // We can't easily call handlers directly on the MCP Server,
     // so we verify the handler was registered by creating the server without error.
     // The actual hint logic is tested via the integration path.
     expect(backend.callTool).not.toHaveBeenCalled(); // not called until request
+  });
+});
+
+describe('MCP output budgets', () => {
+  it('leaves the complete formatted response unchanged when no budget is configured', async () => {
+    const previous = process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    try {
+      const backend = createMockBackend({
+        callTool: vi.fn().mockResolvedValue({ payload: 'complete' }),
+      });
+      const { text, isError } = await callToolThroughServer(backend, 'query', {
+        search_query: 'auth',
+      });
+      expect(isError).toBe(false);
+      expect(text).toContain('"payload": "complete"');
+      expect(text).toContain('**Next:**');
+      expect(text.endsWith('\n…')).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+      else process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = previous;
+    }
+  });
+
+  it('applies explicit maxTokens to the complete response deterministically and UTF-8 safely', async () => {
+    const backend = createMockBackend({
+      callTool: vi.fn().mockResolvedValue({ payload: '😀'.repeat(100) }),
+    });
+    const args = { search_query: 'auth', maxTokens: 8 };
+
+    const first = await callToolThroughServer(backend, 'query', args);
+    const second = await callToolThroughServer(backend, 'query', args);
+
+    expect(first.isError).toBe(false);
+    expect(first.text).toBe(second.text);
+    expect(Buffer.byteLength(first.text, 'utf8')).toBeLessThanOrEqual(8 * 4);
+    expect(first.text.endsWith('\n…')).toBe(true);
+    expect(first.text).not.toContain('\uFFFD');
+    expect(backend.callTool).toHaveBeenCalledWith('query', { search_query: 'auth' });
+  });
+
+  it('uses the environment default when maxTokens is omitted', async () => {
+    const previous = process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = '8';
+    try {
+      const backend = createMockBackend({
+        callTool: vi.fn().mockResolvedValue({ payload: 'x'.repeat(200) }),
+      });
+      const { text } = await callToolThroughServer(backend, 'context', { name: 'auth' });
+      expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(8 * 4);
+      expect(text.endsWith('\n…')).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+      else process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = previous;
+    }
+  });
+
+  it('lets an explicit request override the environment default', async () => {
+    const previous = process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = '1';
+    try {
+      const backend = createMockBackend({
+        callTool: vi.fn().mockResolvedValue({ payload: 'complete' }),
+      });
+      const { text } = await callToolThroughServer(backend, 'impact', {
+        target: 'auth',
+        direction: 'upstream',
+        maxTokens: 200,
+      });
+      expect(text).toContain('"payload": "complete"');
+      expect(text).toContain('**Next:**');
+      expect(text.endsWith('\n…')).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+      else process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = previous;
+    }
+  });
+
+  it('rejects a non-positive explicit maxTokens before backend execution', async () => {
+    const backend = createMockBackend();
+    const { text, isError } = await callToolThroughServer(backend, 'query', {
+      search_query: 'auth',
+      maxTokens: 0,
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/maxTokens.*positive integer/i);
+    expect(backend.callTool).not.toHaveBeenCalled();
+  });
+
+  it('applies a valid budget to backend error text', async () => {
+    const backend = createMockBackend({
+      callTool: vi.fn().mockRejectedValue(new Error('😀'.repeat(100))),
+    });
+    const { text, isError } = await callToolThroughServer(backend, 'context', {
+      name: 'auth',
+      maxTokens: 8,
+    });
+    expect(isError).toBe(true);
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(8 * 4);
+    expect(text.endsWith('\n…')).toBe(true);
+    expect(text).not.toContain('\uFFFD');
   });
 });
 

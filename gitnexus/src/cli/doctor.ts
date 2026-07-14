@@ -1,11 +1,29 @@
+import path from 'node:path';
 import { getRuntimeCapabilities, getRuntimeFingerprint } from '../core/platform/capabilities.js';
+import { buildRecoveryPlan, formatRecoveryPlan } from '../core/incremental/recovery-plan.js';
 import { resolveEmbeddingConfig } from '../core/embeddings/config.js';
 import { isHttpMode } from '../core/embeddings/http-client.js';
-import { getLocalEmbeddingRuntimeBlocker } from '../core/embeddings/runtime-support.js';
-import { checkLbugNative } from '../core/lbug/native-check.js';
+import {
+  getLocalEmbeddingRuntimeBlocker,
+  localEmbeddingPrefixUnloadableMessage,
+  localEmbeddingStackMissingMessage,
+} from '../core/embeddings/runtime-support.js';
+import {
+  isPrefixRuntimeLoadable,
+  resolveEmbeddingRuntime,
+  type EmbeddingRuntimeResolution,
+} from '../core/embeddings/runtime-install.js';
+import { cudaRedirectDoctorStatus } from '../core/embeddings/onnxruntime-node-resolver.js';
+import {
+  checkLbugNative,
+  probeFtsExtensionLoad,
+  probeVectorExtensionLoad,
+} from '../core/lbug/native-check.js';
+import { getOsPageSize, isPageSizeAwareLadybug } from '../core/lbug/lbug-config.js';
+import { diagnoseExtensionLoad } from '../core/lbug/extension-load-error.js';
 import { getExtensionInstallPolicy } from '../core/lbug/extension-loader.js';
-import { getStoragePaths, loadMeta, type RepoMeta } from '../storage/repo-manager.js';
 import { getGitRoot } from '../storage/git.js';
+import { getStoragePaths, loadMeta, type RepoMeta } from '../storage/repo-manager.js';
 import { t } from './i18n/index.js';
 
 function isCombiningMark(codePoint: number): boolean {
@@ -67,6 +85,10 @@ export function localEmbeddingDoctorStatus(opts: {
   httpMode: boolean;
   platform?: NodeJS.Platform;
   arch?: NodeJS.Architecture;
+  /** Injectable for tests; defaults to probing the real install. */
+  resolution?: EmbeddingRuntimeResolution | null;
+  /** Injectable for tests; defaults to this Node's registerHooks capability. */
+  prefixLoadable?: boolean;
 }): { status: string; detail: string | null } {
   if (opts.httpMode) {
     return { status: '✓ http endpoint configured', detail: null };
@@ -77,48 +99,119 @@ export function localEmbeddingDoctorStatus(opts: {
   if (blocker) {
     return { status: `✗ local embeddings unavailable on ${platform}/${arch}`, detail: blocker };
   }
+  // The stack is an optionalDependency — npm prunes it when onnxruntime-node's
+  // postinstall can't download its CUDA binaries (proxy/firewall, #2370).
+  const resolution = opts.resolution !== undefined ? opts.resolution : resolveEmbeddingRuntime();
+  if (resolution === null) {
+    return {
+      status: '✗ optional embedding stack not installed',
+      detail: localEmbeddingStackMissingMessage(),
+    };
+  }
+  // A prefix-sourced stack needs module.registerHooks to load; on Node < 22.15 /
+  // < 23.5 it is present but unreachable (#2372). Report loadability, not bare
+  // presence, so the diagnostic stops claiming a ✓ the loader can't honour.
+  const prefixLoadable = opts.prefixLoadable ?? isPrefixRuntimeLoadable();
+  if (resolution.source === 'runtime-prefix' && !prefixLoadable) {
+    return {
+      status: '✗ embedding stack installed in the prefix but not loadable on this Node',
+      detail: localEmbeddingPrefixUnloadableMessage(),
+    };
+  }
   return { status: '✓ local embeddings supported', detail: null };
 }
 
-type RepoMetaWithCapabilities = RepoMeta & {
-  capabilities?: {
-    vectorSearch?: {
-      provider?: string;
-      status?: string;
-      reason?: string;
-      exactScanLimit?: number;
-    };
-  };
-};
+/**
+ * Page-size lines for the `doctor` Runtime section (#1231). Pure so the
+ * warning gate can be unit-tested without running the whole command (the
+ * `localEmbeddingDoctorStatus` precedent above) — but takes the probed
+ * values as plain params rather than injectable probes, because `undefined`
+ * is a *meaningful* pageSize state here (probe unavailable / win32) and
+ * would collide with a "not provided → use default" DI convention.
+ *
+ * Returns 0 lines (page size unknown), 1 line (page size), or 2 lines
+ * (page size + non-4K warning when the installed @ladybugdb/core does not
+ * detect the OS page size at runtime).
+ */
+export function pageSizeDoctorLines(
+  pageSize: number | undefined,
+  ladybugVersion: string | undefined,
+): string[] {
+  if (pageSize === undefined) return [];
+  const lines = [`  ${padDisplayEnd('page size', 10)}${pageSize}`];
+  if (pageSize > 4096 && !isPageSizeAwareLadybug(ladybugVersion)) {
+    // Don't assert "< 0.18.0" as fact when the version is unresolvable
+    // (#2424 review R2) — name the unknown state instead.
+    const versionClause =
+      ladybugVersion === undefined
+        ? 'an unknown @ladybugdb/core version (may predate 0.18.0)'
+        : `@ladybugdb/core < 0.18.0`;
+    lines.push(
+      `  ${padDisplayEnd('', 10)}⚠ non-4K page size with ${versionClause} — ` +
+        `'gitnexus analyze' may fail during COPY (#1231). Upgrade gitnexus (npm install -g gitnexus@latest).`,
+    );
+  }
+  return lines;
+}
 
-export function repoVectorDoctorStatus(meta: RepoMetaWithCapabilities | null | undefined): {
+export function repoVectorDoctorStatus(meta: RepoMeta | null | undefined): {
   status: string;
   detail: string | null;
 } {
-  if (!meta) return { status: 'not indexed in current repo', detail: null };
-  const embeddings = Number(meta.stats?.embeddings ?? 0);
-  if (embeddings <= 0) return { status: 'no embeddings in current repo index', detail: null };
+  if (!meta) return { status: 'not indexed at this path', detail: null };
 
-  const vectorSearch = meta.capabilities?.vectorSearch;
-  const status =
-    typeof vectorSearch?.status === 'string'
-      ? vectorSearch.status
-      : vectorSearch?.provider === 'ladybugdb-vector'
-        ? 'vector-index'
-        : 'exact-scan-extension-missing';
-  const reason = typeof vectorSearch?.reason === 'string' ? vectorSearch.reason : null;
-  const limit =
-    typeof vectorSearch?.exactScanLimit === 'number'
-      ? ` exact scan limit: ${vectorSearch.exactScanLimit} chunks.`
-      : '';
+  const rawEmbeddingCount = Number(meta.stats?.embeddings ?? 0);
+  const embeddingCount =
+    Number.isFinite(rawEmbeddingCount) && rawEmbeddingCount > 0 ? Math.floor(rawEmbeddingCount) : 0;
+  if (embeddingCount <= 0) return { status: 'no embeddings', detail: null };
+
+  const vector = meta.capabilities?.vectorSearch;
+  if (!vector) {
+    return {
+      status: 'unknown (refresh index metadata)',
+      detail: 'Run gitnexus analyze --embeddings to record the current VECTOR index state.',
+    };
+  }
+
+  if (vector.status === 'vector-index') {
+    return { status: `vector-index (${embeddingCount} chunks)`, detail: null };
+  }
+
+  if (vector.status === 'unavailable') {
+    return {
+      status: `unavailable (${embeddingCount} chunks)`,
+      detail: vector.reason ?? 'Semantic vector search is unavailable for this index.',
+    };
+  }
+
+  const reason = vector.reason ? `${vector.reason} ` : '';
+  if (vector.status === 'exact-scan' && embeddingCount > vector.exactScanLimit) {
+    return {
+      status: `exact-scan refused (${embeddingCount} chunks)`,
+      detail:
+        `${reason}${embeddingCount} embedding chunks exceed the exact-scan limit of ` +
+        `${vector.exactScanLimit}; semantic vector results are skipped until the VECTOR index is restored or the limit is deliberately raised.`,
+    };
+  }
 
   return {
-    status,
-    detail: reason ? `${reason}${limit}` : limit.trim() || null,
+    status: `${vector.status} (${embeddingCount} chunks)`,
+    detail: `${reason}Exact-scan limit is ${vector.exactScanLimit} chunks.`.trim(),
   };
 }
 
-export const doctorCommand = async () => {
+export const doctorCommand = async (
+  inputPath?: string,
+  options: { recoveryPlan?: boolean } = {},
+) => {
+  if (options.recoveryPlan) {
+    const repoPath = inputPath
+      ? path.resolve(inputPath)
+      : (getGitRoot(process.cwd()) ?? process.cwd());
+    console.log(formatRecoveryPlan(await buildRecoveryPlan(repoPath)));
+    return;
+  }
+
   const fingerprint = getRuntimeFingerprint();
   const capabilities = getRuntimeCapabilities();
   const embeddingConfig = resolveEmbeddingConfig();
@@ -129,6 +222,13 @@ export const doctorCommand = async () => {
   console.log(`  ${label('doctor.labels.node', 10)}${fingerprint.node}`);
   console.log(`  ${label('doctor.labels.gitnexus', 10)}${fingerprint.gitnexus}`);
   console.log(`  ${label('doctor.labels.ladybugdb', 10)}${fingerprint.ladybugdb ?? 'unknown'}`);
+  // OS page size next to the LadybugDB version because the two interact:
+  // @ladybugdb/core < 0.18.0 assumed 4 KiB pages in its buffer manager and
+  // crashes mid-COPY on 16 KiB/64 KiB-page kernels (#1231). Literal label
+  // (like the 'native' line below) to avoid adding i18n keys.
+  for (const line of pageSizeDoctorLines(getOsPageSize(), fingerprint.ladybugdb)) {
+    console.log(line);
+  }
   const nativeCheck = checkLbugNative();
   if (nativeCheck.ok) {
     console.log(`  ${padDisplayEnd('native', 10)}✓ lbugjs.node loaded`);
@@ -140,8 +240,35 @@ export const doctorCommand = async () => {
   console.log('');
   console.log(t('doctor.capabilities'));
   console.log(`  ${label('doctor.labels.graphStore', 18)}${capabilities.graph}`);
-  console.log(`  ${label('doctor.labels.fullTextSearch', 18)}${capabilities.fts}`);
-  console.log(`  ${label('doctor.labels.vectorIndex', 18)}${capabilities.vector}`);
+  // Live LOAD probe, not the static platform capability — the static value
+  // said "available" while analyze failed to load the extension (#2374).
+  const ftsProbe = nativeCheck.ok
+    ? await probeFtsExtensionLoad()
+    : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
+  console.log(
+    `  ${label('doctor.labels.fullTextSearch', 18)}${ftsProbe.loaded ? 'available' : 'unavailable'}`,
+  );
+  if (!ftsProbe.loaded && ftsProbe.reason) {
+    console.log(`  ${padDisplayEnd('', 18)}${ftsProbe.reason}`);
+    // Add an actionable remedy for recognized failure classes (#2374). The
+    // Windows missing-dependency case is the point of this: the raw error 126
+    // ("specified module could not be found") is opaque, so name the fix (VC++
+    // redist, then OpenSSL) instead of leaving the user to reinstall in vain.
+    // `unknown`'s remedy is "run doctor", which would be circular here.
+    const { kind, remedy } = diagnoseExtensionLoad(ftsProbe.reason);
+    if (kind !== 'unknown') {
+      console.log(`  ${padDisplayEnd('', 18)}${remedy}`);
+    }
+  }
+  const vectorProbe = nativeCheck.ok
+    ? await probeVectorExtensionLoad()
+    : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
+  console.log(
+    `  ${label('doctor.labels.vectorIndex', 18)}${vectorProbe.loaded ? 'available' : 'unavailable'}`,
+  );
+  if (!vectorProbe.loaded && vectorProbe.reason) {
+    console.log(`  ${padDisplayEnd('', 18)}${vectorProbe.reason}`);
+  }
   console.log(`  ${label('doctor.labels.semanticMode', 18)}${capabilities.semanticMode}`);
   // Surface the optional-extension install policy so offline users can see
   // whether analyze/query will reach the network (extension.ladybugdb.com).
@@ -159,12 +286,13 @@ export const doctorCommand = async () => {
   );
   if (capabilities.reason)
     console.log(`  ${label('doctor.labels.note', 18)}${capabilities.reason}`);
-  const repoRoot = getGitRoot(process.cwd()) ?? process.cwd();
+  const requestedPath = inputPath ? path.resolve(inputPath) : process.cwd();
+  const repoRoot = getGitRoot(requestedPath) ?? requestedPath;
   const repoMeta = await loadMeta(getStoragePaths(repoRoot).storagePath).catch(() => null);
   const repoVector = repoVectorDoctorStatus(repoMeta);
   console.log(`  ${padDisplayEnd('Repo VECTOR:', 18)}${repoVector.status}`);
   if (repoVector.detail) {
-    console.log(`  ${padDisplayEnd('Repo VECTOR note:', 18)}${repoVector.detail}`);
+    console.log(`  ${padDisplayEnd('', 18)}${repoVector.detail}`);
   }
   console.log('');
   console.log(t('doctor.embeddings'));
@@ -185,5 +313,15 @@ export const doctorCommand = async () => {
   console.log(`  ${padDisplayEnd('Support:', 12)}${support.status}`);
   if (support.detail) {
     process.stderr.write(`\n${support.detail.replace(/^/gm, '  ')}\n\n`);
+  }
+  // Surface the CUDA-build-redirect decision so "why is my CUDA-13 host
+  // still on CPU" is visible without digging through debug logs (#2341
+  // follow-up). Only meaningful on the local runtime path.
+  if (!isHttpMode()) {
+    const cudaRedirect = cudaRedirectDoctorStatus();
+    console.log(`  ${padDisplayEnd('CUDA:', 12)}${cudaRedirect.status}`);
+    if (cudaRedirect.detail) {
+      console.log(`  ${padDisplayEnd('', 12)}${cudaRedirect.detail}`);
+    }
   }
 };

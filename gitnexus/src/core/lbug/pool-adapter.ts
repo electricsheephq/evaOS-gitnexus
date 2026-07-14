@@ -17,7 +17,7 @@
 
 import fs from 'fs/promises';
 import lbug from '@ladybugdb/core';
-import { isReadOnlyDbError, loadFTSExtension, loadVectorExtension } from './lbug-adapter.js';
+import { isReadOnlyDbError, loadFTSExtension } from './lbug-adapter.js';
 import { closeQueryResults } from './query-result-utils.js';
 import {
   createLbugDatabase,
@@ -26,6 +26,7 @@ import {
   WAL_RECOVERY_SUGGESTION,
 } from './lbug-config.js';
 import {
+  guardWalQuarantine,
   isMissingFsError,
   isMissingShadowSidecarError,
   isReadOnlyShadowReplayError,
@@ -91,7 +92,6 @@ interface SharedDB {
   db: lbug.Database;
   refCount: number;
   ftsLoaded: boolean;
-  vectorLoaded: boolean;
   /** When true, closeOne skips db.close() — the Database is owned externally. */
   external?: boolean;
 }
@@ -103,6 +103,31 @@ const MAX_POOL_SIZE = 5;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 /** Max connections per repo (caps concurrent queries per repo) */
 const MAX_CONNS_PER_REPO = 8;
+
+/**
+ * Repos exempt from AUTOMATIC eviction (LRU + idle timeout) until explicitly
+ * unpinned. Used by bounded multi-repo operations like `group sync`, which
+ * initializes one pool per repo and then resolves cross-repo manifest/workspace
+ * links against ALL of those pools after the init loop. Without pinning, a
+ * group larger than MAX_POOL_SIZE would LRU-evict the earliest repos before
+ * resolution runs, leaving the deferred executor closures pointing at dead pool
+ * entries (issue #2189).
+ *
+ * Pins are REFERENCE-COUNTED: the map holds repoId → active lease count. This
+ * lets overlapping holders (two windows of one sync, or two concurrent
+ * `group sync` calls sharing a repo) coexist safely — the repo stays exempt
+ * until the LAST holder releases. A boolean Set could not represent "two
+ * holders," so the first release would wrongly clear a pin another holder still
+ * needs (PR #2191 review, Finding 1).
+ *
+ * Pins block only automatic eviction (LRU + idle). Explicit teardown
+ * (closeOne / closeLbug) always closes the entry and force-clears its count —
+ * teardown is authoritative. A present key always means count ≥ 1. While every
+ * pooled repo is pinned, evictLRU finds no eligible victim and the pool may
+ * transiently exceed MAX_POOL_SIZE — the same soft-cap behavior that already
+ * occurs when every entry is checked out.
+ */
+const pinnedRepos = new Map<string, number>();
 
 // Behavior-neutral RSS tracing for the FTS evict→reload memory repro
 // (gitnexus/scripts/bench/fts-evict-reload-rss.mjs). Two invariants keep it safe
@@ -146,6 +171,7 @@ function ensureIdleTimer(): void {
   idleTimer = setInterval(() => {
     const now = Date.now();
     for (const [repoId, entry] of pool) {
+      if (pinnedRepos.has(repoId)) continue;
       if (now - entry.lastUsed > IDLE_TIMEOUT_MS && entry.checkedOut === 0) {
         closeOne(repoId);
       }
@@ -168,7 +194,64 @@ export const touchRepo = (repoId: string): void => {
 };
 
 /**
- * Evict the least-recently-used repo if pool is at capacity
+ * Acquire one eviction-exemption lease on a repo (LRU + idle timeout) by
+ * incrementing its reference count. The repoId must match the key passed to
+ * initLbug (e.g. group sync leases by handle.id — the same id it inits with).
+ * Leasing a repoId before it enters the pool is allowed and protects the entry
+ * once it is created, but the lease does NOT survive a teardown: closeOne
+ * force-clears the count, so a later re-init of the same repoId starts
+ * unpinned. Each pinRepo MUST be balanced by exactly one release (the repo
+ * stays exempt until the last lease is released). See the pinnedRepos docstring
+ * for the full contract.
+ *
+ * Returns a `release` disposer (mirroring addPoolCloseListener) that releases
+ * THIS lease exactly once — calling it twice is a no-op, so it can never
+ * over-decrement a sibling holder's count. Prefer the disposer
+ * (`const release = pinRepo(id); try { … } finally { release(); }`) so the
+ * pin/release pair is leak-proof; unpinRepo remains available for callers that
+ * pair explicitly.
+ */
+export const pinRepo = (repoId: string): (() => void) => {
+  pinnedRepos.set(repoId, (pinnedRepos.get(repoId) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    unpinRepo(repoId);
+  };
+};
+
+/**
+ * Release one eviction-exemption lease on a repo. The repo becomes eligible for
+ * automatic eviction again only once its count reaches 0 (the key is deleted).
+ * Idempotent at the floor: releasing a repo with no active lease is a no-op (no
+ * negative counts). Does NOT close the repo's pool.
+ */
+export const unpinRepo = (repoId: string): void => {
+  const count = pinnedRepos.get(repoId);
+  if (count === undefined) return;
+  if (count <= 1) {
+    pinnedRepos.delete(repoId);
+  } else {
+    pinnedRepos.set(repoId, count - 1);
+  }
+};
+
+/**
+ * Maximum number of repos a bounded multi-repo operation (e.g. group sync's
+ * windowed manifest resolution) should hold resident at once. Equals
+ * MAX_POOL_SIZE today, but exposed under an intent-named accessor so callers
+ * size their working set against "max repos a bounded op should hold" rather
+ * than coupling to the LRU eviction-cap constant, which may be tuned
+ * independently.
+ */
+export const getMaxResidentRepos = (): number => MAX_POOL_SIZE;
+
+/**
+ * Evict the least-recently-used repo if pool is at capacity.
+ * Pinned repos are never chosen as the eviction victim — when every eligible
+ * entry is pinned, no eviction occurs and the pool transiently exceeds
+ * MAX_POOL_SIZE (see the pinnedRepos docstring).
  */
 function evictLRU(): void {
   if (pool.size < MAX_POOL_SIZE) return;
@@ -176,6 +259,7 @@ function evictLRU(): void {
   let oldestId: string | null = null;
   let oldestTime = Infinity;
   for (const [id, entry] of pool) {
+    if (pinnedRepos.has(id)) continue;
     if (entry.checkedOut === 0 && entry.lastUsed < oldestTime) {
       oldestTime = entry.lastUsed;
       oldestId = id;
@@ -236,7 +320,6 @@ function closeOne(repoId: string): void {
         // for the same dbPath reuse it instead of hitting a file lock.
         shared.refCount = 0;
         shared.ftsLoaded = false;
-        shared.vectorLoaded = false;
       } else {
         shared.db.close().catch(() => {});
         dbCache.delete(entry.dbPath);
@@ -245,6 +328,11 @@ function closeOne(repoId: string): void {
   }
 
   pool.delete(repoId);
+
+  // Clear any eviction pin — the entry is gone, so the pin is meaningless and
+  // would otherwise leak across operations in a long-lived process. Teardown
+  // is authoritative: an explicit close always wins over a pin.
+  pinnedRepos.delete(repoId);
 
   // Notify listeners AFTER the pool entry is gone so any cache-invalidation
   // they perform is consistent with `isLbugReady(repoId) === false`.
@@ -350,8 +438,14 @@ type TryQuarantineResult = { kind: 'quarantined'; path: string } | { kind: 'peer
  */
 async function tryQuarantineForMissingShadow(
   dbPath: string,
-  opts: { reason: string },
+  opts: { reason: string; err: unknown },
 ): Promise<TryQuarantineResult> {
+  // Refuse (throw) before renaming a live WAL when the shadow is present on
+  // disk or the orphan WAL is too large — parity with the serve path's
+  // refuseLargeWalQuarantine (issue #2382 review, Finding B). Kept OUTSIDE the
+  // try so the actionable recovery message propagates to the MCP caller rather
+  // than being re-wrapped as a rename failure.
+  await guardWalQuarantine(dbPath, opts.reason, opts.err, poolSidecarLogger);
   try {
     const quarantinePath = await quarantineWalForMissingShadow(dbPath, {
       logger: poolSidecarLogger,
@@ -398,6 +492,7 @@ async function replayShadowPagesWithWritableOpen(dbPath: string): Promise<void> 
     if (isMissingShadowSidecarError(err)) {
       await tryQuarantineForMissingShadow(dbPath, {
         reason: 'pool writable replay recovery',
+        err,
       });
       return;
     }
@@ -429,6 +524,7 @@ async function openReadOnlyDatabase(dbPath: string): Promise<lbug.Database> {
         db = undefined;
         await tryQuarantineForMissingShadow(dbPath, {
           reason: 'pool read-only recovery',
+          err,
         });
         await preflightLbugSidecars(dbPath, {
           mode: 'read-only',
@@ -545,7 +641,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     for (let attempt = 1; attempt <= LOCK_RETRY_ATTEMPTS; attempt++) {
       try {
         const db = await openReadOnlyDatabase(dbPath);
-        shared = { db, refCount: 0, ftsLoaded: false, vectorLoaded: false };
+        shared = { db, refCount: 0, ftsLoaded: false };
         dbCache.set(dbPath, shared);
         break;
       } catch (err: any) {
@@ -554,7 +650,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
         if (isWalCorruptionError(lastError)) {
           try {
             const db = await tryQuarantineAndReopen(dbPath, repoId);
-            shared = { db, refCount: 0, ftsLoaded: false, vectorLoaded: false };
+            shared = { db, refCount: 0, ftsLoaded: false };
             dbCache.set(dbPath, shared);
             break;
           } catch (retryErr) {
@@ -567,6 +663,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
 
         if (
           lastError.message.startsWith('LadybugDB checkpoint sidecar is missing') ||
+          lastError.message.startsWith('LadybugDB checkpoint sidecar is present but unreachable') ||
           lastError.message.startsWith('GitNexus could not move the LadybugDB WAL sidecar') ||
           isMissingShadowSidecarError(lastError)
         ) {
@@ -659,13 +756,7 @@ export async function initLbugWithDb(
   // closeOne() respects the external flag and skips db.close().
   let shared = dbCache.get(dbPath);
   if (!shared) {
-    shared = {
-      db: existingDb,
-      refCount: 0,
-      ftsLoaded: false,
-      vectorLoaded: false,
-      external: true,
-    };
+    shared = { db: existingDb, refCount: 0, ftsLoaded: false, external: true };
     dbCache.set(dbPath, shared);
   }
   shared.refCount++;
@@ -787,37 +878,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 export const executeQuery = async (repoId: string, cypher: string): Promise<any[]> => {
   return await executeParameterized(repoId, cypher, {});
-};
-
-/**
- * Load the VECTOR extension on the read-only pool's shared Database.
- *
- * Analyze owns installation/index creation. Query/MCP paths are strictly
- * `load-only`: if VECTOR was not pre-installed on this machine, callers get a
- * clean `false` and can fall back to exact scan with an explicit diagnostic.
- */
-export const ensureVectorExtensionForRepo = async (repoId: string): Promise<boolean> => {
-  const entry = pool.get(repoId);
-  if (!entry) {
-    throw new Error(`LadybugDB not initialized for repo "${repoId}". Call initLbug first.`);
-  }
-
-  entry.lastUsed = Date.now();
-  const shared = dbCache.get(entry.dbPath);
-  if (shared?.vectorLoaded) return true;
-
-  const conn = await checkout(entry);
-  silenceStdout();
-  activeQueryCount++;
-  try {
-    const loaded = await loadVectorExtension(conn, { policy: 'load-only' });
-    if (loaded && shared) shared.vectorLoaded = true;
-    return loaded;
-  } finally {
-    activeQueryCount--;
-    restoreStdout();
-    checkin(entry, conn);
-  }
 };
 
 /**

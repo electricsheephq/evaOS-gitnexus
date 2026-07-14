@@ -22,7 +22,7 @@
  *
  * `extractChangedSubgraph` intentionally does NOT expand the set it is
  * given — expansion is the orchestrator's job, so the SAME expanded set
- * can be fed to both `deleteNodesForFile` and this function (asymmetry
+ * can be fed to both `deleteNodesForFiles` and this function (asymmetry
  * between the delete set and the write set silently corrupts the DB).
  * `computeEffectiveWriteSet` below performs the boundary-crossing 1-hop
  * walk; the orchestrator composes it with its importer-BFS expansion and
@@ -55,6 +55,36 @@ import type { KnowledgeGraph } from '../graph/types.js';
 const isGraphWide = (label: string): boolean => label === 'Community' || label === 'Process';
 
 /**
+ * Relationship types whose VALIDITY is a whole-program property, not a
+ * function of their endpoints' files (#2084 M4 U6). `TAINT_PATH` (cross-
+ * function taint) can be invalidated by a change to an INTERMEDIATE function
+ * on a third file, so the endpoint-writability rule below would skip a stale
+ * A→C edge. These are always extracted (and the orchestrator delete-alls them
+ * first, like Community/Process) so they rebuild from the fresh graph.
+ */
+// `CALL_SUMMARY` (PDG FU-C) is intra-procedural (a callee's RETURN-VALUE ASCENT
+// depends only on its OWN body), but the orchestrator delete-alls it on an
+// incremental `--pdg` writeback to keep the emit path single — so it must be
+// re-included from the FULL fresh graph (which the emit phase recomputes every
+// run) or an unchanged function's summary would be lost. Cheap: one self-loop
+// edge per return-flowing function.
+//
+// `INJECTS` (DI collection injection, #2200) is the same class as TAINT_PATH
+// (the #2084 M4 U6 pattern above): its validity is a whole-program property —
+// a change to a THIRD file (the interface itself, or a new/removed
+// implementer) creates or invalidates edges between two files that were never
+// touched, so the endpoint-writability rule would strand a stale
+// consumer→implementer edge (or miss a new one). Always re-extracted from the
+// fresh graph; the orchestrator unconditionally delete-alls the old rows
+// first (`deleteAllInjects`). Crash-recovery: delete-then-COPY is not atomic
+// by design — a crash between them loses INJECTS edges until the next
+// analyze, and the `incrementalInProgress` dirty flag (saved before any
+// delete) forces a full rebuild on the next run. Temporary absence is
+// possible; duplicates are not.
+const isGraphWideRelType = (type: string): boolean =>
+  type === 'TAINT_PATH' || type === 'CALL_SUMMARY' || type === 'INJECTS';
+
+/**
  * Build a Map<nodeId, filePath> for every File-bound node in the graph.
  * Graph-wide nodes (Community/Process) have no filePath and are filtered.
  */
@@ -84,7 +114,11 @@ export const extractChangedSubgraph = (
   });
 
   fullGraph.forEachRelationship((r: GraphRelationship) => {
-    if (writableNodeIds.has(r.sourceId) || writableNodeIds.has(r.targetId)) {
+    if (
+      writableNodeIds.has(r.sourceId) ||
+      writableNodeIds.has(r.targetId) ||
+      isGraphWideRelType(r.type)
+    ) {
       sub.addRelationship(r);
     }
   });
@@ -100,7 +134,7 @@ export const extractChangedSubgraph = (
  * deleted + rewritten in lockstep with the changed side.
  *
  * Single pass over the edge list. Does NOT mutate `toWriteSet`. The
- * orchestrator MUST feed the returned set to both `deleteNodesForFile`
+ * orchestrator MUST feed the returned set to both `deleteNodesForFiles`
  * and `extractChangedSubgraph` — feeding the unexpanded set to either
  * one leaves stale rows or PK-conflicts at COPY time.
  */

@@ -35,7 +35,12 @@ import type { MethodExtractor } from './method-types.js';
 import type { VariableExtractor } from './variable-types.js';
 import type { ImportResolverFn } from './import-resolvers/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
+import type { CfgVisitor } from './cfg/types.js';
 import type { NodeLabel } from 'gitnexus-shared';
+import type { ExtractedRoute } from './route-extractors/laravel.js';
+import type { SharedSpringType } from './route-extractors/spring-shared.js';
+import type Parser from 'tree-sitter';
+import type { ExtractedDecoratorRoute } from './workers/parse-worker.js';
 
 // ── Shared type aliases ────────────────────────────────────────────────────
 /** Tree-sitter query captures: capture name → AST node (or undefined if not captured). */
@@ -237,10 +242,69 @@ interface LanguageProviderConfig {
     nodeName: string,
     captureMap: CaptureMap,
   ) => string | undefined;
-  /** Detect if a file contains framework route definitions (e.g., Laravel routes.php).
-   *  When true, the worker extracts routes via the language's route extraction logic.
+  /** Detect if a file contains single-file framework route definitions
+   *  (e.g., Laravel `routes/*.php`). When true, the parse worker extracts
+   *  routes from that file in isolation via the worker's route logic.
    *  Default: undefined (no route files). */
   readonly isRouteFile?: (filePath: string) => boolean;
+  /** Discover the root route file(s) for a whole-repo, cross-file routing
+   *  framework (e.g. Django: manage.py → settings → ROOT_URLCONF → root urls.py).
+   *  Runs once on the main thread after all files are scanned. `reader` resolves
+   *  arbitrary repo-relative paths (in-memory map, then disk) so discovery never
+   *  depends on which parse chunk a file landed in. Returns one repo-relative
+   *  path per discoverable project (empty when the framework is absent) — a
+   *  monorepo with several projects yields each project's root.
+   *  Pairs with `extractRoutes`; languages with this hook are skipped by the
+   *  worker's single-file `isRouteFile` path. */
+  readonly discoverRootRouteFiles?: (
+    files: Array<{ path: string; content?: string }>,
+    contentMap?: Map<string, string>,
+    reader?: (relativePath: string) => string | null,
+  ) => string[];
+  /** Extract routes from a root route file, following cross-file includes via
+   *  `reader`. Runs on the main thread (never in the worker, which has no
+   *  filesystem access). `parser` is a tree-sitter parser preloaded with this
+   *  language's grammar, available for re-parsing included files.
+   *  Default: undefined (no route extraction). */
+  readonly extractRoutes?: (
+    tree: Parser.Tree,
+    filePath: string,
+    reader: (relativePath: string) => string | null,
+    parser?: Parser | null,
+  ) => ExtractedRoute[];
+
+  /**
+   * Extract decorator-style route annotations from a parsed file.
+   *
+   * When defined, the parse worker calls this after per-file capture processing
+   * to extract framework route definitions that require AST-level analysis beyond
+   * generic `@decorator` captures (e.g., Java Spring class-level prefix joining,
+   * multi-class handling). The returned routes are appended to `decoratorRoutes`.
+   *
+   * Default: undefined (no language-specific decorator route extraction).
+   */
+  readonly extractDecoratorRoutes?: (
+    tree: Parser.Tree,
+    filePath: string,
+    lineOffset: number,
+  ) => ExtractedDecoratorRoute[];
+
+  /**
+   * Collect a project-wide, language-agnostic view of route-defining
+   * class/interface declarations (`SharedSpringType`) from a parsed file.
+   *
+   * When defined, the parse worker calls this per file and the parse phase
+   * aggregates the results, then runs a cross-file pass that resolves
+   * interface-inherited routes (a concrete controller inherits the `@*Mapping`s
+   * its interfaces declare) and appends them to `decoratorRoutes`. Separate from
+   * `extractDecoratorRoutes` because inheritance needs all files, not one.
+   *
+   * Default: undefined (no interface-inheritance route resolution).
+   */
+  readonly extractRouteInheritanceTypes?: (
+    tree: Parser.Tree,
+    filePath: string,
+  ) => SharedSpringType[];
 
   // ── Noise filtering ────────────────────────────────────────────────
   /** Built-in/stdlib names that should be filtered from the call graph for this language.
@@ -341,6 +405,17 @@ interface LanguageProviderConfig {
    * Default: undefined (provider has no capture-time module-level side effects).
    */
   readonly collectCaptureSideChannel?: (filePath: string) => unknown;
+
+  /**
+   * Per-language control-flow-graph builder (#2081 M1, PDG/taint substrate).
+   * Invoked IN THE PARSE WORKER (where the AST lives) for each function node,
+   * gated on the `--pdg` opt-in; the resulting per-function CFGs are serialized
+   * onto `ParsedFile.cfgSideChannel` and emitted as BasicBlock nodes + CFG
+   * edges during scope-resolution. `TNode` is `SyntaxNode` for the tree-sitter
+   * languages. Default: undefined (language has no CFG support yet — TS/JS are
+   * the M1 set).
+   */
+  readonly cfgVisitor?: CfgVisitor<SyntaxNode>;
 
   /**
    * Interpret a raw `@import.statement` capture group into a `ParsedImport`.

@@ -13,8 +13,13 @@ import os from 'os';
 import { spawn } from 'child_process';
 import v8 from 'v8';
 import cliProgress from 'cli-progress';
+import { isLbugReady, LbugWipeError } from '../core/lbug/lbug-adapter.js';
+import { boundedCheckpointBeforeExit } from '../core/lbug/shutdown-helpers.js';
 import {
+  getOsPageSize,
   isLbugCheckpointIoError,
+  isLbugPageSizeFrameError,
+  isPageSizeAwareLadybug,
   isWalCorruptionError,
   parseWalCheckpointThreshold,
   WAL_RECOVERY_SUGGESTION,
@@ -34,14 +39,36 @@ import {
   validateBranchName,
   GitNexusRcError,
 } from './analyze-config.js';
+import { runFullAnalysis } from '../core/run-analyze.js';
+import { getRuntimeFingerprint } from '../core/platform/capabilities.js';
 import { getMaxFileSizeBannerMessage } from '../core/ingestion/utils/max-file-size.js';
 import { warnMissingOptionalGrammars, getOptionalGrammarExtensions } from './optional-grammars.js';
 import { glob } from 'glob';
 import fs from 'fs/promises';
 import { cliError } from './cli-message.js';
+import { EMBEDDING_DIMS_ERROR, normalizeEmbeddingDims } from './embedding-dims.js';
 import { formatElapsed } from './format-elapsed.js';
 import { isHfDownloadFailure } from '../core/embeddings/hf-env.js';
-import { isLocalEmbeddingRuntimeBlockerMessage } from '../core/embeddings/runtime-support.js';
+import {
+  isHttpEmbeddingDimsError,
+  isHttpEmbeddingError,
+  isHttpMode,
+  safeUrl,
+} from '../core/embeddings/http-client.js';
+import {
+  isLocalEmbeddingRuntimeBlockerMessage,
+  isMissingLocalEmbeddingStackMessage,
+  localEmbeddingPrefixUnloadableMessage,
+  localEmbeddingStackMissingMessage,
+} from '../core/embeddings/runtime-support.js';
+import {
+  ANALYZE_EMBEDDING_INSTALL_TIMEOUT_MS,
+  getEmbeddingInstallTimeoutMs,
+  getEmbeddingRuntimeDir,
+  installEmbeddingRuntime,
+  isPrefixRuntimeLoadable,
+  resolveEmbeddingRuntime,
+} from '../core/embeddings/runtime-install.js';
 import { warnIfNpm11NpxRisk } from './resolve-invocation.js';
 
 // Capture stderr.write at module load BEFORE anything (LadybugDB native
@@ -99,14 +126,17 @@ const installFatalHandlers = (): void => {
   });
 };
 
+/** Historical floor for the re-exec heap cap — the auto-sizer never goes below
+ *  this, so small boxes / CI never regress. */
+const DEFAULT_HEAP_MB = 16384;
+
 /**
  * RAM-aware re-exec heap cap (MB): `0.75 × effective RAM`, clamped to
- * at least 1MB. Kept BELOW physical RAM on purpose — a cap `>=` RAM makes V8
- * collect lazily and inflate the heap into swap-thrash (observed analyzing the
+ * `>= DEFAULT_HEAP_MB`. Kept BELOW physical RAM on purpose — a cap `>=` RAM makes
+ * V8 collect lazily and inflate the heap into swap-thrash (observed analyzing the
  * Linux kernel at a 30GB cap on a 31GB box). `constrainedBytes` is the cgroup
- * limit or `null`; it is honored only as a real, smaller-than-physical cap,
- * because `process.constrainedMemory()` returns a huge sentinel when
- * UNCONSTRAINED.
+ * limit or `null`; it is honored only as a real, smaller-than-physical cap, because
+ * `process.constrainedMemory()` returns a huge sentinel when UNCONSTRAINED.
  */
 export function computeHeapCapMb(totalBytes: number, constrainedBytes: number | null): number {
   const effectiveBytes =
@@ -114,8 +144,7 @@ export function computeHeapCapMb(totalBytes: number, constrainedBytes: number | 
       ? constrainedBytes
       : totalBytes;
   const effectiveMb = Math.floor(effectiveBytes / (1024 * 1024));
-  const effectiveCapMb = Math.floor(0.75 * effectiveMb);
-  return Math.max(1, effectiveCapMb);
+  return Math.max(DEFAULT_HEAP_MB, Math.floor(0.75 * effectiveMb));
 }
 
 function readConstrainedBytes(): number | null {
@@ -551,15 +580,15 @@ const ANALYZE_CLI_ENV_KEYS = [
   'GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS',
   'GITNEXUS_WAL_CHECKPOINT_THRESHOLD',
   'GITNEXUS_WAL_MANUAL_CHECKPOINT',
-  'GITNEXUS_EMBEDDING_URL',
-  'GITNEXUS_EMBEDDING_MODEL',
-  'GITNEXUS_EMBEDDING_API_KEY',
-  'GITNEXUS_EMBEDDING_DIMS',
   'GITNEXUS_EMBEDDING_THREADS',
   'GITNEXUS_EMBEDDING_BATCH_SIZE',
   'GITNEXUS_EMBEDDING_SUB_BATCH_SIZE',
   'GITNEXUS_EMBEDDING_DEVICE',
   'GITNEXUS_ANALYZE_PROGRESS_ACTIVE',
+  'GITNEXUS_EMBEDDING_URL',
+  'GITNEXUS_EMBEDDING_MODEL',
+  'GITNEXUS_EMBEDDING_API_KEY',
+  'GITNEXUS_EMBEDDING_DIMS',
 ] as const;
 
 type AnalyzeEnvSnapshot = Record<(typeof ANALYZE_CLI_ENV_KEYS)[number], string | undefined>;
@@ -580,6 +609,8 @@ const restoreAnalyzeEnv = (snap: AnalyzeEnvSnapshot): void => {
 
 export interface AnalyzeOptions {
   force?: boolean;
+  /** Refuse any analyze path that would require a full DB rebuild. */
+  incrementalOnly?: boolean;
   repairFts?: boolean;
   /**
    * Embedding generation toggle. Commander parses `--embeddings [limit]` as:
@@ -599,8 +630,12 @@ export interface AnalyzeOptions {
   verbose?: boolean;
   /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
   skipAgentsMd?: boolean;
-  /** Skip all AI context writes: AGENTS.md, CLAUDE.md, and bundled GitNexus skills. */
-  skipAiContext?: boolean;
+  /**
+   * Build the control-flow-graph / PDG substrate (#2081 M1). Opt-in; off by
+   * default. Threaded to both the worker (CFG build) and scope-resolution
+   * (BasicBlock/CFG emit).
+   */
+  pdg?: boolean;
   /**
    * Stats inclusion in AGENTS.md and CLAUDE.md.
    *
@@ -622,6 +657,14 @@ export interface AnalyzeOptions {
    * before being threaded into the generated AGENTS.md / CLAUDE.md content.
    */
   defaultBranch?: string;
+  /**
+   * Index-branch selector (#2106). From `--branch`. Distinct from
+   * `defaultBranch` (cosmetic base_ref): this routes the index to a per-branch
+   * slot. NOT sourced from `.gitnexusrc` — the `.gitnexusrc` `branch` key is an
+   * alias for `defaultBranch` and must not change index placement. Defaults to
+   * the checked-out branch inside `runFullAnalysis` when omitted.
+   */
+  branch?: string;
   /** Pure index mode: skip all file injection (AGENTS.md, CLAUDE.md, skills). */
   indexOnly?: boolean;
   /** Index the folder even when no .git directory is present. */
@@ -657,11 +700,22 @@ export interface AnalyzeOptions {
   embeddingBatchSize?: string;
   embeddingSubBatchSize?: string;
   embeddingDevice?: string;
+  /**
+   * Extra fetch-wrapper function names to treat as HTTP consumers (#1589/#1852
+   * residual). Supplied via `.gitnexusrc` `fetchWrappers: [...]`. Threaded into
+   * the routes phase, where the cross-file consumer scan unions them with the
+   * auto-detected `fetch()` wrappers so a custom/axios-based wrapper named
+   * outside the built-in convention still produces `route_map` consumers.
+   */
+  fetchWrappers?: string[];
+  /** OpenAI-compatible embeddings base URL (incl. /v1). Overrides GITNEXUS_EMBEDDING_URL. */
   embeddingBaseUrl?: string;
+  /** Embedding model name. Overrides GITNEXUS_EMBEDDING_MODEL. */
   embeddingModel?: string;
+  /** Bearer token for the embeddings endpoint. Overrides GITNEXUS_EMBEDDING_API_KEY. Never logged. */
   embeddingAuthToken?: string;
+  /** Embedding vector dimensions (positive integer string). Overrides GITNEXUS_EMBEDDING_DIMS. */
   embeddingDims?: string;
-  allowExactScanFallback?: boolean;
 }
 
 /**
@@ -678,10 +732,9 @@ export interface AnalyzeOptions {
  * without booting the full analyze pipeline (#742 review).
  */
 export const shouldGenerateCommunitySkillFiles = (
-  options: Pick<AnalyzeOptions, 'skills' | 'indexOnly' | 'skipAiContext'> | undefined,
+  options: Pick<AnalyzeOptions, 'skills' | 'indexOnly'> | undefined,
   pipelineResult: unknown,
-): boolean =>
-  Boolean(options?.skills && pipelineResult && !options?.indexOnly && !options?.skipAiContext);
+): boolean => Boolean(options?.skills && pipelineResult && !options?.indexOnly);
 
 export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOptions) => {
   if (await ensureHeap()) return;
@@ -709,6 +762,17 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
     await analyzeCommandImpl(inputPath, options);
   } finally {
     restoreAnalyzeEnv(envSnap);
+  }
+  // If analyzeCommandImpl returned via a soft `process.exitCode = 1` error path
+  // while LadybugDB native handles are still open, the event loop won't drain and
+  // the process would HANG (#2264 review P1). The full analyze paths skip-close the
+  // DB — handles are left open and reclaimed by process.exit — so a soft return
+  // after a real analyze must force the exit. The success path never reaches here
+  // (analyzeCommandImpl calls process.exit(0) itself); early-validation errors and
+  // unit tests that mock runFullAnalysis never open the DB, so isLbugReady() is
+  // false and the soft return is preserved.
+  if (isLbugReady()) {
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 1);
   }
 };
 
@@ -770,6 +834,21 @@ const analyzeCommandImpl = async (
     }
   }
 
+  // Validate the index-branch selector (#2106) the same way, so a malformed
+  // `--branch` exits before any expensive analysis starts. Capture the TRIMMED
+  // return so a whitespace-padded value (e.g. " feature" from shell completion)
+  // normalizes before the checked-out-branch mismatch guard and slug — otherwise
+  // it would false-reject on-branch or create a ghost index when detached.
+  if (cliOptions?.branch !== undefined) {
+    try {
+      cliOptions.branch = validateBranchName(cliOptions.branch, '--branch');
+    } catch (err) {
+      cliError(`  ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   // ── Load .gitnexusrc and merge: CLI flags override config (#243) ───
   // Parse/validate before the progress bar so a malformed config produces an
   // actionable error and exits before any expensive analysis starts.
@@ -787,8 +866,7 @@ const analyzeCommandImpl = async (
     // git call. Detection is best-effort and never blocks analyze.
     const cliBranch = cliOptions?.defaultBranch;
     const configBranch = fileConfig?.defaultBranch;
-    const willGenerateContext =
-      !options.indexOnly && !options.skipAiContext && !options.skipAgentsMd;
+    const willGenerateContext = !options.indexOnly && !options.skipAgentsMd;
     let detectedBranch: string | null = null;
     if (
       cliBranch === undefined &&
@@ -920,18 +998,6 @@ const analyzeCommandImpl = async (
     return;
   }
 
-  if (!setPositiveEnv('--embedding-dims', 'GITNEXUS_EMBEDDING_DIMS', options.embeddingDims)) {
-    return;
-  }
-
-  const setTrimmedEnv = (envName: string, value: string | undefined): void => {
-    const trimmed = value?.trim();
-    if (trimmed) process.env[envName] = trimmed;
-  };
-  setTrimmedEnv('GITNEXUS_EMBEDDING_URL', options.embeddingBaseUrl);
-  setTrimmedEnv('GITNEXUS_EMBEDDING_MODEL', options.embeddingModel);
-  setTrimmedEnv('GITNEXUS_EMBEDDING_API_KEY', options.embeddingAuthToken);
-
   if (options.embeddingDevice) {
     const allowed = new Set(['auto', 'cpu', 'dml', 'cuda', 'wasm']);
     if (!allowed.has(options.embeddingDevice)) {
@@ -940,6 +1006,163 @@ const analyzeCommandImpl = async (
       return;
     }
     process.env.GITNEXUS_EMBEDDING_DEVICE = options.embeddingDevice;
+  }
+
+  // --- Custom HTTP embedding endpoint flags (override GITNEXUS_EMBEDDING_* env vars) ---
+  const anyHttpEmbedFlag =
+    options.embeddingBaseUrl !== undefined ||
+    options.embeddingModel !== undefined ||
+    options.embeddingAuthToken !== undefined ||
+    options.embeddingDims !== undefined;
+
+  if (options.embeddingBaseUrl !== undefined) {
+    const url = options.embeddingBaseUrl.trim();
+    if (url.length === 0) {
+      cliError('  --embedding-base-url must not be empty.\n');
+      process.exitCode = 1;
+      return;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      cliError(`  --embedding-base-url is not a valid URL: "${url}".\n`);
+      process.exitCode = 1;
+      return;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      cliError('  --embedding-base-url must use http:// or https://.\n');
+      process.exitCode = 1;
+      return;
+    }
+    // http-client strips trailing slashes; store as given (trimmed).
+    process.env.GITNEXUS_EMBEDDING_URL = url;
+  }
+
+  if (options.embeddingModel !== undefined) {
+    const model = options.embeddingModel.trim();
+    if (model.length === 0) {
+      cliError('  --embedding-model must not be empty.\n');
+      process.exitCode = 1;
+      return;
+    }
+    process.env.GITNEXUS_EMBEDDING_MODEL = model;
+  }
+
+  if (options.embeddingAuthToken !== undefined) {
+    const token = options.embeddingAuthToken.trim();
+    if (token.length === 0) {
+      cliError('  --embedding-auth-token must not be empty.\n');
+      process.exitCode = 1;
+      return;
+    }
+    // Never log the token value.
+    process.env.GITNEXUS_EMBEDDING_API_KEY = token;
+  }
+
+  // Validate + normalize dims through the same shared helper the preAction
+  // hook uses, so the CLI path, this direct/programmatic-call path, schema.ts
+  // (parseInt) and http-client (/^\d+$/) all agree on one canonical value.
+  if (options.embeddingDims !== undefined) {
+    const dims = normalizeEmbeddingDims(options.embeddingDims);
+    if (dims === null) {
+      cliError(`  ${EMBEDDING_DIMS_ERROR}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    process.env.GITNEXUS_EMBEDDING_DIMS = dims;
+  }
+
+  // Custom-endpoint UX, emitting at most ONE message that reflects THIS run's
+  // intent (not ambient env). Order matters — the first matching branch wins:
+  //   1. flags given but --embeddings absent: the endpoint won't be used, so
+  //      say only that (no contradictory "Using…" line).
+  //   2. embeddings enabled + a complete endpoint (flags or env): confirm it,
+  //      masking the URL via safeUrl() since a base URL may carry credentials
+  //      in userinfo (http://user:pass@host) or a query token (?api_key=…)
+  //      that must not land in stdout/CI logs. The auth token is never printed.
+  //   3. embeddings enabled but only one of URL/MODEL supplied via flags:
+  //      http-client.isHttpMode() needs BOTH, so warn about the fallback.
+  // Gating on embeddingsEnabled also stops the old behaviour of printing
+  // "Using custom embedding endpoint" on every analyze run whenever the env
+  // vars happened to be set.
+  if (anyHttpEmbedFlag && !embeddingsEnabled) {
+    console.log(
+      '  Note: --embedding-* flags only apply when --embeddings is also passed; ' +
+        'no embeddings will be generated this run.\n',
+    );
+  } else if (
+    embeddingsEnabled &&
+    process.env.GITNEXUS_EMBEDDING_URL &&
+    process.env.GITNEXUS_EMBEDDING_MODEL
+  ) {
+    console.log(
+      `  Using custom embedding endpoint: ${safeUrl(process.env.GITNEXUS_EMBEDDING_URL)} ` +
+        `(model: ${process.env.GITNEXUS_EMBEDDING_MODEL})\n`,
+    );
+  } else if (
+    embeddingsEnabled &&
+    anyHttpEmbedFlag &&
+    (process.env.GITNEXUS_EMBEDDING_URL || process.env.GITNEXUS_EMBEDDING_MODEL)
+  ) {
+    console.log(
+      '  Note: custom HTTP embeddings require BOTH --embedding-base-url and --embedding-model ' +
+        '(or the matching env vars). Falling back to local ONNX embeddings.\n',
+    );
+  }
+
+  // On-demand embedding runtime (#2370): when the optional stack was pruned at
+  // install time (proxy-blocked NuGet download in onnxruntime-node's
+  // postinstall), heal it here instead of failing later in the pipeline. The
+  // install goes through the user's npm registry config (mirrors/proxies
+  // apply) with --ignore-scripts, so no NuGet download is attempted. Runs
+  // before bar.start() like the sibling validations above.
+  if (embeddingsEnabled && !isHttpMode()) {
+    const resolved = resolveEmbeddingRuntime();
+    // Resolved-but-unloadable (a populated prefix on a Node with no
+    // module.registerHooks), or nothing installed on such a Node: fail fast with
+    // capability guidance instead of dying mid-pipeline over an unusable prefix
+    // or downloading a runtime the loader can't reach. A package-sourced stack
+    // never needs the hook, so it is excluded. --embeddings was explicitly
+    // requested and this failure is deterministic, so fail fast rather than
+    // silently degrading to BM25 (distinct from a transient install timeout).
+    if (!isPrefixRuntimeLoadable() && (resolved === null || resolved.source === 'runtime-prefix')) {
+      cliError(`  ${localEmbeddingPrefixUnloadableMessage().replace(/\n/g, '\n  ')}\n`, {
+        recoveryHint: 'local-embedding-stack-missing',
+      });
+      process.exitCode = 1;
+      return;
+    }
+    // On-demand embedding runtime (#2370): when the optional stack was pruned at
+    // install time (proxy-blocked NuGet download in onnxruntime-node's
+    // postinstall), heal it here instead of failing later in the pipeline. The
+    // install goes through the user's npm registry config (mirrors/proxies
+    // apply) with --ignore-scripts, so no NuGet download is attempted.
+    if (resolved === null) {
+      console.log(
+        `  Local embedding runtime is not installed (optional packages were skipped at install time).\n` +
+          `  Downloading it now from your npm registry into ${getEmbeddingRuntimeDir()} …\n` +
+          `  (one-time; rerun manually anytime with \`gitnexus embeddings install\`)\n`,
+      );
+      try {
+        // Short deadline (env override still wins): analyze is interactive, so a
+        // blackholed proxy must not stall the whole index run for the 10-minute
+        // default — fail over to the guidance below instead.
+        await installEmbeddingRuntime(
+          {},
+          getEmbeddingInstallTimeoutMs(ANALYZE_EMBEDDING_INSTALL_TIMEOUT_MS),
+        );
+        console.log('  Embedding runtime installed.\n');
+      } catch (err) {
+        cliError(
+          `  Could not install the embedding runtime: ${err instanceof Error ? err.message : String(err)}\n\n` +
+            `  ${localEmbeddingStackMissingMessage().replace(/\n/g, '\n  ')}\n`,
+          { recoveryHint: 'local-embedding-stack-missing' },
+        );
+        process.exitCode = 1;
+        return;
+      }
+    }
   }
 
   if (options.repairFts && options.force) {
@@ -951,15 +1174,24 @@ const analyzeCommandImpl = async (
     return;
   }
 
+  if (options.incrementalOnly && (options.force || options.repairFts || options.skills)) {
+    cliError(
+      '  Cannot combine `--incremental-only` with `--force`, `--repair-fts`, or `--skills`. ' +
+        'The preservation contract refuses every option that can require a full rebuild.\n',
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   // `--index-only` is the stronger contract — it suppresses every form of file
   // injection, including community skill writes that `--skills` would normally
   // produce. Surface the override explicitly so users don't wonder why a
   // pipeline re-index ran but no skill files appeared. The pipeline still
   // re-runs (see `force: options.force || options.skills` below); the warning
   // is purely about the dropped post-index write step.
-  if ((options.indexOnly || options.skipAiContext) && options.skills) {
+  if (options.indexOnly && options.skills) {
     console.log(
-      '  Note: --index-only overrides --skills; --skip-ai-context does the same. Community skill files will not be written.\n',
+      '  Note: --index-only overrides --skills; community skill files will not be written.\n',
     );
   }
 
@@ -1035,14 +1267,18 @@ const analyzeCommandImpl = async (
     aborted = true;
     bar.stop();
     console.log('\n  Interrupted — cleaning up...');
-    import('../core/lbug/lbug-adapter.js')
-      .then(({ closeLbug }) => closeLbug())
-      .catch(() => {})
-      .finally(async () => {
+    // Bounded CHECKPOINT-then-exit (#2264 review P3): skip the native close (the
+    // LadybugDB destructor can double-free after --pdg writes), but don't hang
+    // behind a long --pdg COPY holding the connection lock — bound it so a single
+    // Ctrl-C stays responsive; the WAL replays on the next analyze. A second
+    // Ctrl-C (`if (aborted) process.exit(1)` above) remains the escape hatch.
+    void boundedCheckpointBeforeExit({
+      exitCode: 130,
+      beforeExit: async () => {
         const { flushLoggerSync } = await import('../core/logger.js');
         flushLoggerSync();
-        process.exit(130);
-      });
+      },
+    });
   };
   process.on('SIGINT', sigintHandler);
 
@@ -1095,17 +1331,17 @@ const analyzeCommandImpl = async (
 
   // ── Run shared analysis orchestrator ───────────────────────────────
   try {
-    const skipAll = options.indexOnly || options.skipAiContext;
+    const skipAll = options.indexOnly;
     const skipAgentsMd = skipAll || options.skipAgentsMd;
     const skipSkills = skipAll || options.skipSkills;
-    const { runFullAnalysis } = await import('../core/run-analyze.js');
     const result = await runFullAnalysis(
       repoPath,
       {
         // Pipeline re-index — OR'd with --skills because skill generation
         // needs a fresh pipelineResult. Has no bearing on the registry
         // collision guard (see allowDuplicateName below).
-        force: options.force || (options.skills && !skipAll),
+        force: options.force || options.skills,
+        incrementalOnly: options.incrementalOnly,
         repairFts: options.repairFts,
         embeddings: embeddingsEnabled,
         embeddingsNodeLimit,
@@ -1113,11 +1349,16 @@ const analyzeCommandImpl = async (
         verbose: options.verbose,
         skipGit: options.skipGit,
         skipAgentsMd,
-        skipAiContext: skipAll,
         skipSkills,
+        // CFG/PDG substrate opt-in (#2081 M1) — threaded to both sinks downstream.
+        pdg: options.pdg === true,
         // Resolved default branch (CLI > .gitnexusrc > auto-detect > "main")
         // threaded into the generated regression-compare example (#243).
         defaultBranch: resolvedDefaultBranch,
+        // Index-branch selector (#2106). Read straight from the CLI flag (not
+        // the .gitnexusrc-merged options) so the cosmetic defaultBranch config
+        // can never change index placement. Undefined → auto-detect in pipeline.
+        branch: cliOptions?.branch,
         // commander.js `.option('--no-stats', …)` registers the flag as
         // `options.stats` (boolean, default true; `false` when the user
         // passed --no-stats). Reading `options.noStats` here returns
@@ -1130,11 +1371,19 @@ const analyzeCommandImpl = async (
         // be able to accept the duplicate name without also paying the
         // cost of a full pipeline re-index. See #829 review round 2.
         allowDuplicateName: options.allowDuplicateName,
-        allowExactScanFallback: options.allowExactScanFallback,
         // Worker pool size threaded from --workers, replacing the previous
         // GITNEXUS_WORKER_POOL_SIZE env mutation. `undefined` defers to the
         // env / auto-formula fallback inside the pipeline.
         workerPoolSize,
+        // Extra fetch-wrapper names from `.gitnexusrc` (#1589/#1852 residual);
+        // forwarded to the routes phase consumer scan.
+        fetchWrappers: options.fetchWrappers,
+        // The CLI always process.exit()s after this returns (success path at the
+        // end of analyzeCommandImpl, error/interrupt paths via process.exit too),
+        // so the finalize close skips the native conn/db close — it can double-free
+        // in LadybugDB's ClientContext destructor after --pdg writes (#2264). The
+        // CHECKPOINT keeps the index durable; process exit reclaims the handles.
+        skipNativeCloseOnExit: true,
       },
       {
         onProgress: (_phase, percent, message) => {
@@ -1156,14 +1405,21 @@ const analyzeCommandImpl = async (
       // preserving the rest of the block (incl. --skills community rows). No-op
       // when the value already matches, so a routine up-to-date run is silent
       // (#1996 tri-review P2).
+      // Only refresh the repo-root AGENTS.md/CLAUDE.md base_ref for the flat
+      // WORKSPACE index (#2106 R2, #2354). A pinned --branch sub-index's
+      // up-to-date analyze must not churn the committed AGENTS.md — this
+      // mirrors the in-pipeline `if (!placement.branch)` gate around
+      // generateAIContextFiles.
       let baseRefRefreshed: string[] = [];
-      try {
-        const { refreshBaseRefLine } = await import('./ai-context.js');
-        baseRefRefreshed = (
-          await refreshBaseRefLine(repoPath, resolvedDefaultBranch, { skipAgentsMd })
-        ).files;
-      } catch {
-        /* best-effort — never fail the fast path over a context refresh */
+      if (result.isPrimaryBranch !== false) {
+        try {
+          const { refreshBaseRefLine } = await import('./ai-context.js');
+          baseRefRefreshed = (
+            await refreshBaseRefLine(repoPath, resolvedDefaultBranch, { skipAgentsMd })
+          ).files;
+        } catch {
+          /* best-effort — never fail the fast path over a context refresh */
+        }
       }
       clearInterval(elapsedTimer);
       process.removeListener('SIGINT', sigintHandler);
@@ -1259,6 +1515,7 @@ const analyzeCommandImpl = async (
               // Mirror runFullAnalysis `noStats` bridge (#1477) — same expression;
               // exercised on the `--skills` path by analyze-no-stats-bridge.test.ts.
               noStats: options.stats === false,
+              hasPdg: options.pdg === true,
             },
           );
         }
@@ -1378,6 +1635,70 @@ const analyzeCommandImpl = async (
       return;
     }
 
+    // DB-family wipe failure (#2409, tri-review 4669518496 P2-4): the rebuild
+    // could not verify the LadybugDB file family was removed — usually another
+    // process (MCP server, serve worker, antivirus) holding the index open.
+    // Keyed on the error *type* (repo norm from #2385), never message text.
+    // The message itself is fully self-contained (survivor paths + stop-MCP /
+    // AV-exclusion / re-run guidance) because the serve worker forwards only
+    // `err.message` over IPC — this branch just renders it without the
+    // raw-stack fallback below.
+    if (err instanceof LbugWipeError) {
+      cliError(`  ${msg.replace(/\n/g, '\n  ')}\n`, {
+        recoveryHint: 'lbug-wipe-failed',
+      });
+      process.exitCode = 1;
+      return;
+    }
+
+    // Buffer-manager frame-release failure on non-4K-page kernels (#1231).
+    // LadybugDB <= 0.17.x assumed 4 KiB OS pages when releasing evicted
+    // frames; Raspberry Pi 5 (16 KiB kernel pages) and other arm64 systems
+    // crash mid-COPY with a raw native message. 0.18.0 detects the page size
+    // at runtime, so the actionable fix depends on which side of that
+    // boundary the installed @ladybugdb/core is.
+    if (isLbugPageSizeFrameError(err)) {
+      const pageSize = getOsPageSize();
+      const ladybug = getRuntimeFingerprint().ladybugdb;
+      const pageLine =
+        pageSize !== undefined && pageSize !== 4096
+          ? `  Detected OS page size: ${pageSize} bytes (non-4K — e.g. Raspberry Pi 5 16K kernel, Asahi Linux).\n`
+          : '';
+      // The upgrade variant must not assert version facts about an unknown
+      // version — mirror the doctor-side wording rule (#2424 review R2).
+      const upgradeIntro =
+        ladybug === undefined
+          ? `  The installed @ladybugdb/core version is unknown — it may predate the\n` +
+            `  runtime OS-page-size detection added in 0.18.0.\n`
+          : `  The installed @ladybugdb/core (${ladybug}) assumes 4 KiB pages in its buffer\n` +
+            `  manager.\n`;
+      const guidance = isPageSizeAwareLadybug(ladybug)
+        ? `  The installed @ladybugdb/core (${ladybug}) already detects the OS page size at runtime,\n` +
+          `  so this configuration was expected to work. Please report it:\n` +
+          `    https://github.com/abhigyanpatwari/GitNexus/issues/1231\n` +
+          `  and include: gitnexus --version, node --version, getconf PAGE_SIZE, uname -a,\n` +
+          `  and the full error message above.\n`
+        : upgradeIntro +
+          `  Upgrade GitNexus to a release that bundles @ladybugdb/core >= 0.18.0\n` +
+          `  (gitnexus >= 1.6.9), which detects the OS page size at runtime:\n` +
+          `    npm install -g gitnexus@latest\n` +
+          `  Last-resort workaround on Raspberry Pi 5: boot the 4 KiB-page kernel\n` +
+          `  (config.txt: kernel=kernel8.img), at the cost of Pi 5 optimizations.\n`;
+      // Embed the raw native text (indented, no stack) so "the full error
+      // message above" is fulfillable — same idiom as the LbugWipeError
+      // branch. The errno suffix and the 0.18.0 guard's frame/granule numbers
+      // are the discriminating triage content (#2424 review P2).
+      cliError(
+        `  LadybugDB's buffer manager failed to release frame memory.\n` +
+          `    ${msg.replace(/\n/g, '\n    ')}\n` +
+          pageLine +
+          guidance,
+        { recoveryHint: 'lbug-page-size', pageSize, ladybugVersion: ladybug },
+      );
+      process.exitCode = 1;
+      return;
+    }
+
     // Local embedding runtime unsupported on this platform (macOS Intel ships no
     // darwin/x64 ONNX native binding, #1515). The guard threw before importing
     // transformers.js, so this is a clean, actionable GitNexus message. Checked
@@ -1392,10 +1713,75 @@ const analyzeCommandImpl = async (
       return;
     }
 
+    // The optional embedding stack (@huggingface/transformers → onnxruntime-node)
+    // was pruned at install time — usually a proxy-blocked NuGet download during
+    // onnxruntime-node's postinstall (#2370). Checked before the generic
+    // module-not-found "installation may be corrupt" hint below, which would
+    // otherwise misdiagnose a deliberate optional-dependency skip.
+    if (isMissingLocalEmbeddingStackMessage(msg)) {
+      cliError(`  ${msg.replace(/\n/g, '\n  ')}\n`, {
+        recoveryHint: 'local-embedding-stack-missing',
+      });
+      process.exitCode = 1;
+      return;
+    }
+
+    // Malformed GITNEXUS_EMBEDDING_DIMS env var (#2385). readConfig() throws a
+    // plain Error (a config mistake, not an endpoint failure), surfacing here from
+    // httpEmbed()->readConfig() inside the analysis run. Show a clean config
+    // message rather than a raw stack dump. The --embedding-dims CLI flag is
+    // validated up front (EMBEDDING_DIMS_ERROR); this covers the env-var path.
+    // Checked before the endpoint/HF branches: it is a plain Error, so
+    // isHttpEmbeddingError() is false and the HF network heuristic must not claim it.
+    if (isHttpEmbeddingDimsError(msg)) {
+      cliError(`  ${msg.replace(/\n/g, '\n  ')}\n`, {
+        recoveryHint: 'embedding-dims-invalid',
+      });
+      process.exitCode = 1;
+      return;
+    }
+
+    // Custom HTTP embedding endpoint failure (#2385). When a `--embedding-base-url`
+    // is configured, HTTP mode never downloads a model — so a failure talking to
+    // that endpoint must NOT show the huggingface-download guidance. Keyed on the
+    // error *type* (HttpEmbeddingError), not its message text, so it stays correct
+    // regardless of locale or wording. Checked before the HF branch, whose network
+    // heuristic (`fetch failed` / `ECONNREFUSED`) would otherwise also match a
+    // wrapped endpoint-connection error. The header is deliberately neutral: this
+    // type covers both never-reached failures (connection/timeout/DNS) and
+    // reached-but-failed ones (4xx/5xx, dimension/shape mismatch), so it must not
+    // assert "unreachable". The thrown `msg` carries the specific reason (and the
+    // masked URL where one applies), so it is surfaced verbatim.
+    if (isHttpEmbeddingError(err)) {
+      cliError(
+        `  The custom embedding endpoint request failed.\n` +
+          `  ${msg.replace(/\n/g, '\n  ')}\n` +
+          `  Suggestions:\n` +
+          `    1. Verify the endpoint URL is reachable and running ` +
+          `(--embedding-base-url / GITNEXUS_EMBEDDING_URL: host, port, /v1 path).\n` +
+          `    2. Confirm the model name and embedding dimensions match what the endpoint serves.\n` +
+          `    3. Re-run without --embeddings to index without vectors.\n`,
+        { recoveryHint: 'http-embedding-endpoint-error' },
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    // isHttpMode() is a pure presence probe (URL+MODEL) that never throws — a
+    // malformed GITNEXUS_EMBEDDING_DIMS is handled by the dims branch above — so
+    // no defensive try/catch is needed here (#2385).
+    const inHttpMode = isHttpMode();
+
     // HF download failure — show clean guidance without the raw stack trace.
     // Checked before writeFatalToStderr so the user sees one focused message
     // rather than a stack-trace dump followed by a second remediation block.
-    if (isHfDownloadFailure(msg) || msg.includes('Failed to download embedding model')) {
+    // Gated on !inHttpMode: with a custom endpoint configured no model download
+    // is ever attempted, so a network error there is the endpoint's, handled by
+    // the HttpEmbeddingError branch above — never HF's (#2385).
+    if (
+      (isHfDownloadFailure(msg) || msg.includes('Failed to download embedding model')) &&
+      !inHttpMode
+    ) {
       cliError(
         `  The embedding model could not be downloaded.\n` +
           `  huggingface.co may be unreachable from your network\n` +

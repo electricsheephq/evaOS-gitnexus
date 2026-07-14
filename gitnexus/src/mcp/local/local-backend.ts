@@ -15,9 +15,9 @@ import {
   executeParameterized,
   closeLbug,
   isLbugReady,
-  ensureVectorExtensionForRepo,
 } from '../../core/lbug/pool-adapter.js';
 import { isValidQueryParams } from '../../core/lbug/query-params.js';
+import { toDisplayLine } from './line-display.js';
 import { isWalCorruptionError, WAL_RECOVERY_SUGGESTION } from '../../core/lbug/lbug-config.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
@@ -34,12 +34,25 @@ import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
   canonicalizePath,
+  getStoragePaths,
+  loadMeta,
   RegistryAmbiguousTargetError,
   type RegistryEntry,
+  type BranchSummary,
 } from '../../storage/repo-manager.js';
-import { GroupService, type GroupToolPort } from '../../core/group/service.js';
+import {
+  GroupService,
+  type GroupToolPort,
+  type GroupSymbolResolution,
+  type GroupPdgFlowResult,
+  type GroupPdgFlowHop,
+} from '../../core/group/service.js';
 import { resolveAtGroupMemberRepoPath } from '../../core/group/resolve-at-member.js';
 import { collectBestChunks } from '../../core/embeddings/types.js';
+import {
+  DEFAULT_MCP_VECTOR_MAX_DISTANCE,
+  getVectorMaxDistance,
+} from '../../core/embeddings/config.js';
 import {
   rankExactEmbeddingRows,
   type ExactEmbeddingRow,
@@ -50,36 +63,129 @@ import {
   isVectorExtensionSupportedByPlatform,
 } from '../../core/platform/capabilities.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
+import { rerankDocuments, type RerankRuntime } from '../../core/rerank/provider.js';
+import { resolveRerankRuntime } from '../../core/rerank/voyage-provider.js';
+import { ftsDegradedWarning } from '../../core/search/fts-indexes.js';
 import {
-  rerankDocuments,
-  resolveRerankConfig,
-  type RerankConfig,
-} from '../../core/rerank/voyage-reranker.js';
+  cjkSegmentationModeMismatch,
+  containsSegmentableCjkRun,
+  getSearchFTSCjkSegmentation,
+  isSupportedCjkSegmentationMode,
+  MAX_CJK_SEGMENTATION_QUERY_LENGTH,
+} from '../../core/search/cjk-segmentation.js';
 import { checkStalenessAsync, checkCwdMatch } from '../../core/git-staleness.js';
 import { logger } from '../../core/logger.js';
-import { LIST_REPOS_DEFAULT_LIMIT, LIST_REPOS_MAX_LIMIT } from '../tools.js';
-import { mcpDefaultRepo, mcpReadOnlyMode, repoAllowed } from '../config.js';
+import {
+  isLocalEmbeddingRuntimeBlockerMessage,
+  isMissingLocalEmbeddingStackMessage,
+} from '../../core/embeddings/runtime-support.js';
+import {
+  LIST_REPOS_DEFAULT_LIMIT,
+  LIST_REPOS_MAX_LIMIT,
+  EXPLAIN_DEFAULT_LIMIT,
+  EXPLAIN_MAX_LIMIT,
+  PDG_QUERY_DEFAULT_LIMIT,
+  PDG_QUERY_MAX_LIMIT,
+} from '../tools.js';
+import { findImportCycles } from '../../core/graph/import-cycles.js';
+import { decodeTaintPath } from '../../core/ingestion/taint/path-codec.js';
+import { decodeReachingDefReason } from '../../core/ingestion/cfg/reaching-def-reason-codec.js';
+import { EXTENSIONS } from '../../core/ingestion/import-resolvers/utils.js';
+import {
+  fnLineOf,
+  isPdgDegradedLayerStatus,
+  makePdgImpactErrorResult,
+  makePdgLayerDegradedResult,
+  pdgLayerStatus,
+  pdgStampForMode,
+  runImpactPDG,
+  validateImpactMode,
+  pdgBridgeEvidenceForImpact,
+  betterBridgeEvidence,
+  composeUnifiedPdgImpactResult,
+  splitCalleeIds,
+  type ImpactMode,
+  type PdgImpactResult,
+  type PdgImpactErrorResult,
+  type PdgImpactTarget,
+  type PdgBridgeOptions,
+  type PdgBridgeEvidenceInfo,
+  type PdgLayerStatus,
+} from './pdg-impact.js';
+
+/** Real source-file extensions (`.ts`, `.py`, …) from the resolver's list,
+ *  excluding the empty entry and the `/index.*` forms — used to decide whether
+ *  an `explain` target is a file path vs a (possibly dotted) symbol name. */
+const SOURCE_FILE_EXTENSIONS: readonly string[] = EXTENSIONS.filter(
+  (e) => e.startsWith('.') && !e.includes('/'),
+);
+/** A target is path-ish if it has a path separator or ends in a known source
+ *  extension. A bare dotted symbol (`UserController.create`) is NOT path-ish. */
+function looksLikeFilePath(target: string): boolean {
+  if (/[\\/]/.test(target)) return true;
+  const lower = target.toLowerCase();
+  return SOURCE_FILE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+/**
+ * Resolve a string tool param from its canonical name or legacy alias (#2175).
+ * Returns the first NON-BLANK string of [canonical, legacy] — the canonical (new)
+ * name is preferred when it carries a real value, otherwise the legacy value is used.
+ * A blank/whitespace new value therefore does NOT clobber a valid legacy value (e.g. a
+ * gradually-migrating client that always emits the new key, blank when unset). A
+ * non-string value (the MCP envelope is not schema-validated, so clients can send any
+ * JSON type) and an all-blank input resolve to `undefined`, so the caller returns a
+ * friendly required-param error instead of throwing `TypeError` on `.trim()`.
+ */
+function resolveAliasString(canonical: unknown, legacy: unknown): string | undefined {
+  for (const value of [canonical, legacy]) {
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return undefined;
+}
+
+interface StringAliasDefinition {
+  canonical: string;
+  aliases: readonly string[];
+}
+
+const TOOL_STRING_ALIASES: Readonly<Record<string, readonly StringAliasDefinition[]>> = {
+  impact: [{ canonical: 'target', aliases: ['name', 'symbol'] }],
+  context: [{ canonical: 'file_path', aliases: ['file'] }],
+};
+
+function normalizeToolParams(
+  method: string,
+  params: unknown,
+): { params: Record<string, unknown> } | { error: string } {
+  const input = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
+  const definitions = TOOL_STRING_ALIASES[method];
+  if (!definitions) return { params: input };
+
+  const normalized = { ...input };
+  for (const { canonical, aliases } of definitions) {
+    const keys = [canonical, ...aliases];
+    const supplied = keys.flatMap((key) => {
+      const value = input[key];
+      return typeof value === 'string' && value.trim() ? [{ key, value: value.trim() }] : [];
+    });
+    const distinctValues = new Set(supplied.map(({ value }) => value));
+    if (distinctValues.size > 1) {
+      return {
+        error: `Conflicting MCP parameters for ${method}.${canonical}: ${supplied
+          .map(({ key }) => key)
+          .join(', ')} must agree.`,
+      };
+    }
+
+    for (const alias of aliases) delete normalized[alias];
+    if (supplied.length > 0) normalized[canonical] = supplied[0].value;
+  }
+  return { params: normalized };
+}
+
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
-
-const MCP_READ_ONLY_TOOLS = new Set([
-  'list_repos',
-  'query',
-  'context',
-  'impact',
-  'detect_changes',
-  'cypher',
-]);
-
-interface SemanticSearchDegradation {
-  mode: 'exact-scan';
-  reason: string;
-}
-
-interface SemanticSearchOutput {
-  results: any[];
-  degraded?: SemanticSearchDegradation;
-}
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -151,12 +257,41 @@ export const VALID_RELATION_TYPES = new Set([
   'OVERRIDES', // Legacy alias — dual-read for pre-rename indexes
   'METHOD_IMPLEMENTS',
   'ACCESSES',
+  // Emitted by emit-references.ts / scope-resolution/graph-bridge/edges.ts and
+  // already part of the default impact relTypes + context() incoming queries.
+  // It was missing from this allowlist, so `impact({relationTypes:['USES']})`
+  // silently filtered to [] and fell back to the full default traversal
+  // (#2129/#1858 review F5). No IMPACT_RELATION_CONFIDENCE floor → 0.5 fallback,
+  // matching the FETCHES / WRAPS / HANDLES_ROUTE precedent below.
+  'USES',
   'HANDLES_ROUTE',
   'FETCHES',
   'HANDLES_TOOL',
   'ENTRY_POINT_OF',
   'WRAPS',
+  // Emitted by the `di` pipeline phase (#2200 — DI collection injection,
+  // consumer Class → implementer Class). Valid here for explicit
+  // `relationTypes` filters, but deliberately NOT in the default impact()
+  // relTypes nor the context() incoming/outgoing lists — traversal is opt-in,
+  // like WRAPS/FETCHES. Also deliberately NO IMPACT_RELATION_CONFIDENCE entry
+  // (WRAPS/FETCHES precedent): the 0.5 unknown-type floor applies there,
+  // and the edges carry their own confidence (0.8) in the graph.
+  'INJECTS',
 ]);
+
+/**
+ * Relation types the #1858 epistemic-boundary probe keys on. Kept as
+ * module-level `readonly` arrays (not Sets) because computeEpistemicBoundary
+ * binds them as Cypher query params (`r.type IN $heritage` / `IN $types`).
+ * The heritage set is exactly the IMPACT_RELATION_CONFIDENCE 0.85 tier —
+ * "statically verifiable, but the concrete binding past it is not".
+ */
+export const EPISTEMIC_HERITAGE_RELATION_TYPES: readonly string[] = [
+  'IMPLEMENTS',
+  'METHOD_IMPLEMENTS',
+  'EXTENDS',
+];
+export const EPISTEMIC_CONSUMER_RELATION_TYPES: readonly string[] = ['CALLS', 'USES', 'ACCESSES'];
 
 /**
  * Per-relation-type confidence floor for impact analysis.
@@ -198,10 +333,39 @@ export const IMPACT_RELATION_CONFIDENCE: Readonly<Record<string, number>> = {
 const confidenceForRelType = (relType: string | undefined): number =>
   IMPACT_RELATION_CONFIDENCE[relType ?? ''] ?? 0.5;
 
-/** Structured error logging for query failures — replaces empty catch blocks */
+/**
+ * Structured logging for *swallowed* query failures — replaces empty catch
+ * blocks. The level reflects telemetry severity, NOT a promise about the
+ * caller: most callers catch the failure and degrade to a genuinely safe
+ * fallback (a usable result, usually with a caller-visible `partial`/`ftsUsed`
+ * flag), so these are not operation-level errors and must not log at `error`:
+ *
+ *  - A benign missing optional table/label/column — a repo analyzed without
+ *    processes/communities, or a pre-v3 PDG index lacking the `calleeIds`
+ *    column — is a normal configuration, not a failure. Logged at `debug`
+ *    (suppressed at the default `info` level; surfaced only when troubleshooting).
+ *  - Any other swallowed failure is an unexpected-but-handled degradation:
+ *    logged at `warn` so it stays observable without raising a false `error`
+ *    alarm that would drown genuine, operation-aborting failures.
+ *
+ * `error` is intentionally NOT used here — it is reserved for failures that
+ * actually abort an operation, which log directly rather than through this
+ * best-effort-degradation helper.
+ *
+ * Contract for callers (#2283 review): only route a failure here when the
+ * caller ALSO surfaces the degradation in its result (a `partial` flag,
+ * `failed_files`, `traversalComplete:false`, …). A mutating or safety-critical
+ * path that would otherwise report success/clean (e.g. `rename` apply, the
+ * `detect_changes` safety gate) MUST set that result-level signal — `warn`
+ * alone is not a substitute for an honest result.
+ */
 function logQueryError(context: string, err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
-  logger.error({ context, err: msg }, 'GitNexus query failed');
+  if (isBenignMissingTableError(err)) {
+    logger.debug({ context, err: msg }, 'GitNexus query skipped (missing optional data)');
+    return;
+  }
+  logger.warn({ context, err: msg }, 'GitNexus query failed (degraded)');
 }
 
 /**
@@ -214,7 +378,12 @@ function logQueryError(context: string, err: unknown): void {
  */
 function isBenignMissingTableError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
-  return /does not exist|no such (table|label|rel)|unknown (table|label)|not (defined|found)/i.test(
+  // The `not (defined|found)` arm is scoped to a schema object (table/label/
+  // rel/column/property), mirroring lbug-adapter's isMissingColumnError
+  // (`/(table|column|property).*not found/i`): an unscoped "not found" matched
+  // operation failures like `rg: not found` (ripgrep absent) or `Symbol not
+  // found`, which this helper would then silently demote to `debug` (#2283).
+  return /does not exist|no such (table|label|rel)|unknown (table|label)|(table|label|rel|column|property)[^\n]*\bnot (defined|found)\b/i.test(
     msg,
   );
 }
@@ -273,6 +442,10 @@ interface RepoHandle {
   lastCommit: string;
   remoteUrl?: string;
   stats?: RegistryEntry['stats'];
+  /** Primary/flat branch name, when known (#2106). */
+  branch?: string;
+  /** Pinned `--branch` sub-indexes available for this repo, distinct from the flat workspace slot (#2106/#2354). */
+  branches?: BranchSummary[];
 }
 
 /** Resolve symlinks for path comparison; falls back to path.resolve on error.
@@ -365,13 +538,41 @@ export function resolveWorktreeCwd(repoPath: string, launchCwd: string): string 
  */
 export const REPO_ID_HASH_LENGTH = 6;
 
+interface TraceParams {
+  from?: string;
+  from_uid?: string;
+  from_file?: string;
+  to?: string;
+  to_uid?: string;
+  to_file?: string;
+  maxDepth?: number;
+  includeTests?: boolean;
+}
+
 interface ImpactParams {
   target: string;
   target_uid?: string;
   file_path?: string;
   kind?: string;
   direction: 'upstream' | 'downstream';
+  /**
+   * Blast-radius engine (KTD1/KTD5). Absent / `undefined` / `'callgraph'` →
+   * the unchanged inter-procedural symbol→symbol BFS. `'pdg'` → the opt-in,
+   * intra-procedural Program Dependence Graph traversal (`_runImpactPDG`).
+   * Validated in `_impactImpl`; any other value is a hard `{ error }`.
+   */
+  mode?: ImpactMode;
+  /**
+   * Statement anchor for `mode:'pdg'` (1-based source line). When provided, the
+   * PDG traversal seeds the dependence slice on the BasicBlock(s) at THIS line
+   * within the target symbol — answering "what statements depend on the code at
+   * line N?" — instead of the whole-symbol seed (which is empty for a function,
+   * since its intra-procedural reach stays inside its own blocks). Only
+   * meaningful with `mode:'pdg'`; rejected for `mode:'callgraph'`.
+   */
+  line?: number;
   maxDepth?: number;
+  crossDepth?: number;
   relationTypes?: string[];
   includeTests?: boolean;
   minConfidence?: number;
@@ -380,32 +581,40 @@ interface ImpactParams {
   summaryOnly?: boolean;
 }
 
-type MergedQueryCandidate = [
-  string,
-  { score: number; data: any; originalScore?: number; rerankScore?: number; rerankRank?: number },
-];
+/** One route in an `api_impact` result. `executionFlows` are process names. */
+interface ApiImpactRoute {
+  route: string;
+  method: string | null;
+  handler: string;
+  responseShape: { success: string[]; error: string[] };
+  middleware: string[];
+  middlewareDetection?: 'partial';
+  middlewareNote?: string;
+  consumers: Array<{ name: string; file: string; accesses: string[]; attributionNote?: string }>;
+  mismatches?: Array<{
+    consumer: string;
+    field: string;
+    reason: string;
+    confidence: 'high' | 'low';
+  }>;
+  executionFlows: string[];
+  impactSummary: {
+    directConsumers: number;
+    affectedFlows: number;
+    riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
+    warning?: string;
+  };
+}
 
-const UNSAFE_QUERY_RESULT_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
-
-const isSafeQueryResultString = (value: unknown, { allowEmpty = false } = {}): value is string =>
-  typeof value === 'string' &&
-  (allowEmpty || value.trim().length > 0) &&
-  !UNSAFE_QUERY_RESULT_CHARS.test(value);
-
-const isRenderableQueryCandidateData = (data: any): boolean => {
-  if (!data || typeof data !== 'object') return false;
-
-  const nodeId = data.nodeId;
-  const name = data.name;
-  const type = data.type;
-  const filePath = data.filePath;
-
-  if (nodeId !== undefined && !isSafeQueryResultString(nodeId)) return false;
-  if (!isSafeQueryResultString(name)) return false;
-  if (type !== undefined && !isSafeQueryResultString(type, { allowEmpty: true })) return false;
-  if (!isSafeQueryResultString(filePath)) return false;
-  return Boolean(nodeId || filePath);
-};
+/**
+ * `api_impact` is polymorphic by match count: a single matched route returns the
+ * route object directly; two or more return the wrapped `{ routes, total }`
+ * form; any guard failure returns `{ error }`.
+ */
+type ApiImpactResult =
+  | ApiImpactRoute
+  | { routes: ApiImpactRoute[]; total: number }
+  | { error: string };
 
 /**
  * One repository entry as returned by {@link LocalBackend.listRepos} and in each
@@ -421,6 +630,10 @@ export interface RepoListing {
   stats?: any;
   staleness?: { commitsBehind: number; hint?: string };
   siblings?: Array<{ name: string; path: string; lastCommit: string }>;
+  /** Primary/flat branch name, when known (#2106). */
+  branch?: string;
+  /** Pinned `--branch` sub-indexes available for this repo, distinct from the flat workspace slot (#2106/#2354). */
+  branches?: Array<Omit<BranchSummary, 'stats'>>;
 }
 
 /** Continuation metadata for the paginated `list_repos` MCP tool (#2119). */
@@ -491,6 +704,12 @@ export class LocalBackend {
   private initializedRepos: Set<string> = new Set();
   private reinitPromises: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
+  // Last meta.indexedAt observed for an open pool, keyed by lbugPath. Keyed by
+  // pool (not stored on the handle) because branch handles are produced fresh
+  // by applyBranchScope on every resolveRepo call, so mutating the handle would
+  // not persist across calls and the staleness check would reinit forever
+  // (#2106).
+  private lastObservedIndexedAt: Map<string, string> = new Map();
   private groupToolSvc: GroupService | null = null;
   /**
    * One-shot stderr warnings for sibling-clone drift, keyed by
@@ -508,6 +727,23 @@ export class LocalBackend {
    */
   private warnedVectorUnsupported = false;
 
+  /** One-shot diagnostics for a broken/missing HNSW path and bounded fallback. */
+  private warnedVectorQueryFailure = false;
+  private warnedExactScanLimit = false;
+
+  /**
+   * One-shot warning when a pruned or Node-unloadable optional embedding stack
+   * (#2370/#2372) forces semantic search to fall back to BM25 — so the
+   * degradation is visible once instead of silent.
+   */
+  private warnedMissingEmbeddingStack = false;
+
+  constructor(
+    private readonly rerankRuntimeResolver: (
+      repoName: string,
+    ) => RerankRuntime | null = resolveRerankRuntime,
+  ) {}
+
   /**
    * Cross-repo group tools (CLI). Shares logic with MCP `group_*` handlers.
    */
@@ -519,10 +755,180 @@ export class LocalBackend {
         query: (r, p) => this.query(r as RepoHandle, p),
         impactByUid: (id, uid, d, o) => this.impactByUid(id, uid, d, o),
         context: (r, p) => this.context(r as RepoHandle, p),
+        trace: (r, p) => this.traceForGroup(r as RepoHandle, p),
+        resolveSymbol: (r, q) => this.resolveSymbolForGroup(r as RepoHandle, q),
+        pdgFlows: (r, anchor, opts) => this.pdgFlowsForGroup(r as RepoHandle, anchor, opts),
       };
       this.groupToolSvc = new GroupService(port);
     }
     return this.groupToolSvc;
+  }
+
+  /**
+   * Adapt local `trace` to the group port. The assembled group/cross-repo trace
+   * presents 1-based endpoints (via resolveSymbolForGroup), so convert the hop
+   * lines here too — otherwise one response mixes 1-based endpoints with 0-based
+   * hops (#2380). Single-repo `trace` dispatches directly (not through this
+   * port) and stays 0-based (documented full-parity follow-up).
+   */
+  private async traceForGroup(repo: RepoHandle, params: TraceParams): Promise<unknown> {
+    const result = await this.trace(repo, params);
+    const hops = (result as { hops?: Array<{ startLine?: number | null }> }).hops;
+    if (Array.isArray(hops)) {
+      for (const hop of hops) {
+        hop.startLine = toDisplayLine(hop.startLine);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Adapt the shared symbol resolver to the GroupToolPort contract. Used by the
+   * cross-repo trace path to locate which member repo an endpoint lives in and
+   * recover its node id (== bridge `Contract.symbolUid`).
+   */
+  private async resolveSymbolForGroup(
+    repo: RepoHandle,
+    query: { name?: string; uid?: string; file_path?: string },
+  ): Promise<GroupSymbolResolution> {
+    await this.ensureInitialized(repo);
+    const outcome = await this.resolveSymbolCandidates(
+      repo,
+      { uid: query.uid, name: query.name },
+      { file_path: query.file_path },
+    );
+    if (outcome.kind === 'ok') {
+      const s = outcome.symbol;
+      return {
+        kind: 'ok',
+        symbol: {
+          id: s.id,
+          name: s.name,
+          type: s.type,
+          filePath: s.filePath,
+          startLine: toDisplayLine(s.startLine),
+          endLine: toDisplayLine(s.endLine),
+        },
+      };
+    }
+    if (outcome.kind === 'ambiguous') {
+      return {
+        kind: 'ambiguous',
+        candidates: outcome.candidates.map((c) => ({
+          id: c.id,
+          name: c.name,
+          type: c.type,
+          filePath: c.filePath,
+          startLine: toDisplayLine(c.startLine),
+        })),
+      };
+    }
+    return { kind: 'not_found' };
+  }
+
+  /**
+   * Intra-procedural REACHING_DEF data-flow for a single anchor symbol, adapted
+   * to the GroupToolPort contract. Reuses the same anchor + `flows` query as the
+   * `pdg_query` tool. `available:false` (not an error) when the repo has no PDG
+   * `flows` layer, so the cross-repo trace degrades to call-level hops.
+   */
+  private async pdgFlowsForGroup(
+    repo: RepoHandle,
+    anchor: { name?: string; uid?: string; file_path?: string },
+    opts: { limit?: number },
+  ): Promise<GroupPdgFlowResult> {
+    try {
+      await this.ensureInitialized(repo);
+      return await this._pdgFlowsForGroupImpl(repo, anchor, opts);
+    } catch {
+      // Enrichment is auxiliary — never let a PDG query failure fail the trace.
+      return { available: false, hops: [] };
+    }
+  }
+
+  /**
+   * Intra-procedural REACHING_DEF data-flow within the anchor symbol's block
+   * span. Reuses the same anchored, bind-param-only `flows` query as
+   * `pdg_query` (no rel-property index ⇒ the BasicBlock id-prefix + line-span
+   * anchor IS the bound). The anchor is resolved by UID when available (the
+   * boundary symbol is known precisely), avoiding the name-ambiguity the
+   * by-name `resolveBlockAnchor` path can hit. Data flow never crosses the repo
+   * boundary — this only describes how values move toward the boundary call
+   * inside one function.
+   */
+  private async _pdgFlowsForGroupImpl(
+    repo: RepoHandle,
+    anchor: { name?: string; uid?: string; file_path?: string },
+    opts: { limit?: number },
+  ): Promise<GroupPdgFlowResult> {
+    const rawLimit = opts.limit ?? PDG_QUERY_DEFAULT_LIMIT;
+    const limit =
+      Number.isInteger(rawLimit) && rawLimit >= 1 && rawLimit <= PDG_QUERY_MAX_LIMIT
+        ? rawLimit
+        : PDG_QUERY_DEFAULT_LIMIT;
+
+    // Meta probe: layer present iff the flows cap is stamped. `false` is a
+    // definitive absence (degrade to call-level); `undefined` is unreadable
+    // meta (fall through and infer presence from rows found).
+    const pdgStamped = await pdgStampForMode(repo.lbugPath, 'flows');
+    if (pdgStamped === false) return { available: false, hops: [] };
+
+    // Resolve the anchor symbol (UID is precise; fall back to name/file).
+    const resolved = await this.resolveSymbolCandidates(
+      repo,
+      { uid: anchor.uid, name: anchor.name },
+      { file_path: anchor.file_path },
+    );
+    if (resolved.kind !== 'ok') {
+      // Layer may exist but we couldn't anchor — report availability from the
+      // stamp so the caller's note reflects the layer, not the miss.
+      return { available: pdgStamped === true, hops: [] };
+    }
+    const sym = resolved.symbol;
+
+    // Same span-anchored clause as resolveBlockAnchor's symbol branch: the
+    // BasicBlock startLine is 1-based vs the 0-based symbol span, so shift both
+    // bounds +1. `idPrefix`/`symStart`/`symEnd` are bind params; the edge type
+    // is a hardcoded literal — no user string is ever interpolated.
+    const hasSpan =
+      typeof sym.startLine === 'number' &&
+      typeof sym.endLine === 'number' &&
+      sym.endLine >= sym.startLine;
+    const idPrefix = `BasicBlock:${sym.filePath}:`;
+    const anchorClause = hasSpan
+      ? 'a.id STARTS WITH $idPrefix AND a.startLine >= $symStart AND a.startLine <= $symEnd'
+      : 'a.id STARTS WITH $idPrefix';
+    const queryParams: Record<string, unknown> = hasSpan
+      ? { idPrefix, symStart: sym.startLine + 1, symEnd: sym.endLine + 1 }
+      : { idPrefix };
+
+    const rows = await executeParameterized(
+      repo.lbugPath,
+      `MATCH (a:BasicBlock)-[r:CodeRelation]->(b:BasicBlock)
+       WHERE r.type = 'REACHING_DEF' AND ${anchorClause}
+       RETURN a.startLine AS defLine, b.startLine AS useLine, b.text AS useText, r.reason AS reason
+       ORDER BY useLine, defLine, reason
+       LIMIT ${limit + 1}`,
+      queryParams,
+    );
+
+    const truncated = rows.length > limit;
+    const capped = truncated ? rows.slice(0, limit) : rows;
+    const hops: GroupPdgFlowHop[] = capped.map((r: Record<string, unknown>) => ({
+      // Number()/String() coerce the LadybugDB object/tuple cell; a bare
+      // `as number` cast on a nullish cell would surface NaN downstream.
+      line: Number(r.useLine ?? r[1] ?? 0),
+      text: String(r.useText ?? r[2] ?? '').trim(),
+      variable: decodeReachingDefReason(String(r.reason ?? r[3] ?? '')).name || undefined,
+    }));
+
+    const available = pdgStamped === true || hops.length > 0;
+    return {
+      available,
+      ...(hops[0]?.variable ? { variable: hops[0].variable } : {}),
+      hops,
+      ...(truncated ? { truncated: true } : {}),
+    };
   }
 
   /** Close all pooled LadybugDB connections (CLI one-shot; optional for long-lived MCP). */
@@ -600,6 +1006,8 @@ export class LocalBackend {
         lastCommit: entry.lastCommit,
         remoteUrl: entry.remoteUrl,
         stats: entry.stats,
+        branch: entry.branch,
+        branches: entry.branches,
       };
 
       nextRepos.set(id, handle);
@@ -625,12 +1033,30 @@ export class LocalBackend {
     // the resolve→query wrong-clone window for good (#2067). Only a path that
     // dropped out of the registry must release its pooled connection + state.
     const liveLbugPaths = new Set([...nextRepos.values()].map((h) => h.lbugPath));
-    for (const prev of this.repos.values()) {
-      if (liveLbugPaths.has(prev.lbugPath)) continue;
-      this.initializedRepos.delete(prev.lbugPath);
-      this.lastStalenessCheck.delete(prev.lbugPath);
-      this.reinitPromises.delete(prev.lbugPath);
-      closeLbug(prev.lbugPath).catch(() => {});
+    // Branch pools (opened on demand by applyBranchScope) are NOT in this.repos
+    // — branch handles are minted fresh and discarded — so add every registered
+    // branch's lbugPath to the live set. Pure string work over the already-in-
+    // memory registry snapshot; no disk I/O on this hot path (#2106 R3).
+    for (const entry of entries) {
+      for (const b of entry.branches ?? []) {
+        liveLbugPaths.add(getStoragePaths(entry.path, b.branch).lbugPath);
+      }
+    }
+    // initializedRepos is the authoritative set of OPENED pool keys (flat AND
+    // branch); union it with the previously-known flat handles so an orphaned
+    // branch pool (e.g. after `clean --branch` removes its summary) is closed
+    // and forgotten too, not just flat handles.
+    const knownKeys = new Set<string>([
+      ...[...this.repos.values()].map((h) => h.lbugPath),
+      ...this.initializedRepos,
+    ]);
+    for (const key of knownKeys) {
+      if (liveLbugPaths.has(key)) continue;
+      this.initializedRepos.delete(key);
+      this.lastStalenessCheck.delete(key);
+      this.lastObservedIndexedAt.delete(key);
+      this.reinitPromises.delete(key);
+      closeLbug(key).catch(() => {});
     }
 
     this.repos = nextRepos;
@@ -711,19 +1137,18 @@ export class LocalBackend {
    * On a miss, re-reads the registry once in case a new repo was indexed
    * while the MCP server was running.
    */
-  async resolveRepo(repoParam?: string): Promise<RepoHandle> {
-    const effectiveRepo = repoParam || mcpDefaultRepo();
+  async resolveRepo(repoParam?: string, branch?: string): Promise<RepoHandle> {
     let refreshedAfterAmbiguity = false;
     let result: RepoHandle | null;
     try {
-      result = this.resolveRepoFromCache(effectiveRepo);
+      result = this.resolveRepoFromCache(repoParam);
     } catch (err) {
       if (!(err instanceof RegistryAmbiguousTargetError)) throw err;
       // Stale in-memory duplicate siblings can linger after unregister; refresh
       // once before re-throwing so a resolved registry can disambiguate (#1658).
       await this.refreshRepos();
       refreshedAfterAmbiguity = true;
-      result = this.resolveRepoFromCache(effectiveRepo);
+      result = this.resolveRepoFromCache(repoParam);
     }
 
     if (result) {
@@ -736,26 +1161,22 @@ export class LocalBackend {
       this.maybeWarnSiblingDrift(result).catch(() => {
         /* best-effort; never throw from resolveRepo */
       });
-      return result;
+      return this.applyBranchScope(result, branch);
     }
 
     // Miss — refresh registry and try once more (skip if already refreshed above)
     if (!refreshedAfterAmbiguity) {
       await this.refreshRepos();
     }
-    const retried = this.resolveRepoFromCache(effectiveRepo);
+    const retried = this.resolveRepoFromCache(repoParam);
     if (retried) {
       this.maybeWarnSiblingDrift(retried).catch(() => {});
-      return retried;
+      return this.applyBranchScope(retried, branch);
     }
 
     // Still no match — throw with helpful message
-    const visibleHandles = this.visibleRepoHandles();
     if (this.repos.size === 0) {
       throw new Error('No indexed repositories. Run: gitnexus analyze');
-    }
-    if (visibleHandles.length === 0) {
-      throw new Error('No repositories match the configured GitNexus MCP allow-list.');
     }
 
     // Build a disambiguated "Available: …" list (#829). When two handles
@@ -763,19 +1184,137 @@ export class LocalBackend {
     // caller can actually pick the right one. Single-name entries render
     // identically to pre-#829 output.
     const nameCounts = new Map<string, number>();
-    for (const h of visibleHandles) {
+    for (const h of this.repos.values()) {
       const key = h.name.toLowerCase();
       nameCounts.set(key, (nameCounts.get(key) ?? 0) + 1);
     }
-    const labels = visibleHandles.map((h) =>
+    const labels = [...this.repos.values()].map((h) =>
       (nameCounts.get(h.name.toLowerCase()) ?? 0) > 1 ? `${h.name} (${h.repoPath})` : h.name,
     );
 
-    if (effectiveRepo) {
-      throw new Error(`Repository "${effectiveRepo}" not found. Available: ${labels.join(', ')}`);
+    if (repoParam) {
+      throw new Error(`Repository "${repoParam}" not found. Available: ${labels.join(', ')}`);
     }
     throw new Error(
       `Multiple repositories indexed. Specify which one with the "repo" parameter. Available: ${labels.join(', ')}`,
+    );
+  }
+
+  /**
+   * Re-point a resolved repo handle at a specific branch index (#2106).
+   *
+   * - No `branch` (default) → the flat workspace handle, unchanged (backward
+   *   compatible: every existing caller passes no branch).
+   * - `branch` equal to the flat slot's **on-disk** recorded branch → the
+   *   flat handle. The disk meta is read before any cached state is trusted
+   *   (#2364 review F1): the flat slot follows the checked-out working tree
+   *   (#2354), so a plain analyze after a branch switch restamps the meta
+   *   without any repo-resolution miss that would refresh a long-lived
+   *   server's cached handle — the cached label can otherwise serve another
+   *   branch's content under the old name (the pool staleness reinit
+   *   hot-swaps content without updating `handle.branch`).
+   * - `branch` matching an indexed pinned branch → a handle whose
+   *   `lbugPath` points at `branches/<slug>/lbug`; the connection pool keys by
+   *   `lbugPath`, so this is the only change needed to scope every tool. The
+   *   sub-index lbug must actually exist on disk — `adoptFlatBranchLabel`
+   *   deletes the whole dir when the flat slot takes ownership, and a stale
+   *   cached summary must not route to the deleted path.
+   * - Cached `handle.branch` is trusted only when there is no readable flat
+   *   meta to contradict it (legacy shapes, #2106 R4).
+   * - Any miss → a clear error (never a silently-empty result against the
+   *   wrong DB), after exactly one `refreshRepos()` so newly-pinned branches
+   *   and restamped labels the cached handle predates resolve on the next
+   *   call.
+   */
+  private async applyBranchScope(handle: RepoHandle, branch?: string): Promise<RepoHandle> {
+    if (!branch) return handle;
+    // At most one cache refresh per resolution: enough for the NEXT call to
+    // see fresh handles, without paying two registry re-scans when several
+    // stale arms fire in one degraded resolution.
+    let refreshed = false;
+    const refreshOnce = async (): Promise<void> => {
+      if (refreshed) return;
+      refreshed = true;
+      await this.refreshRepos().catch(() => {});
+    };
+    // One small JSON read per scoped call; mid-run meta writes preserve the
+    // old label until the end-of-run atomic stamp (run-analyze dirty stamps
+    // spread the existing meta), so this read never runs ahead of the DB.
+    const flatMeta = await loadMeta(path.dirname(handle.lbugPath));
+    if (flatMeta?.branch && flatMeta.branch === branch) {
+      // The disk meta decides routing, so it also supplies the metadata —
+      // the cached handle's label/commit/stats can predate the restamp.
+      return {
+        ...handle,
+        branch: flatMeta.branch,
+        indexedAt: flatMeta.indexedAt ?? handle.indexedAt,
+        lastCommit: flatMeta.lastCommit ?? handle.lastCommit,
+        stats: flatMeta.stats ?? handle.stats,
+      };
+    }
+
+    // A registry entry claiming `branch` both as the flat label AND as a
+    // pinned summary is an adopt-degraded state (rm kept the summary while
+    // the label restamped) — never serve the possibly stale-vintage pin for
+    // a label the flat slot claims; fall through to the honest error.
+    const summary =
+      handle.branch !== branch ? handle.branches?.find((b) => b.branch === branch) : undefined;
+    if (summary) {
+      const { lbugPath } = getStoragePaths(handle.repoPath, branch);
+      // The lbug is the artifact the pool opens, so its presence is the
+      // serviceability truth — a half-deleted dir can outlive its meta.json
+      // while the lbug is gone, and vice versa (#2364 review F1 arm ii).
+      // Only provably-absent errno counts as missing: a transient EACCES/EIO
+      // on a healthy pinned sub-index must serve the handle (the pool open
+      // surfaces the real error) rather than a false "not indexed".
+      const probeCode = await fs.access(lbugPath).then(
+        () => null,
+        (e: unknown) => (e as NodeJS.ErrnoException)?.code ?? 'UNKNOWN',
+      );
+      const subIndexMissing = probeCode === 'ENOENT' || probeCode === 'ENOTDIR';
+      if (!subIndexMissing) {
+        return {
+          ...handle,
+          lbugPath,
+          indexedAt: summary.indexedAt,
+          lastCommit: summary.lastCommit,
+          stats: summary.stats,
+        };
+      }
+      // Stale summary (sub-index adopted/deleted): refresh so later calls see
+      // fresh handles, then fall through — the flat meta above is the truth.
+      await refreshOnce();
+    }
+
+    if (handle.branch && handle.branch === branch) {
+      // No readable flat meta (missing/corrupt — loadMeta → null): keep the
+      // pre-#2354 trust in the cached label (#2106 R4 legacy shapes). A
+      // readable meta that names another branch means the label is stale.
+      if (!flatMeta?.branch) return handle;
+    }
+
+    // Every miss refreshes once before erroring: newly-pinned branches and
+    // restamped labels the cached handle predates become resolvable on the
+    // caller's next attempt (the cache otherwise only refreshes on repo-
+    // resolution misses and list_repos).
+    await refreshOnce();
+
+    // The flat slot's label comes from the authoritative meta when readable —
+    // never echo a cached label the meta just contradicted (a "not indexed:
+    // main / indexed: main" self-contradiction). Cached summaries may still
+    // lag; they are a hint, not a promise.
+    const flatLabel = flatMeta?.branch ?? handle.branch;
+    const indexed = [flatLabel, ...(handle.branches?.map((b) => b.branch) ?? [])].filter(
+      (b) => Boolean(b) && b !== branch,
+    );
+    const available = indexed.length > 0 ? indexed.join(', ') : '(workspace only)';
+    // Post-#2354 a bare `analyze --branch <X>` refuses to run unless X is
+    // checked out, so the guidance must lead with the checkout (#2364 F6).
+    throw new Error(
+      `Branch "${branch}" is not indexed for "${handle.name}". ` +
+        `Indexed branches: ${available}. The workspace index follows the ` +
+        `checked-out branch — check out "${branch}" and re-run: gitnexus analyze ` +
+        `(add --branch ${branch} while it is checked out to pin a separate sub-index).`,
     );
   }
 
@@ -785,8 +1324,7 @@ export class LocalBackend {
    * multiple handles by name and cwd cannot disambiguate (#1658).
    */
   private resolveRepoFromCache(repoParam?: string): RepoHandle | null {
-    const entries = this.visibleRepoEntries();
-    if (entries.length === 0) return null;
+    if (this.repos.size === 0) return null;
 
     if (repoParam) {
       const paramLower = repoParam.toLowerCase();
@@ -795,14 +1333,12 @@ export class LocalBackend {
 
       const resolvePathMatch = (): RepoHandle | undefined => {
         const canonicalTarget = canonicalizePath(repoParam);
-        return entries
-          .map(([, handle]) => handle)
-          .find((handle) => {
-            const stored = canonicalizePath(handle.repoPath);
-            return process.platform === 'win32'
-              ? stored.toLowerCase() === canonicalTarget.toLowerCase()
-              : stored === canonicalTarget;
-          });
+        return [...this.repos.values()].find((handle) => {
+          const stored = canonicalizePath(handle.repoPath);
+          return process.platform === 'win32'
+            ? stored.toLowerCase() === canonicalTarget.toLowerCase()
+            : stored === canonicalTarget;
+        });
       };
 
       // Path-like params first (absolute or contains separators) — aligns with
@@ -815,9 +1351,9 @@ export class LocalBackend {
 
       // Exact name before id — the first duplicate sibling keeps id === name
       // (e.g. id "shared"), so a name lookup must not be captured by the id tier.
-      const nameMatches = entries
-        .map(([, handle]) => handle)
-        .filter((handle) => handle.name.toLowerCase() === paramLower);
+      const nameMatches = [...this.repos.values()].filter(
+        (handle) => handle.name.toLowerCase() === paramLower,
+      );
       if (nameMatches.length === 1) return nameMatches[0];
       if (nameMatches.length > 1) {
         const cwdPick = this.pickRepoHandleForCwd(nameMatches);
@@ -829,8 +1365,7 @@ export class LocalBackend {
       }
 
       // Stable hashed id (e.g. "shared-abc123") from repoId() collision suffix
-      const byId = entries.find(([id]) => id === paramLower);
-      if (byId) return byId[1];
+      if (this.repos.has(paramLower)) return this.repos.get(paramLower)!;
 
       // Bare name resolved as a cwd-relative path (e.g. "myrepo" against process.cwd()),
       // after name/id tiers. Path-like strings with separators were handled at the top.
@@ -840,27 +1375,19 @@ export class LocalBackend {
       }
 
       // Partial name — only when unambiguous
-      const partialMatches = entries
-        .map(([, handle]) => handle)
-        .filter((handle) => handle.name.toLowerCase().includes(paramLower));
+      const partialMatches = [...this.repos.values()].filter((handle) =>
+        handle.name.toLowerCase().includes(paramLower),
+      );
       if (partialMatches.length === 1) return partialMatches[0];
 
       return null;
     }
 
-    if (entries.length === 1) {
-      return entries[0]![1];
+    if (this.repos.size === 1) {
+      return this.repos.values().next().value!;
     }
 
     return null; // Multiple repos, no param — ambiguous
-  }
-
-  private visibleRepoEntries(): Array<[string, RepoHandle]> {
-    return [...this.repos.entries()].filter(([, handle]) => repoAllowed(handle.name));
-  }
-
-  private visibleRepoHandles(): RepoHandle[] {
-    return this.visibleRepoEntries().map(([, handle]) => handle);
   }
 
   /**
@@ -924,10 +1451,19 @@ export class LocalBackend {
 
       this.lastStalenessCheck.set(poolKey, now);
       try {
-        const metaPath = path.join(repo.storagePath, 'meta.json');
-        const metaRaw = await fs.readFile(metaPath, 'utf-8');
-        const meta = JSON.parse(metaRaw);
-        if (meta.indexedAt && meta.indexedAt !== repo.indexedAt) {
+        // Read the metadata that sits next to THIS handle's lbug. For the
+        // flat/primary handle this is `<storagePath>/gitnexus.json`; for a
+        // branch handle it is `<storagePath>/branches/<slug>/gitnexus.json`.
+        // loadMeta falls back to legacy meta.json during migration.
+        // Reading the flat meta for a branch handle would compare the branch
+        // index's indexedAt against the primary's and thrash the pool (#2106).
+        const meta = await loadMeta(path.dirname(repo.lbugPath));
+        if (!meta) return;
+        // Compare against the last indexedAt OBSERVED for this pool (keyed by
+        // lbugPath), not the handle's — branch handles are fresh spreads so a
+        // handle mutation would not persist and would reinit on every check.
+        const observed = this.lastObservedIndexedAt.get(poolKey) ?? repo.indexedAt;
+        if (meta.indexedAt && meta.indexedAt !== observed) {
           // Index was rebuilt — close stale connection and re-init.
           // Wrap in reinitPromises to prevent TOCTOU race where concurrent
           // callers both detect staleness and double-close the pool.
@@ -935,7 +1471,7 @@ export class LocalBackend {
             try {
               await closeLbug(poolKey);
               this.initializedRepos.delete(poolKey);
-              repo.indexedAt = meta.indexedAt;
+              this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
               await initLbug(poolKey, repo.lbugPath);
               this.initializedRepos.add(poolKey);
             } finally {
@@ -955,6 +1491,7 @@ export class LocalBackend {
     try {
       await initLbug(poolKey, repo.lbugPath);
       this.initializedRepos.add(poolKey);
+      this.lastObservedIndexedAt.set(poolKey, repo.indexedAt);
     } catch (err: any) {
       // If lock error, mark as not initialized so next call retries
       this.initializedRepos.delete(poolKey);
@@ -992,7 +1529,7 @@ export class LocalBackend {
    */
   async listRepos(): Promise<RepoListing[]> {
     await this.refreshRepos();
-    const handles = this.visibleRepoHandles();
+    const handles = [...this.repos.values()];
 
     // Pre-group registered handles by `remoteUrl` so the sibling
     // lookup is O(1) per handle. We reuse the in-memory `this.repos`
@@ -1038,6 +1575,15 @@ export class LocalBackend {
                 name: s.name,
                 path: s.repoPath,
                 lastCommit: s.lastCommit,
+              }))
+            : undefined,
+        branch: h.branch,
+        branches:
+          h.branches && h.branches.length > 0
+            ? h.branches.map((b) => ({
+                branch: b.branch,
+                indexedAt: b.indexedAt,
+                lastCommit: b.lastCommit,
               }))
             : undefined,
       };
@@ -1156,10 +1702,6 @@ export class LocalBackend {
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
   async callTool(method: string, params: any): Promise<any> {
-    if (mcpReadOnlyMode() && !MCP_READ_ONLY_TOOLS.has(method)) {
-      throw new Error(`Tool "${method}" is not available in GitNexus MCP read-only mode.`);
-    }
-
     if (method === 'list_repos') {
       // Paginated tool surface (#2119). `listRepos()` is unchanged for internal
       // callers; the tool wraps it in { repositories, pagination } and forwards
@@ -1168,77 +1710,122 @@ export class LocalBackend {
     }
 
     if (method.startsWith('group_')) {
-      if (mcpReadOnlyMode()) {
-        throw new Error('Group mode is not available in GitNexus MCP read-only mode.');
-      }
       return this.handleGroupTool(method, params || {});
     }
 
-    const p = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
-    if (mcpReadOnlyMode() && typeof p.repo === 'string' && p.repo.startsWith('@')) {
-      throw new Error('Group mode is not available in GitNexus MCP read-only mode.');
-    }
+    const normalized = normalizeToolParams(method, params);
+    if ('error' in normalized) return { error: normalized.error };
+    const p = normalized.params;
+
+    // #2175: Claude Code drops a tool-call argument named exactly "query", so the
+    // query/cypher tools advertise "search_query"/"statement" while still accepting the
+    // legacy "query" key for backward compat. The alias is resolved with `?? ` (new name
+    // wins) at every consumer site rather than by mutating params here, so precedence is
+    // uniform and there is no hidden mutation: query()/cypher() read it directly, the
+    // legacy "search" alias routes through query(), and the cross-repo group-forward
+    // resolves it self-contained in callToolAtGroupRepo. This is permanent compatibility
+    // — third-party MCP clients may legitimately send "query", so the alias is not slated
+    // for removal even if Claude Code's argument handling later changes.
     if (
-      (method === 'impact' || method === 'query' || method === 'context') &&
+      (method === 'impact' || method === 'query' || method === 'context' || method === 'trace') &&
       typeof p.repo === 'string' &&
       p.repo.startsWith('@')
     ) {
       return this.callToolAtGroupRepo(method, p);
     }
 
-    // Resolve repo from optional param (re-reads registry on miss)
-    const repo = await this.resolveRepo((params as { repo?: string } | undefined)?.repo);
+    // Resolve repo from optional param (re-reads registry on miss). An optional
+    // `branch` param scopes the resolved handle to that branch's index (#2106).
+    const repo = await this.resolveRepo(
+      p.repo as string | undefined,
+      p.branch as string | undefined,
+    );
 
     switch (method) {
       case 'query':
-        return this.query(repo, params);
+        return this.query(repo, p);
       case 'cypher': {
-        const raw = await this.cypher(repo, params);
+        const raw = await this.cypher(repo, p);
         return this.formatCypherAsMarkdown(raw);
       }
-      case 'context': {
-        // Normalize aliases: file → file_path, symbol → name
-        const ctxParams = { ...params };
-        if (ctxParams.file && !ctxParams.file_path) ctxParams.file_path = ctxParams.file;
-        if (ctxParams.symbol && !ctxParams.name) ctxParams.name = ctxParams.symbol;
-        return this.context(repo, ctxParams);
-      }
-      case 'impact': {
-        // Normalize aliases: name/symbol → target
-        const impactParams = { ...params };
-        if (!impactParams.target) {
-          impactParams.target = impactParams.name || impactParams.symbol;
-        }
-        if (!impactParams.direction) {
-          impactParams.direction = 'upstream'; // sensible default
-        }
-        return this.impact(repo, impactParams);
-      }
+      case 'context':
+        return this.context(repo, p);
+      case 'explain':
+        return this.explain(repo, p);
+      case 'pdg_query':
+        return this.pdgQuery(repo, p);
+      case 'impact':
+        return this.impact(repo, p as unknown as ImpactParams);
       case 'detect_changes':
-        return this.detectChanges(repo, params);
+        return this.detectChanges(repo, p);
+      case 'check':
+        return this.check(repo, p);
       case 'rename':
-        return this.rename(repo, params);
+        return this.rename(repo, p as unknown as Parameters<LocalBackend['rename']>[1]);
       // Legacy aliases for backwards compatibility
       case 'search':
-        return this.query(repo, params);
+        return this.query(repo, p);
       case 'explore':
-        return this.context(repo, { name: params?.name, ...params });
+        return this.context(repo, {
+          name: typeof p.name === 'string' ? p.name : undefined,
+          ...p,
+        });
       case 'overview':
-        return this.overview(repo, params);
+        return this.overview(repo, p);
       case 'route_map':
-        return this.routeMap(repo, params);
+        return this.routeMap(repo, p);
       case 'shape_check':
-        return this.shapeCheck(repo, params);
+        return this.shapeCheck(repo, p);
       case 'tool_map':
-        return this.toolMap(repo, params);
+        return this.toolMap(repo, p);
       case 'api_impact':
-        return this.apiImpact(repo, params);
+        return this.apiImpact(repo, p);
+      case 'trace':
+        return this.trace(repo, p);
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
   }
 
   // ─── Tool Implementations ────────────────────────────────────────
+
+  /** Check repository graph invariants that are suitable for CI gating. */
+  private async check(repo: RepoHandle, params?: { cycles?: boolean }): Promise<any> {
+    if (params?.cycles === false) {
+      return { error: 'No checks selected. Set "cycles" to true.' };
+    }
+    await this.ensureInitialized(repo);
+    const rowLimit = 100_001;
+    const rows = await executeParameterized(
+      repo.lbugPath,
+      `MATCH (source:File)-[r:CodeRelation]->(target:File)
+       WHERE r.type = 'IMPORTS'
+         AND (r.reason IS NULL OR (
+           r.reason <> 'swift-scope: implicit module visibility'
+           AND r.reason <> 'markdown-link'
+         ))
+       RETURN source.filePath AS source, target.filePath AS target
+       LIMIT ${rowLimit}`,
+      {},
+    );
+    if (rows.length === rowLimit) {
+      return {
+        error: `Import graph exceeds the ${rowLimit - 1} edge safety limit.`,
+        truncated: true,
+      };
+    }
+    const cycles = findImportCycles(
+      rows.map((row: any) => ({
+        source: String(row.source ?? row[0] ?? ''),
+        target: String(row.target ?? row[1] ?? ''),
+      })),
+    );
+    return {
+      status: cycles.length === 0 ? 'clean' : 'cycles_found',
+      cycleCount: cycles.length,
+      cycles: cycles.map((files) => ({ files })),
+    };
+  }
 
   /**
    * Query tool — process-grouped search.
@@ -1251,7 +1838,8 @@ export class LocalBackend {
   private async query(
     repo: RepoHandle,
     params: {
-      query: string;
+      query?: string;
+      search_query?: string;
       task_context?: string;
       goal?: string;
       limit?: number;
@@ -1260,8 +1848,12 @@ export class LocalBackend {
       rerank?: boolean;
     },
   ): Promise<any> {
-    if (!params.query?.trim()) {
-      return { error: 'query parameter is required and cannot be empty.' };
+    // #2175: each consumer resolves the search_query/query alias itself (there is no
+    // chokepoint mutation in callTool). This also serves the GroupService port, which
+    // reaches query() carrying only the legacy `query` key.
+    const rawQuery = resolveAliasString(params.search_query, params.query);
+    if (!rawQuery?.trim()) {
+      return { error: 'search_query (or legacy query) parameter is required and cannot be empty.' };
     }
 
     await this.ensureInitialized(repo);
@@ -1269,7 +1861,7 @@ export class LocalBackend {
     const processLimit = params.limit || 5;
     const maxSymbolsPerProcess = params.max_symbols || 10;
     const includeContent = params.include_content ?? false;
-    const searchQuery = params.query.trim();
+    const searchQuery = rawQuery.trim();
 
     // Per-phase timing instrumentation (#553). Records wall time for each
     // observable sub-step of the search pipeline so production latency can
@@ -1284,7 +1876,7 @@ export class LocalBackend {
     // each so both get independent wall-time records without fighting
     // over a single `current` phase slot.
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const [bm25SearchResult, semanticSearchOutput] = await Promise.all([
+    const [bm25SearchResult, semanticResults] = await Promise.all([
       timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
       timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit)),
     ]);
@@ -1310,7 +1902,7 @@ export class LocalBackend {
       }
     }
 
-    const safeSemanticResults = semanticSearchOutput?.results ?? [];
+    const safeSemanticResults = semanticResults ?? [];
     for (let i = 0; i < safeSemanticResults.length; i++) {
       const result = safeSemanticResults[i];
       const key = result.nodeId || result.filePath;
@@ -1325,24 +1917,26 @@ export class LocalBackend {
 
     let merged = Array.from(scoreMap.entries())
       .sort((a, b) => b[1].score - a[1].score)
-      .slice(0, searchLimit)
-      .filter(([, item]) => isRenderableQueryCandidateData(item.data)) as MergedQueryCandidate[];
+      .slice(0, searchLimit);
     timer.stop(); // merge
 
     let rerankWarning: string | undefined;
     if (params.rerank !== false) {
-      try {
-        const config = resolveRerankConfig(repo.name);
-        if (config) {
+      // Configuration errors are deliberate operator errors and stay fatal.
+      // Only an actual provider call follows the runtime's fallback/error policy.
+      const runtime = this.rerankRuntimeResolver(repo.name);
+      if (runtime) {
+        try {
           merged = await timer.time(
             'rerank',
-            this.rerankMergedCandidates(repo, searchQuery, merged, config),
+            this.rerankMergedCandidates(repo, searchQuery, merged, runtime),
           );
+        } catch (error) {
+          if (runtime.failurePolicy === 'error') throw error;
+          rerankWarning =
+            'Rerank unavailable - using existing BM25/vector ranking. ' +
+            (error instanceof Error ? error.message : String(error));
         }
-      } catch (err) {
-        rerankWarning =
-          'Rerank unavailable — using existing BM25/vector ranking. ' +
-          (err instanceof Error ? err.message : String(err));
       }
     }
 
@@ -1492,8 +2086,8 @@ export class LocalBackend {
         name: sym.name,
         type: sym.type,
         filePath: sym.filePath,
-        startLine: sym.startLine,
-        endLine: sym.endLine,
+        startLine: toDisplayLine(sym.startLine),
+        endLine: toDisplayLine(sym.endLine),
         ...(module ? { module } : {}),
         ...(includeContent && content ? { content } : {}),
       };
@@ -1590,24 +2184,84 @@ export class LocalBackend {
     // path, leaving the success-path response shape byte-identical.
     const warnings: string[] = [];
     if (!ftsUsed) {
-      warnings.push(
-        'FTS indexes missing — keyword search degraded. Run: gitnexus analyze --repair-fts (or gitnexus analyze --force) to rebuild indexes.',
-      );
+      warnings.push(ftsDegradedWarning());
+    }
+    // #2331: a CJK query against a server process resolving
+    // GITNEXUS_FTS_CJK_SEGMENTATION to 'none' silently misses sub-phrase
+    // matches with no other signal — this is the only place an agent driving
+    // GitNexus through the query tool can learn the capability exists.
+    try {
+      const cjkMode = getSearchFTSCjkSegmentation();
+      if (containsSegmentableCjkRun(searchQuery) && cjkMode !== 'bigram') {
+        warnings.push(
+          'Query contains CJK characters — sub-phrase matches require GITNEXUS_FTS_CJK_SEGMENTATION=bigram set for both `analyze` and this server process, then `gitnexus analyze --force`.',
+        );
+      } else if (
+        cjkMode === 'bigram' &&
+        searchQuery.length > MAX_CJK_SEGMENTATION_QUERY_LENGTH &&
+        containsSegmentableCjkRun(searchQuery)
+      ) {
+        // #2339: bigram mode is enabled, but the query exceeds the length
+        // cap that guards segmentCjkSpans's per-character allocation cost —
+        // applyCjkSegmentationIfEnabled silently skips segmentation above
+        // this length, so an over-cap CJK query returns zero results for
+        // text that IS indexed and present verbatim, with no other signal.
+        warnings.push(
+          `Query exceeds the ${MAX_CJK_SEGMENTATION_QUERY_LENGTH}-character CJK segmentation cap — ` +
+            'sub-phrase matches are skipped for this query even though GITNEXUS_FTS_CJK_SEGMENTATION=bigram is enabled. Shorten the query to search within the cap.',
+        );
+      }
+    } catch (err) {
+      // Best-effort diagnostic only — never fail the query over it.
+      logQueryError('query:cjk-warning', err);
+    }
+    // #2339: the checks above only compare the QUERY's own content against
+    // the live process's mode — they can't detect "server mode is 'bigram'
+    // but the on-disk index was actually built under 'none'/legacy" (env var
+    // changed without a full --force re-analyze, or a plain/--repair-fts
+    // analyze ran instead). That mismatch affects every CJK query against
+    // this repo, not just one whose own text happens to contain CJK, so it's
+    // a separate, unconditional check — not folded into the branches above.
+    try {
+      const meta = await loadMeta(path.dirname(repo.lbugPath));
+      // meta.json is on-disk state inside the analyzed repo, read via a
+      // schema-less JSON.parse — not trusted input. Validate before
+      // interpolating it into agent-visible tool output (#2339): an
+      // unrecognized value is itself evidence of a corrupt/foreign index,
+      // reported generically rather than echoed verbatim.
+      const persistedMode = meta?.cjkSegmentation;
+      if (meta && persistedMode !== undefined && !isSupportedCjkSegmentationMode(persistedMode)) {
+        warnings.push(
+          "This repo's index metadata has an unrecognized CJK segmentation mode stamp — the index " +
+            'may be corrupt or from an incompatible GitNexus version. Run `gitnexus analyze --force` to rebuild it.',
+        );
+      } else if (
+        meta &&
+        cjkSegmentationModeMismatch(meta.cjkSegmentation, getSearchFTSCjkSegmentation())
+      ) {
+        warnings.push(
+          `Index was built with CJK segmentation mode '${meta.cjkSegmentation ?? 'none'}', but this ` +
+            `server is resolving '${getSearchFTSCjkSegmentation()}' — sub-phrase CJK search results ` +
+            'may be incomplete. Set GITNEXUS_FTS_CJK_SEGMENTATION to the same value for both the ' +
+            '`analyze` process and this server, then run `gitnexus analyze --force` to rebuild under ' +
+            "the agreed mode (do not assume the live server's mode is the one to keep — re-analyzing " +
+            'under the wrong mode can strip an already-working bigram-segmented index back to `none`).',
+        );
+      }
+    } catch (err) {
+      // loadMeta() itself never throws (it returns null on any read/parse
+      // failure) — the actual throw source here is getSearchFTSCjkSegmentation()
+      // on an invalid env value, same root cause as the catch above. This is
+      // a separate, independently-guarded diagnostic though, so it gets its
+      // own log context rather than sharing 'query:cjk-warning'.
+      logQueryError('query:cjk-mode-drift', err);
     }
     if (enrichmentDegraded) {
       warnings.push(
         'Symbol enrichment partially failed — some process/cohesion/content data may be missing from these results (see server logs).',
       );
     }
-    if (rerankWarning) {
-      warnings.push(rerankWarning);
-    }
-    if (semanticSearchOutput?.degraded) {
-      warnings.push(
-        `Semantic vector search degraded: ${semanticSearchOutput.degraded.reason}. ` +
-          'Using exact-scan fallback within the configured limit.',
-      );
-    }
+    if (rerankWarning) warnings.push(rerankWarning);
 
     return {
       processes,
@@ -1619,16 +2273,13 @@ export class LocalBackend {
     };
   }
 
-  /**
-   * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
-   */
   private async rerankMergedCandidates(
     repo: RepoHandle,
     query: string,
-    merged: MergedQueryCandidate[],
-    config: RerankConfig,
-  ): Promise<MergedQueryCandidate[]> {
-    const candidateCount = Math.min(config.candidates, merged.length);
+    merged: Array<[string, { score: number; data: any }]>,
+    runtime: RerankRuntime,
+  ): Promise<Array<[string, { score: number; data: any }]>> {
+    const candidateCount = Math.min(runtime.candidates, merged.length);
     if (candidateCount <= 1) return merged;
 
     const candidates = merged.slice(0, candidateCount);
@@ -1655,64 +2306,59 @@ export class LocalBackend {
             contents.set(nodeId, content);
           }
         }
-      } catch (err) {
-        logQueryError('query:rerank-content-fetch', err);
+      } catch (error) {
+        // Source content is enrichment, not a prerequisite: providers still get
+        // stable symbol identity and file metadata when the fetch is unavailable.
+        logQueryError('query:rerank-content-fetch', error);
       }
     }
 
     const documents = candidates.map(([, item]) => {
-      const sym = item.data ?? {};
-      const rawContent = typeof sym.nodeId === 'string' ? contents.get(sym.nodeId) : undefined;
-      const content =
-        rawContent && rawContent.length > config.maxDocChars
-          ? rawContent.slice(0, config.maxDocChars)
-          : rawContent;
+      const symbol = item.data ?? {};
+      const rawContent =
+        typeof symbol.nodeId === 'string' ? contents.get(symbol.nodeId) : undefined;
+      const content = rawContent?.slice(0, runtime.maxDocChars);
       return [
-        `name: ${sym.name ?? ''}`,
-        `type: ${sym.type ?? 'Unknown'}`,
-        `file: ${sym.filePath ?? ''}`,
-        sym.startLine || sym.endLine ? `lines: ${sym.startLine ?? '?'}-${sym.endLine ?? '?'}` : '',
+        `name: ${symbol.name ?? ''}`,
+        `type: ${symbol.type ?? 'Unknown'}`,
+        `file: ${symbol.filePath ?? ''}`,
+        symbol.startLine || symbol.endLine
+          ? `lines: ${symbol.startLine ?? '?'}-${symbol.endLine ?? '?'}`
+          : '',
         content ? `content:\n${content}` : '',
       ]
         .filter(Boolean)
         .join('\n');
     });
 
-    const ranked = await rerankDocuments(query, documents, config);
+    const ranked = await rerankDocuments(runtime.provider, { query, documents });
     if (ranked.length === 0) return merged;
 
     const used = new Set<number>();
-    const reordered: MergedQueryCandidate[] = [];
+    const reordered: Array<[string, { score: number; data: any }]> = [];
     for (let rank = 0; rank < ranked.length; rank++) {
-      const item = ranked[rank]!;
-      if (used.has(item.index)) continue;
-      const candidate = candidates[item.index];
-      if (!candidate) continue;
-      used.add(item.index);
-      const relevanceScore =
-        Number.isFinite(item.relevance_score) && item.relevance_score > 0
-          ? item.relevance_score
-          : 0;
+      const result = ranked[rank]!;
+      const candidate = candidates[result.index]!;
+      used.add(result.index);
       reordered.push([
         candidate[0],
         {
           ...candidate[1],
-          originalScore: candidate[1].originalScore ?? candidate[1].score,
-          rerankScore: relevanceScore,
-          rerankRank: rank,
-          // Keep reranked candidates in a score band above BM25/vector RRF
-          // scores so downstream process aggregation honors the same order
-          // agents see in standalone definition results.
-          score: 1 + relevanceScore + (candidateCount - rank) / (candidateCount * 1000),
+          // Keep provider-ranked candidates above the RRF score band so the
+          // existing downstream process aggregation observes the same order.
+          score: 1 + Math.max(0, result.score) + (candidateCount - rank) / (candidateCount * 1000),
         },
       ]);
     }
-    for (let i = 0; i < candidates.length; i++) {
-      if (!used.has(i)) reordered.push(candidates[i]!);
+    for (let index = 0; index < candidates.length; index++) {
+      if (!used.has(index)) reordered.push(candidates[index]!);
     }
     return [...reordered, ...merged.slice(candidateCount)];
   }
 
+  /**
+   * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
+   */
   private async bm25Search(
     repo: RepoHandle,
     query: string,
@@ -1733,9 +2379,14 @@ export class LocalBackend {
     try {
       ftsResponse = await searchFTSFromLbug(query, limit, repo.lbugPath);
     } catch (err: any) {
-      logger.error(
+      // Swallowed, gracefully-degraded failure: the search falls back to
+      // semantic-only (a valid result), and the most common cause is simply an
+      // un-indexed FTS extension — a normal configuration, not an operation
+      // error. Logged at warn (matching the sibling import-failure fallback
+      // above), never error, so it does not raise a false alarm.
+      logger.warn(
         { err: err.message },
-        'GitNexus: BM25/FTS search failed (FTS indexes may not exist) -',
+        'GitNexus: BM25/FTS search failed (FTS indexes may not exist) — falling back to semantic-only',
       );
       return { results: [], ftsUsed: false };
     }
@@ -1766,9 +2417,14 @@ export class LocalBackend {
             )
           : await executeParameterized(
               repo.lbugPath,
+              // Same BasicBlock exclusion as detect_changes (#2082 U7): on a
+              // --pdg index a function-heavy file has far more BasicBlock rows
+              // than symbols, so an unfiltered LIMIT 3 would surface nameless
+              // substrate rows and displace the real symbols.
               `
               MATCH (n)
               WHERE n.filePath = $filePath
+                AND NOT n.id STARTS WITH 'BasicBlock:'
               RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
               LIMIT 3
             `,
@@ -1777,18 +2433,18 @@ export class LocalBackend {
 
         if (symbols.length > 0) {
           for (const sym of symbols) {
-            const candidate = {
-              nodeId: sym.id ?? sym[0],
-              name: sym.name ?? sym[1],
-              type: sym.type ?? sym[2],
-              filePath: sym.filePath ?? sym[3],
+            results.push({
+              nodeId: sym.id || sym[0],
+              name: sym.name || sym[1],
+              type: sym.type || sym[2],
+              filePath: sym.filePath || sym[3],
+              // Raw 0-based here — `bm25Search` is only called from `query()`,
+              // whose aggregation loop applies `toDisplayLine` once (see below).
+              // Converting here too would double-shift BM25-matched lines (#2380).
               startLine: sym.startLine ?? sym[4],
               endLine: sym.endLine ?? sym[5],
               bm25Score: bm25Result.score,
-            };
-            if (isRenderableQueryCandidateData(candidate)) {
-              results.push(candidate);
-            }
+            });
           }
         } else {
           const fileName = fullPath.split('/').pop() || fullPath;
@@ -1816,91 +2472,81 @@ export class LocalBackend {
   /**
    * Semantic vector search helper
    */
-  private async semanticSearch(
-    repo: RepoHandle,
-    query: string,
-    limit: number,
-  ): Promise<SemanticSearchOutput> {
+  private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       const tableCheck = await executeQuery(
         repo.lbugPath,
         `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN COUNT(*) AS cnt LIMIT 1`,
       );
-      if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) {
-        return { results: [] };
-      }
+      if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
 
       const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
       const queryVec = await embedQuery(query);
       const dims = getEmbeddingDims();
       const queryVecStr = `[${queryVec.join(',')}]`;
+      const maxDistance = getVectorMaxDistance(DEFAULT_MCP_VECTOR_MAX_DISTANCE);
 
       let bestChunks = new Map<
         string,
         { distance: number; chunkIndex: number; startLine: number; endLine: number }
       >();
-      let degraded: SemanticSearchDegradation | undefined;
       if (isVectorExtensionSupportedByPlatform()) {
-        const vectorLoaded = await ensureVectorExtensionForRepo(repo.lbugPath);
-        if (!vectorLoaded) {
-          degraded = {
-            mode: 'exact-scan',
-            reason: 'VECTOR extension unavailable on the query path',
-          };
-        }
-        if (vectorLoaded) {
-          try {
-            bestChunks = await collectBestChunks(limit, async (fetchLimit) => {
-              const vectorQuery = `
+        try {
+          bestChunks = await collectBestChunks(limit, async (fetchLimit) => {
+            const vectorQuery = `
             CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
               CAST(${queryVecStr} AS FLOAT[${dims}]), ${fetchLimit})
             YIELD node AS emb, distance
             WITH emb, distance
-            WHERE distance < 0.6
+            WHERE distance < ${maxDistance}
             RETURN emb.nodeId AS nodeId, emb.chunkIndex AS chunkIndex,
                    emb.startLine AS startLine, emb.endLine AS endLine, distance
             ORDER BY distance
           `;
 
-              const embResults = await executeQuery(repo.lbugPath, vectorQuery);
-              return embResults.map((row) => ({
-                nodeId: row.nodeId ?? row[0],
-                chunkIndex: row.chunkIndex ?? row[1] ?? 0,
-                startLine: row.startLine ?? row[2] ?? 0,
-                endLine: row.endLine ?? row[3] ?? 0,
-                distance: row.distance ?? row[4],
-              }));
-            });
-          } catch {
-            degraded = {
-              mode: 'exact-scan',
-              reason: `VECTOR index "${EMBEDDING_INDEX_NAME}" unavailable or query failed`,
-            };
-            bestChunks = new Map();
+            const embResults = await executeQuery(repo.lbugPath, vectorQuery);
+            return embResults.map((row) => ({
+              nodeId: row.nodeId ?? row[0],
+              chunkIndex: row.chunkIndex ?? row[1] ?? 0,
+              startLine: row.startLine ?? row[2] ?? 0,
+              endLine: row.endLine ?? row[3] ?? 0,
+              distance: row.distance ?? row[4],
+            }));
+          });
+        } catch (error) {
+          bestChunks = new Map();
+          if (!this.warnedVectorQueryFailure) {
+            this.warnedVectorQueryFailure = true;
+            logger.warn(
+              { err: error },
+              'GitNexus [query:vector]: VECTOR index query failed; using exact scan fallback',
+            );
           }
         }
-      } else {
-        if (!this.warnedVectorUnsupported) {
-          // Rare diagnostic: surface why we fell back to the exact scan path so
-          // operators can see at a glance that VECTOR is disabled by platform
-          // policy. Emitted once per `LocalBackend` instance lifetime to avoid
-          // noisy stderr on hot semantic-search paths (DoD §2.8).
-          this.warnedVectorUnsupported = true;
-          logger.warn(
-            'GitNexus [query:vector]: VECTOR extension not supported on this platform; using exact scan fallback',
-          );
-        }
-        degraded = {
-          mode: 'exact-scan',
-          reason: 'VECTOR extension not supported on this platform',
-        };
+      } else if (!this.warnedVectorUnsupported) {
+        // Rare diagnostic: surface why we fell back to the exact scan path so
+        // operators can see at a glance that VECTOR is disabled by platform
+        // policy. Emitted once per `LocalBackend` instance lifetime to avoid
+        // noisy stderr on hot semantic-search paths (DoD §2.8).
+        this.warnedVectorUnsupported = true;
+        logger.warn(
+          'GitNexus [query:vector]: VECTOR extension not supported on this platform; using exact scan fallback',
+        );
       }
 
       if (bestChunks.size === 0) {
         const embeddingCount = Number(tableCheck[0].cnt ?? tableCheck[0][0] ?? 0);
         const exactLimit = getExactScanLimit();
-        if (embeddingCount > exactLimit) return { results: [], degraded };
+        if (embeddingCount > exactLimit) {
+          if (!this.warnedExactScanLimit) {
+            this.warnedExactScanLimit = true;
+            logger.warn(
+              `GitNexus [query:vector]: exact scan refused; ${embeddingCount} chunks exceed the configured safety limit of ${exactLimit}. Restore the VECTOR index or deliberately raise GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT after reviewing memory cost.`,
+            );
+          }
+          return [];
+        }
 
         const rows = await executeQuery(
           repo.lbugPath,
@@ -1918,7 +2564,7 @@ export class LocalBackend {
           embedding: row.embedding ?? row[4] ?? [],
         }));
         bestChunks = new Map(
-          rankExactEmbeddingRows(exactRows, queryVec, limit, 0.6).map((row) => [
+          rankExactEmbeddingRows(exactRows, queryVec, limit, maxDistance).map((row) => [
             row.nodeId,
             {
               distance: row.distance,
@@ -1930,7 +2576,7 @@ export class LocalBackend {
         );
       }
 
-      if (bestChunks.size === 0) return { results: [], degraded };
+      if (bestChunks.size === 0) return [];
 
       const results: any[] = [];
 
@@ -1950,7 +2596,7 @@ export class LocalBackend {
           const nodeRows = await executeParameterized(repo.lbugPath, nodeQuery, { nodeId });
           if (nodeRows.length > 0) {
             const nodeRow = nodeRows[0];
-            const candidate = {
+            results.push({
               nodeId,
               name: nodeRow.name ?? nodeRow[0] ?? '',
               type: label,
@@ -1958,18 +2604,29 @@ export class LocalBackend {
               distance: chunk.distance,
               startLine: chunk.startLine,
               endLine: chunk.endLine,
-            };
-            if (isRenderableQueryCandidateData(candidate)) {
-              results.push(candidate);
-            }
+            });
           }
         } catch {}
       }
 
-      return { results, degraded };
-    } catch {
-      // Expected when embeddings are disabled — silently fall back to BM25-only
-      return { results: [] };
+      return results;
+    } catch (err) {
+      // Embeddings disabled is the common, silent case. But a pruned or
+      // Node-unloadable optional stack (#2370/#2372) also lands here — surface it
+      // once so semantic search doesn't silently degrade to BM25 with no hint
+      // (the exact silent-degradation mode #2370 exists to fix). Emitted once per
+      // LocalBackend instance to keep stderr quiet on hot paths (like the VECTOR
+      // fallback above). All other errors stay silent, as before.
+      const message = err instanceof Error ? err.message : '';
+      if (
+        !this.warnedMissingEmbeddingStack &&
+        (isMissingLocalEmbeddingStackMessage(message) ||
+          isLocalEmbeddingRuntimeBlockerMessage(message))
+      ) {
+        this.warnedMissingEmbeddingStack = true;
+        logger.warn(`GitNexus [query:vector]: ${message}`);
+      }
+      return [];
     }
   }
 
@@ -1984,7 +2641,9 @@ export class LocalBackend {
 
   private async cypher(
     repo: RepoHandle,
-    request: { query: string; params?: Record<string, unknown> },
+    // #2175: "statement" is the advertised param; "query" is the legacy alias,
+    // still accepted (and the field the internal executeCypher() passes). New wins.
+    request: { query?: string; statement?: string; params?: Record<string, unknown> },
   ): Promise<any> {
     await this.ensureInitialized(repo);
 
@@ -1993,13 +2652,19 @@ export class LocalBackend {
     }
     if (request.params !== undefined && !isValidQueryParams(request.params)) {
       return {
-        error:
-          '"params" must be a plain object with scalar or scalar-array values (string/number/boolean/null).',
+        error: '"params" must be a plain object with scalar values (string/number/boolean/null).',
       };
     }
 
+    const cypherText = resolveAliasString(request.statement, request.query) ?? '';
+    if (!cypherText.trim()) {
+      // Mirror query()'s friendly required-param error instead of letting an empty
+      // string fall through to a raw LadybugDB prepare error (#2175 review).
+      return { error: 'statement (or legacy query) parameter is required and cannot be empty.' };
+    }
+
     try {
-      const result = await executeParameterized(repo.lbugPath, request.query, request.params ?? {});
+      const result = await executeParameterized(repo.lbugPath, cypherText, request.params ?? {});
       return result;
     } catch (err: any) {
       const msg = err.message || 'Query failed';
@@ -2042,7 +2707,11 @@ export class LocalBackend {
             const v = row[k];
             if (v === null || v === undefined) return '';
             if (typeof v === 'object') return JSON.stringify(v);
-            return String(v);
+            // Collapse newlines so a multi-line cell value (e.g. a symbol's
+            // `content`) stays on one physical line. Otherwise the rendered row
+            // spans multiple lines, which corrupts the table and breaks the
+            // CLI's `--limit` line-based slicing (#2310 review).
+            return String(v).replace(/\r?\n/g, ' ');
           })
           .join(' | ') +
         ' |',
@@ -2521,7 +3190,7 @@ export class LocalBackend {
           name: c.name,
           kind: c.type,
           filePath: c.filePath,
-          line: c.startLine,
+          line: toDisplayLine(c.startLine),
           score: Number(c.score.toFixed(2)),
         })),
       };
@@ -2708,6 +3377,30 @@ export class LocalBackend {
     const symKind = isClassLike ? resolvedLabel || 'Class' : sym.type || sym[2];
     const isMethodLike =
       symKind === 'Method' || symKind === 'Function' || symKind === 'Constructor';
+
+    // #1858 review F2 — start the epistemic boundary probe here (right after
+    // `symKind` is known) so it runs CONCURRENTLY with the methodMetadata fetch
+    // below, mirroring how _runImpactBFS overlaps it with the BFS. It is awaited
+    // at result assembly. (It cannot start earlier — `symKind` is only computed
+    // on this line, after the incoming/outgoing round-trips.)
+    //
+    // #1858 review F3 — pass an interface-preserving type, NOT `symKind`.
+    // `symKind` collapses a single-resolved Interface to 'Class' (resolvedLabel
+    // is '' on the single-candidate path), which would skip computeEpistemicBoundary's
+    // `symType === 'Interface'` self-boundary branch and under-report a leaf
+    // interface as 'exact'. `enrichCandidateLabels` runs BEFORE the single-candidate
+    // early return and patches `sym.type` from '' to 'Interface' (LadybugDB returns
+    // '' for labels()[0] on Interface/Class), so `sym.type` is the reliable signal
+    // here — mirroring impact()'s `resolvedLabel || symbol.type` derivation. Do not
+    // "fix" enrichment ordering; F3 depends on enrichment-before-early-return.
+    const epistemicSymType = (resolvedLabel || sym.type || symKind || '') as string;
+    const epistemicPromise = this.computeEpistemicBoundary(
+      repo,
+      symId,
+      epistemicSymType,
+      (sym.name || sym[1]) as string,
+    );
+
     let methodMetadata: Record<string, unknown> | undefined;
     if (isMethodLike) {
       try {
@@ -2740,6 +3433,13 @@ export class LocalBackend {
       }
     }
 
+    // #1858 — same epistemic boundary signal as impact(): when this symbol sits
+    // behind an interface / indirection boundary, callers binding via DI or
+    // dynamic dispatch are not reflected in `incoming`, so the view is a lower
+    // bound. Additive; never suppresses a field. Resolved from the probe started
+    // above (concurrent with methodMetadata).
+    const epistemic = await epistemicPromise;
+
     return {
       status: 'found',
       symbol: {
@@ -2747,11 +3447,12 @@ export class LocalBackend {
         name: sym.name || sym[1],
         kind: symKind,
         filePath: sym.filePath || sym[3],
-        startLine: sym.startLine || sym[4],
-        endLine: sym.endLine || sym[5],
+        startLine: toDisplayLine(sym.startLine ?? sym[4]),
+        endLine: toDisplayLine(sym.endLine ?? sym[5]),
         ...(include_content && (sym.content || sym[6]) ? { content: sym.content || sym[6] } : {}),
         ...(methodMetadata ? { methodMetadata } : {}),
       },
+      ...epistemic,
       incoming: categorize(incomingRows),
       outgoing: categorize(outgoingRows),
       ...(typedPropertyRows.length > 0
@@ -2771,6 +3472,601 @@ export class LocalBackend {
         step_index: r.step || r[2],
         step_count: r.stepCount || r[3],
       })),
+    };
+  }
+
+  /**
+   * Resolve a `target` (file path OR symbol/function name) into a BasicBlock
+   * SOURCE-block anchor, shared by `explain` (TAINTED) and `pdg_query`
+   * (CDG/REACHING_DEF) — both reconstruct the symbol↔block join the same way
+   * (there is no Function→BasicBlock edge). #2188 review: extracted from two
+   * near-identical copies that had DRIFTED — `_explainImpl` used a 0-based,
+   * un-widened span window that dropped a function's final-line block and could
+   * leak a neighbor's line-above block; this single resolver applies the correct
+   * `[symStart+1, symEnd+1]` window (1-based BasicBlock startLine vs 0-based
+   * symbol span) to BOTH callers.
+   *
+   * Returns a BARE `anchorClause` (no leading `AND`) so each caller composes its
+   * own `WHERE`; `early` carries the not-found/ambiguous payload (caller returns
+   * it verbatim). `target` / symbol names flow only through `queryParams` bind
+   * params — never interpolated into Cypher.
+   */
+  private async resolveBlockAnchor(
+    repo: RepoHandle,
+    target: string,
+    toolName: 'explain' | 'pdg_query' | 'impact',
+  ): Promise<{
+    anchorClause: string;
+    queryParams: Record<string, unknown>;
+    anchor: { file: string; symbol?: string; startLine?: number; endLine?: number };
+    early?: Record<string, unknown>;
+  }> {
+    if (looksLikeFilePath(target)) {
+      return {
+        anchorClause:
+          '(a.id STARTS WITH $idPrefix OR a.filePath = $targetPath OR a.filePath ENDS WITH $targetSuffix)',
+        queryParams: {
+          idPrefix: `BasicBlock:${target}:`,
+          targetPath: target,
+          targetSuffix: `/${target}`,
+        },
+        anchor: { file: target },
+      };
+    }
+    const outcome = await this.resolveSymbolCandidates(repo, { name: target }, {});
+    if (outcome.kind === 'not_found') {
+      return {
+        anchorClause: '',
+        queryParams: {},
+        anchor: { file: '' },
+        early: { error: `Symbol '${target}' not found` },
+      };
+    }
+    if (outcome.kind === 'ambiguous') {
+      return {
+        anchorClause: '',
+        queryParams: {},
+        anchor: { file: '' },
+        early: {
+          status: 'ambiguous',
+          message: `Found ${outcome.candidates.length} symbols matching '${target}'. Re-call ${toolName} with the file path, or disambiguate via context() first.`,
+          candidates: outcome.candidates.map((c) => ({
+            uid: c.id,
+            name: c.name,
+            kind: c.type,
+            filePath: c.filePath,
+            line: toDisplayLine(c.startLine),
+            score: Number(c.score.toFixed(2)),
+          })),
+        },
+      };
+    }
+    const sym = outcome.symbol;
+    const idPrefix = `BasicBlock:${sym.filePath}:`;
+    if (
+      typeof sym.startLine === 'number' &&
+      typeof sym.endLine === 'number' &&
+      sym.endLine >= sym.startLine
+    ) {
+      // BasicBlock startLine is 1-based; the symbol span is 0-based. Shift BOTH
+      // bounds +1 so the window is the function's true block span: the lower +1
+      // excludes a neighbor's block on the line directly above, the upper +1
+      // keeps a guard/def/use on the final line (#2188 review).
+      return {
+        anchorClause:
+          'a.id STARTS WITH $idPrefix AND a.startLine >= $symStart AND a.startLine <= $symEnd',
+        queryParams: { idPrefix, symStart: sym.startLine + 1, symEnd: sym.endLine + 1 },
+        // Display anchor is 1-based, matching the ambiguous-candidate branch and
+        // the context/query/impact tools (#2380). This is display-only — the
+        // BasicBlock join above uses the raw `sym.startLine + 1` in `symStart`.
+        anchor: {
+          file: sym.filePath,
+          symbol: sym.name,
+          startLine: toDisplayLine(sym.startLine),
+          endLine: toDisplayLine(sym.endLine),
+        },
+      };
+    }
+    // No usable span — degrade to the file-level filter (documented).
+    return {
+      anchorClause: 'a.id STARTS WITH $idPrefix',
+      queryParams: { idPrefix },
+      anchor: { file: sym.filePath, symbol: sym.name },
+    };
+  }
+
+  /**
+   * Explain tool (#2083 M3 U6) — persisted taint-finding explanation.
+   * WAL-aware wrapper mirroring `context`.
+   */
+  private async explain(
+    repo: RepoHandle,
+    params: { target?: string; limit?: number },
+  ): Promise<any> {
+    try {
+      return await this._explainImpl(repo, params);
+    } catch (err: any) {
+      const msg = (err instanceof Error ? err.message : String(err)) || 'Explain query failed';
+      if (isWalCorruptionError(err)) {
+        return {
+          error: msg,
+          recoverySuggestion: WAL_RECOVERY_SUGGESTION,
+        };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Taint findings are persisted as `TAINTED` rows in CodeRelation whose
+   * endpoints are BOTH BasicBlock nodes — the label anchor restricts every
+   * query here to the BasicBlock→BasicBlock partition of the rel table
+   * (which holds only the sparse, per-function-capped pdg layers), never a
+   * global symbol-space scan (the S1 verdict; LadybugDB has no rel-property
+   * index, so the label anchor IS the bound).
+   *
+   * Anchoring granularity:
+   * - file target → BasicBlock id prefix (`BasicBlock:<filePath>:` — the
+   *   shared `basicBlockId` template) with an exact-or-suffix path match so
+   *   `vuln.ts` finds `src/vuln.ts`.
+   * - symbol target → resolved via `resolveSymbolCandidates` (the context()
+   *   path: ambiguous ⇒ ranked candidates, unknown ⇒ not-found), then the
+   *   file id-prefix PLUS source-block startLine within the symbol's
+   *   [startLine, endLine] span. Findings are intra-procedural, so filtering
+   *   the SOURCE endpoint is sufficient — both endpoints share the function.
+   *   Symbols without a line span degrade to the file-level filter.
+   *
+   * The per-finding `sinkKind` and hop path decode from the persisted
+   * `reason` via the SHARED `taint/path-codec.ts` (the U4 write path encodes
+   * with the same module — `;<kind>` header + ordered `variable:line` hops).
+   */
+  private async _explainImpl(
+    repo: RepoHandle,
+    params: { target?: string; limit?: number },
+  ): Promise<any> {
+    await this.ensureInitialized(repo);
+
+    const rawLimit = params.limit ?? EXPLAIN_DEFAULT_LIMIT;
+    if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > EXPLAIN_MAX_LIMIT) {
+      return {
+        error: `Invalid "limit": expected an integer in [1, ${EXPLAIN_MAX_LIMIT}], got ${JSON.stringify(params.limit)}.`,
+      };
+    }
+    const limit = rawLimit;
+
+    const NO_TAINT_NOTE =
+      'no taint layer — run gitnexus analyze --pdg to record taint findings for this repo';
+
+    // Cheap meta probe: the TAINT layer exists iff the pdg stamp carries a
+    // `taintModelVersion` (the field M3 added). An M1/M2-era `--pdg` index has
+    // `meta.pdg` defined but no taintModelVersion — BasicBlock/REACHING_DEF
+    // exist, zero TAINTED rows do — so it must surface the no-taint-layer hint,
+    // not the generic "analyzed, nothing found" note. An unreadable meta (e.g.
+    // a seeded test DB) falls through to the row-existence probe below.
+    let pdgStamped: boolean | undefined;
+    try {
+      const meta = await loadMeta(path.dirname(repo.lbugPath));
+      if (meta) pdgStamped = meta.pdg?.taintModelVersion !== undefined;
+    } catch {
+      /* meta unreadable — decide from the DB below */
+    }
+    if (pdgStamped === false) {
+      return { findings: [], totalFindings: 0, note: NO_TAINT_NOTE };
+    }
+
+    // Resolve the optional anchor into a WHERE clause on the SOURCE block.
+    const target = typeof params.target === 'string' ? params.target.trim() : '';
+    let anchorClause = '';
+    let queryParams: Record<string, unknown> = {};
+    let anchor: { file: string; symbol?: string; startLine?: number; endLine?: number } | undefined;
+
+    // Bounded by construction: the BasicBlock→BasicBlock partition holds only
+    // the sparse pdg layers, TAINTED rows are per-function-capped at analyze
+    // time, and the page is LIMIT-bounded (the limit is a validated integer —
+    // interpolated because LadybugDB does not parameterize LIMIT).
+    const runAnchoredQuery = async (): Promise<{ rows: unknown[]; totalFindings: number }> => {
+      const matchClause = `
+      MATCH (a:BasicBlock)-[r:CodeRelation]->(b:BasicBlock)
+      WHERE r.type = 'TAINTED'${anchorClause ? ` AND ${anchorClause}` : ''}`;
+      const [qRows, countRows] = await Promise.all([
+        executeParameterized(
+          repo.lbugPath,
+          `${matchClause}
+      RETURN a.id AS sourceBlockId, a.filePath AS file, a.startLine AS sourceStart,
+             b.startLine AS sinkStart, r.reason AS reason, b.id AS sinkBlockId
+      ORDER BY sourceBlockId, sinkBlockId, reason
+      LIMIT ${limit}`,
+          queryParams,
+        ),
+        executeParameterized(
+          repo.lbugPath,
+          `${matchClause}
+      RETURN COUNT(*) AS total`,
+          queryParams,
+        ),
+      ]);
+      return {
+        rows: qRows,
+        totalFindings: Number((countRows[0] as any)?.total ?? (countRows[0] as any)?.[0] ?? 0),
+      };
+    };
+
+    if (target) {
+      // Shared symbol↔block anchor resolver (#2188): file id-prefix OR symbol
+      // span, with the corrected [symStart+1, symEnd+1] window. A bare/dotted
+      // symbol name resolves as a symbol rather than silently file-anchoring.
+      const resolved = await this.resolveBlockAnchor(repo, target, 'explain');
+      if (resolved.early) return resolved.early;
+      anchorClause = resolved.anchorClause;
+      queryParams = resolved.queryParams;
+      anchor = resolved.anchor;
+    }
+
+    const { rows, totalFindings } = await runAnchoredQuery();
+
+    // M4 (#2084 U7): cross-function findings ride TAINT_PATH edges (Function/
+    // Method → Function/Method), separate from the intra-procedural TAINTED
+    // BasicBlock rows above. Enumerate them too so `explain` is the discovery
+    // surface for interprocedural flows (TAINT_PATH stays out of
+    // VALID_RELATION_TYPES + the web schema, like TAINTED). File-anchored:
+    // filter on the source function's file; symbol-anchored: either endpoint
+    // matches the symbol name; anchorless: all (bounded by LIMIT). Computed
+    // BEFORE the no-taint early returns — a repo with ONLY cross-function
+    // findings (no intra-procedural TAINTED rows) must not look empty.
+    const runInterprocQuery = async (): Promise<{ findings: any[]; total: number }> => {
+      const where: string[] = [`r.type = 'TAINT_PATH'`];
+      const p: Record<string, unknown> = {};
+      if (anchor?.symbol) {
+        where.push('(a.name = $ipSym OR b.name = $ipSym)');
+        p.ipSym = anchor.symbol;
+      } else if (anchor?.file) {
+        // Match EITHER endpoint's file — a cross-function flow anchored on the
+        // SINK's file (b) is as relevant as one anchored on the source's (a).
+        where.push(
+          '(a.filePath = $ipFile OR a.filePath ENDS WITH $ipSuffix OR ' +
+            'b.filePath = $ipFile OR b.filePath ENDS WITH $ipSuffix)',
+        );
+        p.ipFile = anchor.file;
+        p.ipSuffix = `/${anchor.file}`;
+      }
+      const matchClause = `MATCH (a)-[r:CodeRelation]->(b)\n      WHERE ${where.join(' AND ')}`;
+      // Page query + a separate COUNT (#2084 review P2-4): the page is
+      // LIMIT-capped, so its row count cannot stand in for the true total —
+      // run a COUNT with the same WHERE (no LIMIT) like the intra layer does.
+      const [ipRows, ipCountRows] = await Promise.all([
+        executeParameterized(
+          repo.lbugPath,
+          `${matchClause}
+      RETURN a.filePath AS file, a.name AS sourceFn, a.startLine AS sourceLine,
+             b.name AS sinkFn, b.startLine AS sinkLine, r.reason AS reason
+      ORDER BY sourceFn, sinkFn, reason
+      LIMIT ${limit}`,
+          p,
+        ),
+        executeParameterized(repo.lbugPath, `${matchClause}\n      RETURN COUNT(*) AS total`, p),
+      ]);
+      const total = Number((ipCountRows[0] as any)?.total ?? (ipCountRows[0] as any)?.[0] ?? 0);
+      const findings = ipRows.map((r: any) => {
+        const decoded = decodeTaintPath(r.reason ?? r[5]);
+        const hops = decoded.ok
+          ? decoded.hops.map((h) => ({ function: h.variable, line: h.line }))
+          : [];
+        return {
+          interprocedural: true,
+          file: String(r.file ?? r[0] ?? ''),
+          sinkKind: decoded.ok ? (decoded.kind ?? 'unknown') : 'unknown',
+          source: { function: String(r.sourceFn ?? r[1] ?? ''), line: r.sourceLine ?? r[2] },
+          sink: { function: String(r.sinkFn ?? r[3] ?? ''), line: r.sinkLine ?? r[4] },
+          hops,
+          ...(decoded.ok && decoded.truncated ? { pathIncomplete: true } : {}),
+        };
+      });
+      return { findings, total };
+    };
+    const { findings: interprocFindings, total: interprocTotal } = await runInterprocQuery();
+
+    if (
+      totalFindings === 0 &&
+      interprocFindings.length === 0 &&
+      pdgStamped === undefined &&
+      !target
+    ) {
+      // Meta was unreadable and the repo-wide enumerate (both layers) found
+      // nothing — the counts above WERE the existence probe; surface the hint.
+      return { findings: [], totalFindings: 0, note: NO_TAINT_NOTE };
+    }
+    if (
+      totalFindings === 0 &&
+      interprocFindings.length === 0 &&
+      pdgStamped === undefined &&
+      target
+    ) {
+      // Anchored miss with unreadable meta: one extra bounded probe decides
+      // "no findings for this anchor" vs "no taint layer at all". Probe BOTH
+      // intra (TAINTED) and inter (TAINT_PATH) existence.
+      const probe = await executeParameterized(
+        repo.lbugPath,
+        `MATCH (a:BasicBlock)-[r:CodeRelation]->(b:BasicBlock) WHERE r.type = 'TAINTED' RETURN r.reason AS reason LIMIT 1`,
+        {},
+      );
+      const ipProbe =
+        probe.length === 0
+          ? await executeParameterized(
+              repo.lbugPath,
+              `MATCH (a)-[r:CodeRelation]->(b) WHERE r.type = 'TAINT_PATH' RETURN r.reason AS reason LIMIT 1`,
+              {},
+            )
+          : [];
+      if (probe.length === 0 && ipProbe.length === 0) {
+        return { findings: [], totalFindings: 0, note: NO_TAINT_NOTE };
+      }
+    }
+
+    const findings = rows.map((r: any) => {
+      const sourceBlockId = String(r.sourceBlockId ?? r[0] ?? '');
+      const file = String(r.file ?? r[1] ?? '');
+      const sourceStart = (r.sourceStart ?? r[2]) as number | undefined;
+      const sinkStart = (r.sinkStart ?? r[3]) as number | undefined;
+      const reason = r.reason ?? r[4];
+      // basicBlockId = `BasicBlock:<filePath>:<fnLine>:<fnCol>:<blockIdx>` —
+      // split from the RIGHT (the filePath may itself contain ':').
+      const idParts = sourceBlockId.split(':');
+      const fnLine = Number(idParts[idParts.length - 3]);
+      const decoded = decodeTaintPath(reason);
+      if (!decoded.ok) {
+        // Unreadable reason (foreign/corrupt row): surface the finding's
+        // existence with its block anchors, never throw.
+        return {
+          file,
+          ...(Number.isInteger(fnLine) ? { functionLine: fnLine } : {}),
+          sinkKind: 'unknown',
+          source: { line: sourceStart },
+          sink: { line: sinkStart },
+          hops: [],
+          pathIncomplete: true,
+        };
+      }
+      const hops = decoded.hops.map((h) => ({
+        variable: h.variable,
+        line: h.line,
+        ...(h.viaCall ? { viaCall: true } : {}),
+      }));
+      const first = hops[0];
+      const last = hops[hops.length - 1];
+      return {
+        file,
+        ...(Number.isInteger(fnLine) ? { functionLine: fnLine } : {}),
+        sinkKind: decoded.kind ?? 'unknown',
+        source: first ? { variable: first.variable, line: first.line } : { line: sourceStart },
+        sink: { line: last?.line ?? sinkStart },
+        hops,
+        ...(decoded.truncated ? { pathIncomplete: true } : {}),
+      };
+    });
+
+    // Combine both layers and re-apply the page LIMIT to the union — each
+    // layer was queried with its own LIMIT, so the union can hold up to 2×;
+    // cap it so `findings.length` honours the caller's `limit`. `truncated`
+    // reflects EITHER layer overflowing OR the union being trimmed here, and
+    // `totalFindings` counts both layers' matched rows (the intra COUNT plus
+    // the interproc rows returned — interproc has no separate COUNT, so a
+    // capped interproc layer is reflected via `truncated`, never undercounted
+    // into a false "complete" signal). Review: code-review #2/#4 (explain
+    // accounting + sink-file anchoring) — both layers now accounted.
+    const combined = [...findings, ...interprocFindings];
+    const pageFindings = combined.length > limit ? combined.slice(0, limit) : combined;
+    // Truncated iff EITHER layer overflowed its own LIMIT (strict `>` — exactly
+    // `limit` rows is not truncated), OR the combined union was trimmed to the
+    // page (#2084 review P2-4). `totalFindings` uses the interproc COUNT, not
+    // the capped slice length, so it never undercounts.
+    const truncated =
+      totalFindings > findings.length ||
+      interprocTotal > interprocFindings.length ||
+      combined.length > pageFindings.length;
+
+    return {
+      ...(anchor ? { anchor } : {}),
+      findings: pageFindings,
+      totalFindings: totalFindings + interprocTotal,
+      ...(truncated ? { truncated: true } : {}),
+      note: 'Intra-procedural (TAINTED, statement hops) AND cross-function (TAINT_PATH, function hops, `interprocedural: true`) flows are modeled. Closure/callback, property/field, and implicit flows are NOT modeled; absence of a finding is not proof of safety. Cross-function findings are context-insensitive and may over-attribute among same-named callees. SANITIZES (kill) edges are queryable via cypher.',
+    };
+  }
+
+  private async pdgQuery(
+    repo: RepoHandle,
+    params: { mode?: string; target?: string; variable?: string; limit?: number },
+  ): Promise<any> {
+    try {
+      return await this._pdgQueryImpl(repo, params);
+    } catch (err: any) {
+      const msg = (err instanceof Error ? err.message : String(err)) || 'pdg_query failed';
+      if (isWalCorruptionError(err)) {
+        return { error: msg, recoverySuggestion: WAL_RECOVERY_SUGGESTION };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Query the persisted PDG (#2086 M6) — the control/data-dependence analog of
+   * `explain`. `controls` reads CDG ("under what condition does X run?", branch
+   * sense 'T'|'F' in `reason`); `flows` reads REACHING_DEF (def→use, variable
+   * name in `reason`). Intra-procedural, basic-block granular.
+   *
+   * Bounded by construction: the BasicBlock→BasicBlock partition holds only the
+   * sparse, per-function-capped pdg layers, the query is anchored to one file/
+   * symbol, and the page is LIMIT-bounded (validated integer, interpolated
+   * because LadybugDB does not parameterize LIMIT). LadybugDB has no rel-
+   * property index, so the anchor IS the bound — there is no anchorless mode.
+   *
+   * Symbol↔block join: there is no Function→BasicBlock edge; the SOURCE block
+   * (`a` — controller for CDG, def for REACHING_DEF) is filtered by the
+   * BasicBlock id-prefix (`basicBlockId` template) plus its `startLine` within
+   * the symbol's span. BasicBlock `startLine` is 1-based while symbol-node
+   * `startLine`/`endLine` are 0-based, so BOTH bounds are shifted +1
+   * (`[symStart+1, symEnd+1]`) onto the block basis: the upper +1 keeps a
+   * guard/def/use on the function's final line, and the lower +1 excludes an
+   * adjacent function's block on the line directly above (#2188 review). Both
+   * endpoints share the function (intra-procedural), so filtering the source
+   * endpoint suffices.
+   */
+  private async _pdgQueryImpl(
+    repo: RepoHandle,
+    params: { mode?: string; target?: string; variable?: string; limit?: number } = {},
+  ): Promise<any> {
+    await this.ensureInitialized(repo);
+
+    // Mode validation — the JSON-schema enum is advisory for MCP clients, so
+    // the backend enforces it (an unhandled mode would otherwise fall through).
+    const mode = params.mode;
+    if (mode !== 'controls' && mode !== 'flows') {
+      return {
+        error: `Invalid "mode": expected "controls" or "flows", got ${JSON.stringify(params.mode)}.`,
+      };
+    }
+
+    const rawLimit = params.limit ?? PDG_QUERY_DEFAULT_LIMIT;
+    if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > PDG_QUERY_MAX_LIMIT) {
+      return {
+        error: `Invalid "limit": expected an integer in [1, ${PDG_QUERY_MAX_LIMIT}], got ${JSON.stringify(params.limit)}.`,
+      };
+    }
+    const limit = rawLimit;
+
+    // PDG queries are always anchored (no rel-property index ⇒ an unanchored
+    // basic-block path scan is unbounded). `target` is required.
+    const target = typeof params.target === 'string' ? params.target.trim() : '';
+    if (!target) {
+      return {
+        error:
+          'pdg_query requires a "target" (a file path or symbol/function name) — PDG queries are always anchored.',
+      };
+    }
+
+    const edgeType = mode === 'controls' ? 'CDG' : 'REACHING_DEF';
+    // Definitive: the meta stamp says this layer was never recorded.
+    const NO_PDG_NOTE = `no PDG layer — run gitnexus analyze --pdg to record ${edgeType} edges for this repo`;
+    // Inconclusive: meta is unreadable AND a global probe found zero rows of this
+    // edge type — but a genuinely edge-free layer (all-linear functions) looks
+    // identical to a missing one, so don't assert absence (#2188 review).
+    const PDG_LAYER_UNKNOWN_NOTE = `no ${edgeType} edges found for this target; PDG layer status unknown — was this repo indexed with gitnexus analyze --pdg?`;
+
+    // Cheap meta probe: the layer exists iff the pdg stamp carries the
+    // mode-relevant cap (maxCdgEdgesPerFunction for CDG, maxReachingDef…
+    // for REACHING_DEF). Absent ⇒ the no-layer hint without a DB scan.
+    // `pdgStampForMode` is the shared meta read (the both-caps `pdgLayerStatus`
+    // helper consumes the same underlying read for impact); here we project it
+    // down to this one mode's cap, preserving the tri-state `boolean | undefined`
+    // contract byte-for-byte: `false` ⇒ definitive no-layer (short-circuit
+    // below), `true` ⇒ proceed, `undefined` ⇒ meta unreadable, defer to the
+    // post-anchored-query probe (Feasibility Issue 4).
+    const pdgStamped = await pdgStampForMode(repo.lbugPath, mode);
+    if (pdgStamped === false) {
+      return { mode, results: [], total: 0, note: NO_PDG_NOTE };
+    }
+
+    // Resolve the anchor on the SOURCE block via the shared resolver also used
+    // by explain (#2188): file id-prefix OR symbol span on the corrected
+    // [symStart+1, symEnd+1] window. `target` is required, so the early cases
+    // (not-found/ambiguous) return here and `anchor`/`anchorClause` are always
+    // set below (anchor stays non-optional — no `| undefined` — #2188 CodeQL).
+    const resolved = await this.resolveBlockAnchor(repo, target, 'pdg_query');
+    if (resolved.early) return resolved.early;
+    const { anchorClause, anchor } = resolved;
+    const queryParams = resolved.queryParams;
+
+    // Optional variable filter (flows mode) — REACHING_DEF stores the variable
+    // name in `reason`. FU-B-2 prefixes the name with a `<name>|1:<def>:<use>`
+    // annotation (name FIRST), so match BOTH a legacy bare-name reason (`=`) AND
+    // an annotated one (`STARTS WITH <name>|`). Source identifiers never contain
+    // `|`, so the `<name>|` prefix is exact (it cannot collide with a longer name
+    // — `ab|…` is not a prefix of `abc|…`).
+    let reasonClause = '';
+    if (mode === 'flows' && typeof params.variable === 'string' && params.variable.trim()) {
+      reasonClause = ' AND (r.reason = $variable OR r.reason STARTS WITH $variablePrefix)';
+      const variable = params.variable.trim();
+      queryParams.variable = variable;
+      queryParams.variablePrefix = `${variable}|`;
+    }
+
+    // edgeType is a hardcoded per-mode literal (never user input); `target` /
+    // `variable` flow only through bind params (no Cypher interpolation).
+    const matchClause = `
+      MATCH (a:BasicBlock)-[r:CodeRelation]->(b:BasicBlock)
+      WHERE r.type = '${edgeType}' AND ${anchorClause}${reasonClause}`;
+    const [rows, countRows] = await Promise.all([
+      executeParameterized(
+        repo.lbugPath,
+        `${matchClause}
+      RETURN a.id AS srcId, a.startLine AS srcLine, b.startLine AS dstLine, b.text AS dstText, r.reason AS reason
+      ORDER BY srcId, dstLine, reason
+      LIMIT ${limit}`,
+        queryParams,
+      ),
+      executeParameterized(
+        repo.lbugPath,
+        `${matchClause}\n      RETURN COUNT(*) AS total`,
+        queryParams,
+      ),
+    ]);
+    const total = Number((countRows[0] as any)?.total ?? (countRows[0] as any)?.[0] ?? 0);
+
+    // Unreadable meta + anchored miss: one bounded probe distinguishes "no rows
+    // for this anchor" from "no rows of this edge type at all". With meta
+    // unreadable we cannot tell a missing layer from an edge-free one, so the
+    // note is the inconclusive "status unknown" form, not the definitive
+    // NO_PDG_NOTE (which is reserved for the meta-stamped absence above).
+    if (total === 0 && pdgStamped === undefined) {
+      const probe = await executeParameterized(
+        repo.lbugPath,
+        `MATCH (:BasicBlock)-[r:CodeRelation]->(:BasicBlock) WHERE r.type = '${edgeType}' RETURN r.reason AS reason LIMIT 1`,
+        {},
+      );
+      if (probe.length === 0) return { mode, results: [], total: 0, note: PDG_LAYER_UNKNOWN_NOTE };
+    }
+
+    // basicBlockId = `BasicBlock:<filePath>:<fnLine>:<fnCol>:<blockIdx>` — split
+    // from the RIGHT (filePath may contain ':'). Shared module-scope `fnLineOf`.
+    const results =
+      mode === 'controls'
+        ? rows.map((r: any) => {
+            const fnLine = fnLineOf(String(r.srcId ?? r[0] ?? ''));
+            const dstText = String(r.dstText ?? r[3] ?? '');
+            // A CDG edge into an early-exit block is a guard clause (subsumes
+            // #559): the controller predicate gates the dependent via `label`.
+            const isGuardExit = /^\s*(return|throw|continue|break)\b/.test(dstText);
+            return {
+              ...(Number.isInteger(fnLine) ? { functionLine: fnLine } : {}),
+              controller: { line: (r.srcLine ?? r[1]) as number | undefined },
+              dependent: { line: (r.dstLine ?? r[2]) as number | undefined, text: dstText },
+              label: String(r.reason ?? r[4] ?? ''),
+              ...(isGuardExit ? { guard: true } : {}),
+            };
+          })
+        : rows.map((r: any) => {
+            const fnLine = fnLineOf(String(r.srcId ?? r[0] ?? ''));
+            // FU-B-2: REACHING_DEF `reason` is `<name>` (legacy) or
+            // `<name>|1:<defLine>:<useLine>` — decode to surface the bare
+            // variable name, not the encoded annotation.
+            const variable = decodeReachingDefReason(r.reason ?? r[4] ?? '').name;
+            return {
+              ...(Number.isInteger(fnLine) ? { functionLine: fnLine } : {}),
+              variable,
+              def: { line: (r.srcLine ?? r[1]) as number | undefined },
+              use: {
+                line: (r.dstLine ?? r[2]) as number | undefined,
+                text: String(r.dstText ?? r[3] ?? ''),
+              },
+            };
+          });
+
+    return {
+      mode,
+      anchor,
+      results,
+      total,
+      ...(total > results.length ? { truncated: true } : {}),
     };
   }
 
@@ -2998,6 +4294,9 @@ export class LocalBackend {
 
     // Map diff hunks to indexed symbols via range overlap
     const changedSymbols: any[] = [];
+    // Set if a swallowed graph query fails below — surfaces `partial:true` so a
+    // degraded run cannot report a false-clean `risk_level:'low'` (#2283).
+    let queryDegraded = false;
     for (const fileDiff of fileDiffs) {
       if (fileDiff.hunks.length === 0) continue;
 
@@ -3012,8 +4311,20 @@ export class LocalBackend {
         queryParams[`hunkEnd${i}`] = hunk.endLine;
       });
 
+      // Exclude BasicBlock rows by id prefix: on a --pdg index every edited
+      // function otherwise contributes N nameless BasicBlock pseudo-"symbols"
+      // (they carry filePath/start/end but no name), inflating changed_count
+      // and risk level with rows no consumer can act on (#2082 U7). Blocks
+      // are implementation substrate, not symbols — the owning Function row
+      // already represents the change. The id prefix (`BasicBlock:<file>:…`,
+      // cfg/emit.ts basicBlockId) beats a label predicate (`labels(n)[0]` is
+      // known to come back empty for several node types — see
+      // enrichCandidateLabels) AND beats `n.name IS NOT NULL` (which would
+      // also drop legitimate symbols whose name loaded as NULL, e.g.
+      // quoted-empty CSV fields for anonymous constructs).
       const symbolQuery = `
         MATCH (n) WHERE n.filePath ENDS WITH $filePath
+          AND NOT n.id STARTS WITH 'BasicBlock:'
           AND n.startLine IS NOT NULL AND n.endLine IS NOT NULL
           AND (${overlapConditions})
         RETURN n.id AS id, n.name AS name, labels(n)[0] AS type,
@@ -3033,6 +4344,12 @@ export class LocalBackend {
         }
       } catch (e) {
         logQueryError('detect-changes:file-symbols', e);
+        // The symbol query failed: changedSymbols stays empty and the result
+        // would otherwise look like a clean no-op (`changed_count:0`,
+        // `risk_level:'low'`). detect_changes is the pre-commit safety gate, so
+        // flag the result `partial` rather than let a swallowed failure
+        // masquerade as "nothing changed" (#2283).
+        queryDegraded = true;
       }
     }
 
@@ -3071,6 +4388,7 @@ export class LocalBackend {
         }
       } catch (e) {
         logQueryError('detect-changes:process-lookup', e);
+        queryDegraded = true;
       }
     }
 
@@ -3093,6 +4411,9 @@ export class LocalBackend {
       },
       changed_symbols: changedSymbols,
       affected_processes: Array.from(affectedProcesses.values()),
+      // A swallowed query failure makes the counts/risk above incomplete — tell
+      // the caller so the safety gate isn't trusted as a clean result (#2283).
+      ...(queryDegraded && { partial: true }),
     };
   }
 
@@ -3293,6 +4614,7 @@ export class LocalBackend {
     const allChanges = Array.from(changes.values());
     const totalEdits = allChanges.reduce((sum, c) => sum + c.edits.length, 0);
 
+    const failedFiles: string[] = [];
     if (!dry_run) {
       // Apply edits to files
       for (const change of allChanges) {
@@ -3303,13 +4625,17 @@ export class LocalBackend {
           content = content.replace(regex, new_name);
           await fs.writeFile(fullPath, content, 'utf-8');
         } catch (e) {
+          // A swallowed write failure must not be reported as a full success
+          // (#2283): record the file so the result can degrade to 'partial'
+          // with the unwritten files listed, rather than masquerading as done.
           logQueryError('rename:apply-edit', e);
+          failedFiles.push(change.file_path);
         }
       }
     }
 
     return {
-      status: 'success',
+      status: failedFiles.length > 0 ? 'partial' : 'success',
       old_name: oldName,
       new_name,
       files_affected: allChanges.length,
@@ -3318,6 +4644,278 @@ export class LocalBackend {
       text_search_edits: astSearchEdits,
       changes: allChanges,
       applied: !dry_run,
+      ...(failedFiles.length > 0 && { failed_files: failedFiles }),
+    };
+  }
+
+  private async trace(repo: RepoHandle, params: TraceParams): Promise<any> {
+    try {
+      return await this._traceImpl(repo, params);
+    } catch (err: any) {
+      return {
+        status: 'error',
+        error: (err instanceof Error ? err.message : String(err)) || 'Trace analysis failed',
+        from: { name: params.from },
+        to: { name: params.to },
+        suggestion:
+          'The graph query failed — try gitnexus context <symbol> to see connections, ' +
+          'or check if an interface bridges them.',
+        ...(isWalCorruptionError(err) ? { recoverySuggestion: WAL_RECOVERY_SUGGESTION } : {}),
+      };
+    }
+  }
+
+  private async _traceImpl(repo: RepoHandle, params: TraceParams): Promise<any> {
+    await this.ensureInitialized(repo);
+
+    // resolveSymbolCandidates feeds `from`/`to` into string operations
+    // (e.g. name.includes), so a non-string param would surface a low-level
+    // "x.includes is not a function". Reject it with a clear message instead.
+    const isStringOrAbsent = (v: unknown): boolean => v === undefined || typeof v === 'string';
+    if (
+      !isStringOrAbsent(params.from) ||
+      !isStringOrAbsent(params.to) ||
+      !isStringOrAbsent(params.from_uid) ||
+      !isStringOrAbsent(params.to_uid)
+    ) {
+      return {
+        status: 'error',
+        error: "'from', 'to', and their *_uid variants must be strings.",
+        suggestion: 'Pass symbol names or UIDs as strings, e.g. trace from="A" to="B".',
+      };
+    }
+
+    // A single-repo trace needs a target. Omitting `to` is the destination-trace
+    // shorthand, but that only exists for a cross-repo @group trace — reject a
+    // to-less single-repo call with an actionable error rather than the opaque
+    // "Target symbol 'undefined' not found".
+    const hasTo =
+      (typeof params.to === 'string' && params.to.trim() !== '') ||
+      (typeof params.to_uid === 'string' && params.to_uid.trim() !== '');
+    if (!hasTo) {
+      return {
+        status: 'error',
+        error: 'trace requires `to` (or `to_uid`) for a single-repo trace.',
+        suggestion:
+          'Pass a target symbol, or use repo:"@<group>" and omit `to` to trace `from` to its HTTP destination.',
+      };
+    }
+
+    const fromOutcome = await this.resolveSymbolCandidates(
+      repo,
+      { uid: params.from_uid, name: params.from },
+      { file_path: params.from_file },
+    );
+
+    if (fromOutcome.kind === 'not_found') {
+      return {
+        status: 'not_found',
+        error: `Source symbol '${params.from_uid ?? params.from}' not found.`,
+        suggestion: 'Check the symbol name or use --from-uid for zero-ambiguity.',
+      };
+    }
+    if (fromOutcome.kind === 'ambiguous') {
+      return {
+        status: 'ambiguous',
+        role: 'from',
+        message: `Found ${fromOutcome.candidates.length} symbols matching '${params.from}'. Disambiguate with --from-uid.`,
+        candidates: fromOutcome.candidates,
+      };
+    }
+
+    const toOutcome = await this.resolveSymbolCandidates(
+      repo,
+      { uid: params.to_uid, name: params.to },
+      { file_path: params.to_file },
+    );
+
+    if (toOutcome.kind === 'not_found') {
+      return {
+        status: 'not_found',
+        error: `Target symbol '${params.to_uid ?? params.to}' not found.`,
+        suggestion: 'Check the symbol name or use --to-uid for zero-ambiguity.',
+      };
+    }
+    if (toOutcome.kind === 'ambiguous') {
+      return {
+        status: 'ambiguous',
+        role: 'to',
+        message: `Found ${toOutcome.candidates.length} symbols matching '${params.to}'. Disambiguate with --to-uid.`,
+        candidates: toOutcome.candidates,
+      };
+    }
+
+    const fromSym = fromOutcome.symbol;
+    const toSym = toOutcome.symbol;
+
+    if (fromSym.id === toSym.id) {
+      return {
+        status: 'ok',
+        from: { name: fromSym.name, filePath: fromSym.filePath, startLine: fromSym.startLine },
+        to: { name: toSym.name, filePath: toSym.filePath, startLine: toSym.startLine },
+        hopCount: 0,
+        hops: [{ name: fromSym.name, filePath: fromSym.filePath, startLine: fromSym.startLine }],
+        edges: [],
+      };
+    }
+
+    // Sanitize maxDepth at the real boundary: the MCP inputSchema's
+    // minimum/maximum is advisory only (callTool is reachable directly), so a
+    // caller can pass 0, a negative, NaN, or a non-integer. `??` does NOT
+    // recover 0/NaN, and Math.min has no lower bound — left unguarded, any of
+    // those makes the BFS loop run zero iterations and return a false no_path.
+    const DEFAULT_TRACE_DEPTH = 10;
+    const MAX_TRACE_DEPTH = 30;
+    const requestedDepth =
+      Number.isInteger(params.maxDepth) && (params.maxDepth as number) > 0
+        ? (params.maxDepth as number)
+        : DEFAULT_TRACE_DEPTH;
+    const maxDepth = Math.min(requestedDepth, MAX_TRACE_DEPTH);
+    const includeTests = params.includeTests ?? false;
+    // Traversal vocabulary: CALLS for actual calls, HAS_METHOD so a class-rooted
+    // trace can descend into its methods. Not "calls only" — per-hop edge type is
+    // surfaced in edges[] so containment hops stay distinguishable.
+    const TRAVERSAL_EDGE_TYPES = ['CALLS', 'HAS_METHOD'];
+
+    // Bound the traversal so a high-fanout hub (a logger/util reached by many
+    // symbols) can't materialize an unbounded frontier. Per-level rows are
+    // capped and the total visited set is capped; either cap sets `truncated`
+    // so a resulting no_path is never reported as if the graph was exhausted.
+    const PER_NODE_FANOUT_CAP = 200;
+    const ABS_ROW_CAP = 5000;
+    const MAX_VISITED = 50000;
+    let truncated = false;
+
+    const visited = new Set<string>([fromSym.id]);
+    let frontier = [fromSym.id];
+    const parent = new Map<
+      string,
+      {
+        from: string;
+        name: string;
+        filePath: string;
+        startLine: number;
+        edgeType: string;
+        confidence: number;
+      }
+    >();
+
+    let found = false;
+    // The last node discovered at the deepest reached level — surfaced as
+    // `furthest` in the no_path response to hint where the chain breaks.
+    let lastReached: {
+      name: string;
+      filePath: string;
+      startLine: number;
+    } | null = null;
+    let reachedDepth = 0;
+
+    for (let depth = 1; depth <= maxDepth && frontier.length > 0 && !found; depth++) {
+      const nextFrontier: string[] = [];
+      // LadybugDB/Kuzu does not support a parameterized LIMIT, so the cap is
+      // interpolated (it is a derived integer, not user input).
+      const rowCap = Math.min(frontier.length * PER_NODE_FANOUT_CAP, ABS_ROW_CAP);
+
+      const rows = await executeParameterized(
+        repo.lbugPath,
+        `MATCH (n)-[r:CodeRelation]->(m)
+         WHERE n.id IN $frontierIds AND r.type IN $edgeTypes
+         RETURN n.id AS sourceId, m.id AS id, m.name AS name, labels(m)[0] AS type,
+                m.filePath AS filePath, m.startLine AS startLine,
+                r.type AS edgeType, r.confidence AS confidence
+         LIMIT ${rowCap}`,
+        { frontierIds: frontier, edgeTypes: TRAVERSAL_EDGE_TYPES },
+      );
+
+      // A clipped level may have dropped a node that lies on the only shortest
+      // path, so any subsequent no_path is not authoritative.
+      if (rows.length >= rowCap) truncated = true;
+
+      for (const row of rows) {
+        // Decode once. The `?? row[N]` fallback handles LadybugDB tuple-mode
+        // returns; the positional indices mirror the RETURN column order above.
+        const nodeId = (row.id ?? row[1]) as string;
+        const sourceId = (row.sourceId ?? row[0]) as string;
+        const name = (row.name ?? row[2]) as string;
+        const filePath = (row.filePath ?? row[4]) as string;
+        const startLine = (row.startLine ?? row[5]) as number;
+        const edgeType = (row.edgeType ?? row[6]) as string;
+        const storedConfidence = row.confidence ?? row[7];
+        const confidence =
+          typeof storedConfidence === 'number' && storedConfidence > 0
+            ? storedConfidence
+            : confidenceForRelType(edgeType);
+
+        // Match the explicitly-requested target before the test-file filter.
+        // resolveSymbolCandidates does not exclude test-file symbols, so a
+        // target (or a required hop) that lives in a test file would otherwise
+        // be dropped by the includeTests guard below and produce a false
+        // no_path even when a direct edge exists.
+        if (nodeId === toSym.id) {
+          parent.set(nodeId, { from: sourceId, name, filePath, startLine, edgeType, confidence });
+          found = true;
+          break;
+        }
+
+        // Skip non-target nodes that live in test files unless includeTests.
+        if (!includeTests && isTestFilePath(filePath)) continue;
+
+        if (!visited.has(nodeId)) {
+          visited.add(nodeId);
+          parent.set(nodeId, { from: sourceId, name, filePath, startLine, edgeType, confidence });
+          nextFrontier.push(nodeId);
+          lastReached = { name, filePath, startLine };
+          reachedDepth = depth;
+        }
+      }
+
+      frontier = nextFrontier;
+      if (visited.size >= MAX_VISITED) {
+        truncated = true;
+        break;
+      }
+    }
+
+    if (found) {
+      const path: Array<{ name: string; filePath: string; startLine: number }> = [];
+      const edges: Array<{ relType: string; confidence: number }> = [];
+      let current = toSym.id;
+
+      while (current !== fromSym.id) {
+        const info = parent.get(current)!;
+        path.unshift({ name: info.name, filePath: info.filePath, startLine: info.startLine });
+        edges.unshift({ relType: info.edgeType, confidence: info.confidence });
+        current = info.from;
+      }
+      path.unshift({
+        name: fromSym.name,
+        filePath: fromSym.filePath,
+        startLine: fromSym.startLine,
+      });
+
+      return {
+        status: 'ok',
+        from: { name: fromSym.name, filePath: fromSym.filePath, startLine: fromSym.startLine },
+        to: { name: toSym.name, filePath: toSym.filePath, startLine: toSym.startLine },
+        hopCount: edges.length,
+        hops: path,
+        edges,
+      };
+    }
+
+    return {
+      status: 'no_path',
+      from: { name: fromSym.name, filePath: fromSym.filePath, startLine: fromSym.startLine },
+      to: { name: toSym.name, filePath: toSym.filePath, startLine: toSym.startLine },
+      furthest: lastReached ? { ...lastReached, depth: reachedDepth } : null,
+      ...(truncated ? { truncated: true } : {}),
+      suggestion: truncated
+        ? 'Search was truncated at a traversal cap before exhausting the graph — a path ' +
+          'may still exist. Narrow the search (a lower --depth, or trace from a more ' +
+          'specific symbol), or use gitnexus context <symbol> to inspect connections.'
+        : 'No directed path found. The call chain likely breaks at dynamic dispatch, ' +
+          'reflection, or an external API boundary. Try gitnexus context <symbol> to see ' +
+          "both symbols' connections, or check if an interface/abstraction bridges them.",
     };
   }
 
@@ -3326,14 +4924,34 @@ export class LocalBackend {
       return await this._impactImpl(repo, params);
     } catch (err: any) {
       // Return structured error instead of crashing (#321)
+      const message =
+        (err instanceof Error ? err.message : String(err)) || 'Impact analysis failed';
+      const suggestion = 'The graph query failed — try gitnexus context <symbol> as a fallback';
+      const recoverySuggestion = isWalCorruptionError(err) ? WAL_RECOVERY_SUGGESTION : undefined;
+      if (params.mode === 'pdg') {
+        // Symbol resolution never reached the catch with a resolved symbol (the
+        // throw can originate before/within resolution), so the envelope carries
+        // the partial-but-typed target — typed as PdgImpactTarget so the partial
+        // is type-checked, not an inline literal in a Promise<any> hole.
+        const target: PdgImpactTarget = { name: params.target };
+        const pdgErr: PdgImpactErrorResult = makePdgImpactErrorResult({
+          mode: 'pdg',
+          error: message,
+          target,
+          direction: params.direction,
+          suggestion,
+          recoverySuggestion,
+        });
+        return pdgErr;
+      }
       return {
-        error: (err instanceof Error ? err.message : String(err)) || 'Impact analysis failed',
+        error: message,
         target: { name: params.target },
         direction: params.direction,
         impactedCount: 0,
         risk: 'UNKNOWN',
-        suggestion: 'The graph query failed — try gitnexus context <symbol> as a fallback',
-        ...(isWalCorruptionError(err) ? { recoverySuggestion: WAL_RECOVERY_SUGGESTION } : {}),
+        suggestion,
+        ...(recoverySuggestion ? { recoverySuggestion } : {}),
       };
     }
   }
@@ -3342,6 +4960,94 @@ export class LocalBackend {
     await this.ensureInitialized(repo);
 
     const { target, direction } = params;
+
+    // ── Dispatch order (KTD5) ──────────────────────────────────────────
+    // (1) Validate `mode`. Absent/'callgraph' → unchanged path; 'pdg' → the
+    // intra-procedural PDG engine; anything else → hard error.
+    // This MUST come before resolveSymbolCandidates so the ambiguous branch can
+    // fork on the validated mode and never run the callgraph fan-out under pdg.
+    const modeResult = validateImpactMode(params.mode);
+    if ('error' in modeResult) {
+      return {
+        error: modeResult.error,
+        target: { name: target },
+        direction,
+        impactedCount: 0,
+        risk: 'UNKNOWN',
+      };
+    }
+    const mode = modeResult.mode;
+
+    // #2279: some MCP client/agent adapters serialize an *omitted* optional
+    // numeric field as `0` rather than dropping it, so callgraph calls arrive
+    // carrying a spurious `line: 0`. `line` is meaningless on the callgraph path
+    // (the symbol→symbol BFS has no statement notion), so treat a literal `0`
+    // there as omitted and let the normal traversal run. The coercion is
+    // deliberately narrow — only the literal `0`, only when mode !== 'pdg':
+    // a genuine positive `line` on callgraph still errors (real mode mistake),
+    // negative/fractional values still error, and pdg mode is untouched (the
+    // normalization is an identity there, so `line: 0` is still rejected below —
+    // there is no 1-based source line `0` to anchor on).
+    const effectiveLine = mode !== 'pdg' && params.line === 0 ? undefined : params.line;
+
+    // `line` is a PDG-only statement anchor. Reject it on the callgraph path
+    // rather than silently ignore (the symbol→symbol BFS has no statement notion).
+    if (effectiveLine !== undefined && mode !== 'pdg') {
+      return {
+        error: `Parameter 'line' is only supported with mode:'pdg' (it anchors the dependence slice on a statement). Remove it or set mode:'pdg'.`,
+        target: { name: params.target },
+        direction: params.direction,
+        impactedCount: 0,
+        risk: 'UNKNOWN',
+      };
+    }
+    // A provided `line` must be a positive integer.
+    if (
+      effectiveLine !== undefined &&
+      (!Number.isInteger(effectiveLine) || (effectiveLine as number) < 1)
+    ) {
+      // Line param fails validation before target resolution → partial-but-typed
+      // target on the pdg path (typed PdgImpactTarget, not an inline literal).
+      const badLineTarget: PdgImpactTarget = { name: params.target };
+      return mode === 'pdg'
+        ? makePdgImpactErrorResult({
+            mode: 'pdg',
+            error: `Parameter 'line' must be a positive integer (1-based source line), got ${JSON.stringify(params.line)}.`,
+            target: badLineTarget,
+            direction: params.direction,
+          })
+        : {
+            error: `Parameter 'line' must be a positive integer (1-based source line), got ${JSON.stringify(params.line)}.`,
+            target: { name: params.target },
+            direction: params.direction,
+            impactedCount: 0,
+            risk: 'UNKNOWN',
+          };
+    }
+
+    if (mode === 'pdg') {
+      // PDG mode is now unified inside a single repo: it combines the local
+      // CDG/RD statement slice with the same inter-symbol reach used for the
+      // option-driven comparison path. Cross-repo fan-out remains a callgraph
+      // feature, so crossDepth is still a loud error rather than a silent ignore.
+      const incompatible: string[] = [];
+      if (params.crossDepth !== undefined) incompatible.push('crossDepth');
+      if (incompatible.length > 0) {
+        // crossDepth is rejected before target resolution → partial-but-typed
+        // target (typed PdgImpactTarget).
+        const crossDepthTarget: PdgImpactTarget = { name: target };
+        const pdgErr: PdgImpactErrorResult = makePdgImpactErrorResult({
+          mode: 'pdg',
+          error:
+            `Parameter(s) ${incompatible.join(', ')} are not supported with mode:'pdg' ` +
+            `(single-repo PDG impact). Remove them or use mode:'callgraph' for cross-repo fan-out.`,
+          target: crossDepthTarget,
+          direction,
+        });
+        return pdgErr;
+      }
+    }
+
     const maxDepth = params.maxDepth || 3;
     // Map legacy relation type names before filtering (backward compat for OVERRIDES → METHOD_OVERRIDES)
     const mappedRelTypes = params.relationTypes?.flatMap((t: string) =>
@@ -3394,31 +5100,181 @@ export class LocalBackend {
 
     if (outcome.kind === 'not_found') {
       const missing = params.target_uid ?? target;
-      return {
-        error: `Target '${missing}' not found`,
-        target: { name: target },
-        direction,
-        impactedCount: 0,
-        risk: 'UNKNOWN',
-      };
+      // not_found = no resolved symbol, so the envelope keeps the partial-but-
+      // typed target (typed PdgImpactTarget — there is no id/type/filePath yet).
+      const notFoundTarget: PdgImpactTarget = { name: target };
+      return mode === 'pdg'
+        ? makePdgImpactErrorResult({
+            mode: 'pdg',
+            error: `Target '${missing}' not found`,
+            target: notFoundTarget,
+            direction,
+          })
+        : {
+            error: `Target '${missing}' not found`,
+            target: { name: target },
+            direction,
+            impactedCount: 0,
+            risk: 'UNKNOWN',
+          };
     }
 
     if (outcome.kind === 'ambiguous') {
+      // Shared truncation cap for the ambiguous candidate list — both the pdg
+      // branch (shows candidates) and the callgraph branch (probes candidates)
+      // bound to this many.
+      const AMBIGUOUS_MAX_CANDIDATES = 6;
+      // KTD5 ambiguous trap — under mode:'pdg' we MUST NOT fall into the
+      // callgraph fan-out below: it runs `_runImpactBFS` per candidate, which
+      // would silently execute the call-graph engine under a `pdg` call (the
+      // exact silent fallback KTD5 forbids). For U1 the pdg ambiguous path
+      // returns the candidate list WITHOUT any callgraph probe; the full pdg
+      // ambiguous handling (per-candidate PDG summaries / ranking) lands in U4.
+      if (mode === 'pdg') {
+        const truncated = outcome.candidates.length > AMBIGUOUS_MAX_CANDIDATES;
+        const shown = outcome.candidates.slice(0, AMBIGUOUS_MAX_CANDIDATES);
+        return {
+          status: 'ambiguous',
+          mode,
+          message:
+            `Found ${outcome.candidates.length} symbols matching '${target}'` +
+            (truncated ? ` (showing ${shown.length} of ${outcome.candidates.length})` : '') +
+            `. Disambiguate with target_uid (or file_path/kind) for a single ` +
+            `authoritative PDG result.`,
+          target: { name: target },
+          direction,
+          totalCandidates: outcome.candidates.length,
+          // No single resolved symbol → impactedCount stays 0 / risk UNKNOWN
+          // (UNKNOWN must never read as "safe to refactor"). No callgraph
+          // fan-out runs, so there is no per-candidate blast radius here yet.
+          impactedCount: 0,
+          risk: 'UNKNOWN',
+          ...(truncated && { candidatesTruncated: true }),
+          candidates: shown.map((c) => ({
+            uid: c.id,
+            name: c.name,
+            kind: c.type,
+            filePath: c.filePath,
+            line: toDisplayLine(c.startLine),
+            score: Number(c.score.toFixed(2)),
+          })),
+        };
+      }
+
+      // #2129 — a bare name that collides with several symbols must NOT report a
+      // bare `impactedCount: 0`. The real blast radius lives under whichever
+      // candidate the caller meant; a flat zero here is precisely the silent
+      // under-report the "run impact before editing" workflow exists to prevent
+      // (the dropped caller calls a *different* same-name node, so it never shows
+      // up against the one the resolver happened to pick). Run a bounded,
+      // summary-only BFS per candidate so each one's true count + risk is
+      // visible, and surface the maximum at the top level so the headline can
+      // never read as "safe to refactor". Candidates arrive sorted by score.
+      const probed = outcome.candidates.slice(0, AMBIGUOUS_MAX_CANDIDATES);
+      // `partialProbe` is intentionally a SECOND incompleteness flag, distinct
+      // from the traversal-interrupted `partial` flag used elsewhere: it means
+      // one or more per-candidate probes threw, so maxRisk / maxImpactedCount
+      // are lower bounds over the probes that succeeded (a failed candidate must
+      // not be masked by a benign sibling success).
+      let probeFailed = false;
+      const candidateSummaries = await Promise.all(
+        probed.map(async (c) => {
+          const cType = c.type || '';
+          const cRelTypes =
+            (cType === 'Class' || cType === 'Interface') &&
+            !hasExplicitRelationTypes &&
+            !relationTypes.includes('ACCESSES')
+              ? [...relationTypes, 'ACCESSES']
+              : relationTypes;
+          // #1858/#2129 review F8 — name the shape the probe summary is read
+          // through (`_runImpactBFS` returns `Promise<any>`, so this is the
+          // narrowing cast) so a future rename of those fields fails tsc instead
+          // of silently zeroing candidate counts.
+          let summary: {
+            impactedCount: number;
+            risk: string;
+            summary?: { direct: number };
+          } | null = null;
+          try {
+            summary = await this._runImpactBFS(
+              repo,
+              { id: c.id, name: c.name, filePath: c.filePath },
+              cType,
+              direction,
+              {
+                maxDepth,
+                relationTypes: cRelTypes,
+                includeTests,
+                minConfidence,
+                summaryOnly: true,
+                skipEpistemic: true,
+                skipEnrichment: true,
+              },
+            );
+          } catch (e) {
+            probeFailed = true;
+            logQueryError('impact:ambiguous-candidate', e);
+          }
+          return {
+            uid: c.id,
+            name: c.name,
+            kind: c.type,
+            filePath: c.filePath,
+            line: toDisplayLine(c.startLine),
+            score: Number(c.score.toFixed(2)),
+            impactedCount: summary?.impactedCount ?? 0,
+            risk: summary?.risk ?? 'UNKNOWN',
+            direct: summary?.summary?.direct ?? 0,
+          };
+        }),
+      );
+
+      // Rank by blast radius so the most-impactful interpretation is first, and
+      // hoist the maximum count/risk to the top level so the response cannot be
+      // misread as "no impact".
+      candidateSummaries.sort((a, b) => b.impactedCount - a.impactedCount);
+      const maxImpactedCount = candidateSummaries.reduce((m, c) => Math.max(m, c.impactedCount), 0);
+      const RISK_ORDER = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
+      // If EVERY candidate probe failed (all 'UNKNOWN' — e.g. pool exhaustion
+      // under the fan-out), the worst real risk is genuinely unknown, not LOW.
+      // Reporting LOW here would re-introduce the false-safe signal. Only fall to
+      // the LOW seed when at least one candidate produced a real risk.
+      const anyKnownRisk = candidateSummaries.some((c) => RISK_ORDER.includes(c.risk));
+      const maxRisk = anyKnownRisk
+        ? candidateSummaries.reduce(
+            (worst, c) => (RISK_ORDER.indexOf(c.risk) > RISK_ORDER.indexOf(worst) ? c.risk : worst),
+            'LOW',
+          )
+        : 'UNKNOWN';
+      const truncated = outcome.candidates.length > probed.length;
+
       return {
         status: 'ambiguous',
-        message: `Found ${outcome.candidates.length} symbols matching '${target}'. Use target_uid, file_path, or kind to disambiguate.`,
+        message:
+          `Found ${outcome.candidates.length} symbols matching '${target}'` +
+          (truncated
+            ? ` (showing ${candidateSummaries.length} of ${outcome.candidates.length})`
+            : '') +
+          `. Blast radius differs per candidate (max ${maxImpactedCount} impacted at risk ${maxRisk}). ` +
+          `Disambiguate with target_uid (or file_path/kind) for a single authoritative result.`,
         target: { name: target },
         direction,
+        // Full match count — `candidates[]` is truncated to AMBIGUOUS_MAX_CANDIDATES,
+        // so consumers (CLI formatter) need this to report "N of M" honestly (#2129
+        // review F11; the CLI previously read the truncated array length).
+        totalCandidates: outcome.candidates.length,
+        // `impactedCount` stays 0 and `risk` stays UNKNOWN — there is no single
+        // resolved symbol, and UNKNOWN must NOT read as "safe to refactor". The
+        // real blast radius is surfaced per-candidate plus `maxImpactedCount` /
+        // `maxRisk` so a real caller can never hide behind the ambiguous zero
+        // (#2129).
         impactedCount: 0,
         risk: 'UNKNOWN',
-        candidates: outcome.candidates.map((c) => ({
-          uid: c.id,
-          name: c.name,
-          kind: c.type,
-          filePath: c.filePath,
-          line: c.startLine,
-          score: Number(c.score.toFixed(2)),
-        })),
+        maxImpactedCount,
+        maxRisk,
+        ...(probeFailed ? { partialProbe: true } : {}),
+        ...(truncated && { candidatesTruncated: true }),
+        candidates: candidateSummaries,
       };
     }
 
@@ -3426,8 +5282,48 @@ export class LocalBackend {
       id: outcome.symbol.id,
       name: outcome.symbol.name,
       filePath: outcome.symbol.filePath,
+      // Carry the resolved span so the PDG seed anchors on THIS symbol directly,
+      // without re-resolving its (possibly ambiguous) name (FIX 1).
+      startLine: outcome.symbol.startLine,
+      endLine: outcome.symbol.endLine,
     };
     const symType = outcome.resolvedLabel || outcome.symbol.type || '';
+
+    // (2) PDG-layer presence probe (U2, KTD7) — the four-state degradation
+    // contract after target resolution, before traversal. A repo never analyzed
+    // with `--pdg` (no-layer), one with only a partial layer (sub-layer-missing
+    // — impact needs BOTH CDG and REACHING_DEF), or one whose meta is unreadable
+    // (unknown) each returns a distinct guidance note here rather than a
+    // confusing empty blast radius. Resolve first so target-known degraded
+    // responses keep the same id/type/filePath envelope as successful PDG
+    // responses; only `ready` falls through to traversal.
+    // Hoisted so the (4) traversal branch can read `layer.hasCallSummary` (FU-C):
+    // the same single meta-stamp probe serves both the degradation gate and the
+    // ascent-availability note — no second probe.
+    let layer: PdgLayerStatus | undefined;
+    if (mode === 'pdg') {
+      layer = await pdgLayerStatus({
+        lbugPath: repo.lbugPath,
+        executeParameterized,
+      });
+      if (isPdgDegradedLayerStatus(layer)) {
+        // Degradation occurs AFTER target resolution → thread the FULL typed
+        // envelope ({ id, name, type, filePath }) so degraded responses keep the
+        // same target shape as a successful PDG result (typed PdgImpactTarget).
+        const degradedTarget: PdgImpactTarget = {
+          id: sym.id,
+          name: sym.name,
+          type: symType || 'Function',
+          filePath: sym.filePath,
+        };
+        return makePdgLayerDegradedResult({
+          mode,
+          layer,
+          target: degradedTarget,
+          direction,
+        });
+      }
+    }
 
     const effectiveRelationTypes =
       (symType === 'Class' || symType === 'Interface') &&
@@ -3435,6 +5331,90 @@ export class LocalBackend {
       !relationTypes.includes('ACCESSES')
         ? [...relationTypes, 'ACCESSES']
         : relationTypes;
+
+    // (4) single → route the resolved symbol to the engine selected by `mode`.
+    if (mode === 'pdg') {
+      const pdgResult = await this._runImpactPDG({
+        repo,
+        sym,
+        symType,
+        direction,
+        maxDepth,
+        // Use the normalized line, not raw params.line, so the gate and the
+        // engine share one source of truth (#2283). Identity in pdg mode today
+        // — effectiveLine === params.line when mode === 'pdg' — but this stays
+        // correct if the normalization ever stops being an identity here.
+        line: effectiveLine,
+        limit: Number.isFinite(params.limit) ? params.limit : 100,
+        // KTD2 extraction-seam discipline: hand the engine its DB dependency
+        // explicitly rather than `this.`-binding it. LocalBackend owns repo
+        // lifecycle; `pdg-impact.ts` owns traversal/projection.
+        executeParameterized,
+        // FU-C: thread the CALL_SUMMARY layer presence read above (meta stamp) so
+        // the engine notes "no return-value ascent (re-index)" on a pre-FU-C (v3)
+        // index. `layer.hasCallSummary` is set on every meta-readable state.
+        callSummaryAvailable: layer?.hasCallSummary === true,
+      });
+
+      // Statement-precise inter-procedural reach: a first-hop callee is "proven"
+      // iff it is invoked in a block of the criterion's dependence slice. The
+      // slice = the seed block(s) (the changed line itself) UNION the dependent
+      // reachable blocks — both carry the leaf callee names they call
+      // (`BasicBlock.callees`). The seed block is included because a callee
+      // invoked directly on the changed line is the most-directly-impacted one,
+      // yet `reachableBlocks` excludes the seed by the seed-minus-reachable
+      // convention. Upstream seeds carry no discriminating slice, so the bridge
+      // falls back to preserving callgraph reach.
+      // `_runImpactPDG` returns the PdgImpactResult union; only the success/empty
+      // slice results carry intraReachableBlocks/seedBlocks (degraded and error
+      // results do not). Narrow via the same discriminant the composer uses, then
+      // read the typed string[] slices — no `as any`.
+      const sliceResult = 'error' in pdgResult || 'pdgLayer' in pdgResult ? null : pdgResult;
+      // FIX 6: key the "first-hop proven" set on the INTRA-procedural slice only
+      // (seed ∪ intra-reachable), NOT `reachableBlocks` — which the U1 descent now
+      // EXPANDS with inter-procedurally-reached callee blocks. Using the expanded
+      // superset would mark transitively-reached (2+ hop) callgraph targets as
+      // first-hop "proven", silently shifting the established statementPrecision
+      // semantics. The interproc-reached blocks are routed into the statement
+      // slice / block→symbol projection inside `_runImpactPDG` only.
+      const intraReachableBlocks: string[] = sliceResult?.intraReachableBlocks ?? [];
+      const seedBlocks: string[] = sliceResult?.seedBlocks ?? [];
+      const sliceBlocks = [...seedBlocks, ...intraReachableBlocks];
+      const sliceCalleeNames =
+        direction === 'downstream' && sliceBlocks.length > 0
+          ? await this.calleesOfBlocks(repo, sliceBlocks)
+          : new Set<string>();
+      // Resolved-id slice set (sound primary key, KTD3): unioned from the SAME
+      // seed ∪ reachable block set as the names — so a callee invoked only on the
+      // seeded line is still provable by id. Absent on a pre-v3 index (no
+      // `calleeIds` column) → empty → the bridge falls back to the leaf-name match.
+      const sliceCalleeIds =
+        direction === 'downstream' && sliceBlocks.length > 0
+          ? await this.calleeIdsOfBlocks(repo, sliceBlocks)
+          : new Set<string>();
+      // Build the bridge when EITHER the name fallback or the id key has signal —
+      // an id-only index (names empty but ids present) must still seed the bridge.
+      const pdgBridge: PdgBridgeOptions | undefined =
+        sliceCalleeNames.size > 0 || sliceCalleeIds.size > 0
+          ? { sliceCalleeNames, sliceCalleeIds }
+          : undefined;
+
+      try {
+        const interproceduralResult = await this._runImpactBFS(repo, sym, symType, direction, {
+          maxDepth,
+          relationTypes: effectiveRelationTypes,
+          includeTests,
+          minConfidence,
+          limit: Number.isFinite(params.limit) ? params.limit : 100,
+          offset: Number.isFinite(params.offset) ? params.offset : 0,
+          pdgBridge,
+        });
+        return composeUnifiedPdgImpactResult(pdgResult, interproceduralResult);
+      } catch (e) {
+        logQueryError('impact:pdg-interprocedural-reach', e);
+        return composeUnifiedPdgImpactResult(pdgResult, null, e);
+      }
+    }
 
     return this._runImpactBFS(repo, sym, symType, direction, {
       maxDepth,
@@ -3445,6 +5425,209 @@ export class LocalBackend {
       offset: Number.isFinite(params.offset) ? params.offset : 0,
       summaryOnly: params.summaryOnly,
     });
+  }
+
+  /**
+   * Union of the leaf callee names invoked across a set of dependence-slice
+   * blocks (`BasicBlock.callees`, space-joined at emit). Drives statement-precise
+   * inter-procedural evidence: a first-hop callee reached from the criterion is
+   * "proven" (callgraph-bridge) iff its name is in this set, else unproven-bridge.
+   * Empty when the slice blocks call nothing or carry no harvested callees
+   * (non-TS/JS or synthetic ENTRY/EXIT blocks) — the bridge then preserves
+   * callgraph reach. A query failure is logged and degrades to empty (no proof),
+   * never throws (the inter-procedural reach is still returned).
+   */
+  private async calleesOfBlocks(repo: RepoHandle, blockIds: string[]): Promise<Set<string>> {
+    const names = new Set<string>();
+    if (blockIds.length === 0) return names;
+    try {
+      const rows = await executeParameterized(
+        repo.lbugPath,
+        `MATCH (b:BasicBlock) WHERE b.id IN $ids RETURN b.callees AS callees`,
+        { ids: blockIds },
+      );
+      for (const r of rows as any[]) {
+        const raw = String(r.callees ?? r[0] ?? '');
+        for (const n of raw.split(' ')) if (n) names.add(n);
+      }
+    } catch (e) {
+      logQueryError('impact:pdg-slice-callees', e);
+    }
+    return names;
+  }
+
+  /**
+   * Union of the RESOLVED callee symbol ids invoked across a set of
+   * dependence-slice blocks (`BasicBlock.calleeIds`, space-joined at emit —
+   * sibling of `callees`). This is the SOUND key the bridge prefers: a first-hop
+   * callee is proven statement-precise iff its resolved id is in this set, which
+   * eliminates the same-leaf-name collision (false-positive) and import-alias
+   * (false-negative) the name set cannot distinguish. Empty when the slice blocks
+   * carry no captured ids (pre-v3 index without the `calleeIds` column, or
+   * non-overloading/synthetic blocks) — the bridge then falls back to the
+   * leaf-name match per U5. A query failure is logged and degrades to empty (no
+   * proof), never throws (the inter-procedural reach is still returned). Mirrors
+   * `calleesOfBlocks` exactly — same shape, same swallow-on-error contract.
+   */
+  private async calleeIdsOfBlocks(repo: RepoHandle, blockIds: string[]): Promise<Set<string>> {
+    const ids = new Set<string>();
+    if (blockIds.length === 0) return ids;
+    try {
+      const rows = await executeParameterized(
+        repo.lbugPath,
+        `MATCH (b:BasicBlock) WHERE b.id IN $ids RETURN b.calleeIds AS calleeIds`,
+        { ids: blockIds },
+      );
+      for (const r of rows) {
+        // Shared split-and-drop-sentinel logic (`splitCalleeIds`) so this bridge
+        // key and the inter-procedural descent cannot diverge. The sentinel marks
+        // a capped block (handled by the names-sentinel check in the bridge) and
+        // is not a resolved symbol id, so it never enters the `has(realId)` set.
+        for (const id of splitCalleeIds(r.calleeIds ?? r[0])) ids.add(id);
+      }
+    } catch (e) {
+      logQueryError('impact:pdg-slice-callee-ids', e);
+    }
+    return ids;
+  }
+
+  /**
+   * Delegates the PDG impact engine to `pdg-impact.ts`.
+   *
+   * The private method remains as the LocalBackend dispatch seam so existing
+   * tests can keep asserting that `mode:'pdg'` routes through the PDG
+   * statement engine before LocalBackend attaches interprocedural symbol reach.
+   * The traversal/projection/result assembly lives in the extracted helper
+   * module.
+   */
+  private async _runImpactPDG(deps: {
+    repo: RepoHandle;
+    sym: { id: string; name: string; filePath: string; startLine?: number; endLine?: number };
+    symType: string;
+    direction: 'upstream' | 'downstream';
+    maxDepth: number;
+    limit: number;
+    line?: number;
+    executeParameterized: typeof executeParameterized;
+    callSummaryAvailable?: boolean;
+  }): Promise<PdgImpactResult> {
+    return runImpactPDG(deps);
+  }
+
+  /**
+   * #1858 — epistemic lower-bound detection.
+   *
+   * impact()/context() traverse only edges materialized in the graph. When the
+   * queried symbol sits on an interface / abstract boundary, callers that bind
+   * to the interface via DI, a container, or dynamic dispatch — rather than
+   * naming the concrete symbol — are not traced. The reported count is then a
+   * lower bound, not an exact figure. Instead of returning a confident count
+   * that silently omits those callers, annotate the result with
+   * `epistemic: 'lower-bound'` plus a human-readable boundary note. A fully
+   * resolved leaf with no indirection stays `epistemic: 'exact'`.
+   *
+   * Aligns with the numeric confidence model rather than the long-deleted
+   * TIER_CONFIDENCE enum: the heritage/indirection edges this keys on
+   * (IMPLEMENTS / METHOD_IMPLEMENTS / EXTENDS) carry the 0.85
+   * `IMPACT_RELATION_CONFIDENCE` floor — "statically verifiable, but the
+   * concrete binding past it is not".
+   *
+   * Never throws: on query error it returns 'exact', so it can only add signal,
+   * never suppress a result.
+   */
+  private async computeEpistemicBoundary(
+    repo: RepoHandle,
+    symId: string,
+    symType: string,
+    symName: string,
+  ): Promise<{ epistemic: 'exact' | 'lower-bound'; boundaries?: string[] }> {
+    const HERITAGE_TYPES = EPISTEMIC_HERITAGE_RELATION_TYPES;
+    const CONSUMER_TYPES = EPISTEMIC_CONSUMER_RELATION_TYPES;
+    try {
+      // Discover the interface / abstract supertypes on the target's boundary.
+      // If the target is itself an interface, it is its own boundary node.
+      const boundary = new Map<string, { name: string; label: string }>();
+      if (symType === 'Interface') {
+        boundary.set(symId, { name: symName || '', label: 'Interface' });
+      }
+      const ifaceRows = await executeParameterized(
+        repo.lbugPath,
+        `MATCH (x)-[r:CodeRelation]->(iface)
+         WHERE x.id = $symId AND r.type IN $heritage
+         RETURN DISTINCT iface.id AS id, iface.name AS name, labels(iface)[0] AS label
+         LIMIT 25`,
+        { symId, heritage: HERITAGE_TYPES },
+      ).catch(() => []);
+      for (const r of ifaceRows) {
+        const id = (r.id ?? r[0]) as string;
+        if (id && !boundary.has(id)) {
+          boundary.set(id, {
+            name: (r.name ?? r[1] ?? '') as string,
+            label: (r.label ?? r[2] ?? 'Interface') as string,
+          });
+        }
+      }
+      if (boundary.size === 0) return { epistemic: 'exact' };
+
+      const ifaceIds = Array.from(boundary.keys());
+      // Count per interface id with scalar equality. A parameterized
+      // `iface.id IN $ids` combined with `COUNT(DISTINCT ...)` + implicit
+      // group-by returns no rows under the LadybugDB cypher subset, so query
+      // each boundary node individually (boundary is small — capped at 25).
+      const countByType = async (types: readonly string[]): Promise<Map<string, number>> => {
+        const m = new Map<string, number>();
+        await Promise.all(
+          ifaceIds.map(async (ifaceId) => {
+            const rows = await executeParameterized(
+              repo.lbugPath,
+              `MATCH (other)-[r:CodeRelation]->(iface)
+               WHERE iface.id = $ifaceId AND r.type IN $types
+               RETURN COUNT(DISTINCT other.id) AS cnt`,
+              { ifaceId, types },
+            ).catch(() => []);
+            const cnt =
+              rows.length > 0 ? Number((rows[0] as any).cnt ?? (rows[0] as any)[0] ?? 0) : 0;
+            m.set(ifaceId, cnt);
+          }),
+        );
+        return m;
+      };
+      const [implCounts, consumerCounts] = await Promise.all([
+        countByType(HERITAGE_TYPES),
+        countByType(CONSUMER_TYPES),
+      ]);
+
+      const boundaries: string[] = [];
+      for (const [id, info] of boundary) {
+        const impls = implCounts.get(id) ?? 0;
+        const consumers = consumerCounts.get(id) ?? 0;
+        // Flag only a genuine indirection risk: an interface that is actually
+        // consumed (callers bind to it) or that has multiple implementations
+        // (runtime dispatch is ambiguous). A concrete type implementing an
+        // interface nothing references is fully traced → stays exact.
+        if (consumers >= 1 || impls >= 2) {
+          const label = (info.label || 'Interface').toLowerCase();
+          const name = info.name || '(unnamed)';
+          const article = /^[aeiou]/.test(label) ? 'an' : 'a';
+          const parts: string[] = [];
+          if (impls >= 1)
+            parts.push(`${impls} ${impls === 1 ? 'implementation' : 'implementations'}`);
+          if (consumers >= 1)
+            parts.push(
+              `${consumers} interface-level ${consumers === 1 ? 'consumer' : 'consumers'}`,
+            );
+          boundaries.push(
+            `${name} is ${article} ${label} with ${parts.join(' and ')}; callers that bind via the ${label} ` +
+              `(e.g. a DI container or dynamic dispatch) are not traced to the concrete symbol — ` +
+              `actual impact may be higher.`,
+          );
+        }
+      }
+      if (boundaries.length === 0) return { epistemic: 'exact' };
+      return { epistemic: 'lower-bound', boundaries };
+    } catch {
+      return { epistemic: 'exact' };
+    }
   }
 
   /**
@@ -3463,11 +5646,29 @@ export class LocalBackend {
       limit?: number;
       offset?: number;
       summaryOnly?: boolean;
+      // Enrichment/annotation suppression flags (#1858/#2129 review F6). Each
+      // suppresses a distinct sub-phase; they compose, and the real call sites are:
+      //   - full impact()/context(): none set.
+      //   - group cross-repo fan-out (impactByUid): skipPerSymbolEnrichment +
+      //     skipEpistemic — the fan-out consumes only byDepth.
+      //   - ambiguous #2129 per-candidate probe: skipEpistemic + skipEnrichment —
+      //     needs only count + a count-based risk.
+      // skipPerSymbolEnrichment: drop the post-pagination per-symbol
+      //   STEP_IN_PROCESS pass (keeps byDepth).
+      // skipEpistemic: skip the #1858 interface/indirection boundary probe.
+      // skipEnrichment: skip the process/module aggregation passes entirely;
+      //   risk then derives from directCount/total only. NOTE: this also makes
+      //   skipPerSymbolEnrichment a no-op (affectedProcesses stays empty), which
+      //   is why the ambiguous probe sets only the two flags above.
       skipPerSymbolEnrichment?: boolean;
+      skipEpistemic?: boolean;
+      skipEnrichment?: boolean;
+      pdgBridge?: PdgBridgeOptions;
     },
   ): Promise<any> {
     const { maxDepth, relationTypes, includeTests, minConfidence } = opts;
     const skipPerSymbolEnrichment = opts.skipPerSymbolEnrichment ?? false;
+    const skipEnrichment = opts.skipEnrichment ?? false;
     const hasExplicitLimit = typeof opts.limit === 'number' && Number.isFinite(opts.limit);
     const paginationLimit = hasExplicitLimit
       ? Math.max(1, Math.min(Math.trunc(opts.limit!), 10000))
@@ -3487,8 +5688,25 @@ export class LocalBackend {
 
     const symId = sym.id || sym[0];
 
+    // #1858 — kick off the epistemic boundary probe concurrently with the BFS.
+    // It depends only on symId/symType/symName (all known now) and touches no
+    // shared state, so its extra round-trip overlaps the traversal instead of
+    // adding to the serial path. `skipEpistemic` (ambiguous #2129 candidate
+    // probes, group fan-out) resolves to no field, preserving prior behavior.
+    // #1858/#2129 review F8 — the skip case adds no field, so `epistemic` is
+    // optional here (the union's `{}` subtype). computeEpistemicBoundary's own
+    // return keeps `epistemic` REQUIRED — only this promise widens to the skip
+    // subtype.
+    const epistemicPromise: Promise<{
+      epistemic?: 'exact' | 'lower-bound';
+      boundaries?: string[];
+    }> = opts.skipEpistemic
+      ? Promise.resolve({})
+      : this.computeEpistemicBoundary(repo, symId, symType, (sym.name || sym[1]) as string);
+
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
+    const pdgBridgeEvidenceById = new Map<string, PdgBridgeEvidenceInfo>();
     let frontier = [symId];
     let traversalComplete = true;
 
@@ -3586,10 +5804,35 @@ export class LocalBackend {
         });
 
         for (const rel of related) {
+          const sourceId = String(rel.sourceId ?? rel[0] ?? '');
           const relId = rel.id || rel[1];
           const filePath = rel.filePath || rel[4] || '';
 
           if (!includeTests && isTestFilePath(filePath)) continue;
+
+          // Bridge evidence is computed for EVERY edge (not just the first to
+          // reach a node) and the strongest verdict across all parents is kept
+          // (`callgraph-bridge` wins). This makes a diamond-reachable node's
+          // proven/unproven label order-independent of DB row iteration; the
+          // final label is stamped onto the impacted items after the depth loop.
+          if (opts.pdgBridge) {
+            const ev = pdgBridgeEvidenceForImpact({
+              bridge: opts.pdgBridge,
+              depth,
+              calleeName: rel.name || rel[2],
+              // Sound primary key (KTD3): the reached callee's RESOLVED id — the
+              // same `relId` (`rel.id`) the BFS keys its visited/frontier sets on,
+              // which equals the CALLS targetId captured into `BasicBlock.calleeIds`.
+              // The bridge proves by id ∈ `sliceCalleeIds` first, falling back to
+              // `calleeName` only when ids are absent or the block is capped.
+              calleeId: relId,
+              inherited: pdgBridgeEvidenceById.get(sourceId),
+            });
+            pdgBridgeEvidenceById.set(
+              String(relId),
+              betterBridgeEvidence(pdgBridgeEvidenceById.get(String(relId)), ev),
+            );
+          }
 
           if (!visited.has(relId)) {
             visited.add(relId);
@@ -3602,6 +5845,8 @@ export class LocalBackend {
               typeof storedConfidence === 'number' && storedConfidence > 0
                 ? storedConfidence
                 : confidenceForRelType(relationType);
+            // pdgEvidence is stamped after the depth loop from the finalized,
+            // order-independent pdgBridgeEvidenceById map.
             impacted.push({
               depth,
               id: relId,
@@ -3622,6 +5867,19 @@ export class LocalBackend {
       }
 
       frontier = nextFrontier;
+    }
+
+    // Stamp the finalized, order-independent bridge evidence (strongest across
+    // all parents) onto each impacted item. Deferred from the BFS loop so a
+    // diamond-reachable node reflects a proven parent regardless of visit order.
+    if (opts.pdgBridge) {
+      for (const item of impacted as Array<Record<string, unknown>>) {
+        const ev = pdgBridgeEvidenceById.get(String(item.id));
+        if (ev) {
+          item.pdgEvidence = ev.evidence;
+          item.pdgBridgeBasis = ev.basis;
+        }
+      }
     }
 
     const grouped: Record<number, any[]> = {};
@@ -3652,7 +5910,13 @@ export class LocalBackend {
     // Configurable via env IMPACT_MAX_CHUNKS, default 10 => max items = 1000
     const MAX_CHUNKS = parseInt(process.env.IMPACT_MAX_CHUNKS || '10', 10);
 
-    if (impacted.length > 0) {
+    // `skipEnrichment` (ambiguous #2129 per-candidate probes) bypasses the
+    // process/module aggregation passes entirely — those probes need only the
+    // count + a count-based risk, so paying the bounded-but-real enrichment cost
+    // ~6× per ambiguous call is wasted. risk then derives from directCount /
+    // total only (processCount/moduleCount stay 0), an acceptable approximation
+    // for a disambiguation aid.
+    if (impacted.length > 0 && !skipEnrichment) {
       // ── Process enrichment: batched chunking (bounded by MAX_CHUNKS) ─
       // Uses merged Cypher query (WITH + OPTIONAL MATCH) to fetch
       // process + entry point info in 1 round-trip per chunk. Converted to
@@ -3919,6 +6183,10 @@ export class LocalBackend {
       byDepthCounts[Number(depth)] = items.length;
     }
 
+    // #1858 — await the epistemic boundary probe kicked off alongside the BFS
+    // above. Additive: leaves impactedCount and every existing field untouched.
+    const epistemic = await epistemicPromise;
+
     const base = {
       target: {
         id: symId,
@@ -3929,6 +6197,7 @@ export class LocalBackend {
       direction,
       impactedCount: impacted.length,
       risk,
+      ...epistemic,
       ...(!traversalComplete && { partial: true }),
       summary: {
         direct: directCount,
@@ -4141,6 +6410,10 @@ export class LocalBackend {
         includeTests: opts.includeTests,
         minConfidence: opts.minConfidence,
         skipPerSymbolEnrichment: true,
+        // Group cross-repo fan-out consumes only byDepth (cross-impact.ts), not
+        // the #1858 epistemic/boundaries fields — computing them per neighbor is
+        // dead work on the highest-volume path, so suppress them here too.
+        skipEpistemic: true,
       });
     } catch {
       return null;
@@ -4187,7 +6460,53 @@ export class LocalBackend {
     if (resolved.ok === false) return { error: resolved.error };
 
     const svc = this.getGroupService();
+    if (method === 'trace') {
+      // Cross-repo trace resolves `from`/`to` across ALL members (it does not
+      // anchor on a single member like impact/query/context), so the member
+      // path in `@group/path` is advisory here — `resolved` above still
+      // validates that the group exists. groupTrace owns cross-member
+      // resolution and the single-boundary bridge crossing.
+      const traceArgs: Record<string, unknown> = { name: groupName };
+      if (params.from !== undefined) traceArgs.from = params.from;
+      if (params.to !== undefined) traceArgs.to = params.to;
+      if (params.from_uid !== undefined) traceArgs.from_uid = params.from_uid;
+      if (params.to_uid !== undefined) traceArgs.to_uid = params.to_uid;
+      if (params.from_file !== undefined) traceArgs.from_file = params.from_file;
+      if (params.to_file !== undefined) traceArgs.to_file = params.to_file;
+      if (params.maxDepth !== undefined) traceArgs.maxDepth = params.maxDepth;
+      if (params.crossDepth !== undefined) traceArgs.crossDepth = params.crossDepth;
+      if (params.includeTests !== undefined) traceArgs.includeTests = params.includeTests;
+      if (params.pdg !== undefined) traceArgs.pdg = params.pdg;
+      if (params.limit !== undefined) traceArgs.limit = params.limit;
+      return svc.groupTrace(traceArgs);
+    }
     if (method === 'impact') {
+      // KTD5/KTD12 — validate `mode` at the group-forward boundary too (the
+      // JSON-schema enum is advisory). An invalid mode errors; `mode:'pdg'` is
+      // rejected for @group targets because PDG impact is single-repo and
+      // intra-procedural — there is no cross-repo dependence graph to walk.
+      // Rejecting here (before groupImpact) is the KTD12 @group hard error.
+      const groupModeResult = validateImpactMode(params.mode);
+      if ('error' in groupModeResult) return { error: groupModeResult.error };
+      if (groupModeResult.mode === 'pdg') {
+        // @group reject: no single-repo symbol is ever resolved on the group path,
+        // so the envelope carries the partial-but-typed target (PdgImpactTarget).
+        // Routed through the typed builder so this exit is a PdgImpactResult union
+        // member, never a bare { error } object.
+        const groupRejectTarget: PdgImpactTarget = { name: String(params.target ?? '') };
+        const pdgErr: PdgImpactErrorResult = makePdgImpactErrorResult({
+          mode: 'pdg',
+          error:
+            "mode:'pdg' is not supported for @group targets — PDG impact is " +
+            'single-repo and intra-procedural. Run pdg impact against an ' +
+            'individual indexed repository instead.',
+          target: groupRejectTarget,
+          direction: (params.direction === 'downstream' ? 'downstream' : 'upstream') as
+            | 'upstream'
+            | 'downstream',
+        });
+        return pdgErr;
+      }
       const impactArgs: Record<string, unknown> = {
         name: groupName,
         repo: resolved.repoPath,
@@ -4212,7 +6531,10 @@ export class LocalBackend {
     if (method === 'query') {
       const queryArgs: Record<string, unknown> = {
         name: groupName,
-        query: params.query,
+        // #2175: resolve the search_query alias here (new name wins, same rule as the
+        // local query() handler) so the group path is self-contained and does not depend
+        // on params being normalized upstream. groupQuery() reads `query`.
+        query: resolveAliasString(params.search_query, params.query),
       };
       if (typeof params.task_context === 'string') queryArgs.task_context = params.task_context;
       if (typeof params.goal === 'string') queryArgs.goal = params.goal;
@@ -4314,6 +6636,7 @@ export class LocalBackend {
     Array<{
       id: string;
       name: string;
+      method: string | null;
       filePath: string;
       responseKeys: string[] | null;
       errorKeys: string[] | null;
@@ -4336,7 +6659,7 @@ export class LocalBackend {
       RETURN n.id AS routeId, n.name AS routeName, n.filePath AS handlerFile,
              n.responseKeys AS responseKeys, n.errorKeys AS errorKeys, n.middleware AS middleware,
              consumer.name AS consumerName, consumer.filePath AS consumerFile,
-             r.reason AS fetchReason
+             r.reason AS fetchReason, n.method AS method
     `,
       params,
     );
@@ -4351,6 +6674,7 @@ export class LocalBackend {
       {
         id: string;
         name: string;
+        method: string | null;
         filePath: string;
         responseKeys: string[] | null;
         errorKeys: string[] | null;
@@ -4373,11 +6697,17 @@ export class LocalBackend {
       const consumerName = row.consumerName ?? row[6];
       const consumerFile = row.consumerFile ?? row[7];
       const fetchReason: string | null = row.fetchReason ?? row[8] ?? null;
+      // Verb is the literal '*' for method-agnostic routes (Django function
+      // views) and absent (null) for method-less routes (filesystem, Laravel
+      // resource). Appended last in RETURN so positional fallbacks for the
+      // consumer/reason columns above stay stable.
+      const method: string | null = row.method ?? row[9] ?? null;
 
       if (!routeMap.has(id)) {
         routeMap.set(id, {
           id,
           name,
+          method,
           filePath,
           responseKeys,
           errorKeys,
@@ -4475,6 +6805,7 @@ export class LocalBackend {
     return {
       routes: routes.map((r) => ({
         route: r.name,
+        method: r.method,
         handler: r.filePath,
         middleware: r.middleware || [],
         consumers: r.consumers,
@@ -4542,6 +6873,7 @@ export class LocalBackend {
 
         return {
           route: r.name,
+          method: r.method,
           handler: r.filePath,
           ...(responseKeys.length > 0 ? { responseKeys } : {}),
           ...(errorKeys.length > 0 ? { errorKeys } : {}),
@@ -4609,8 +6941,8 @@ export class LocalBackend {
 
   private async apiImpact(
     repo: RepoHandle,
-    params: { route?: string; file?: string },
-  ): Promise<any> {
+    params: { route?: string; file?: string; method?: unknown },
+  ): Promise<ApiImpactResult> {
     await this.ensureInitialized(repo);
 
     if (!params.route && !params.file) {
@@ -4629,11 +6961,30 @@ export class LocalBackend {
       queryParams.file = params.file;
     }
 
-    const routes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
+    // After #2302 the same URL/handler can expose one Route node per HTTP verb.
+    // An optional `method` narrows to that one verb so the response collapses to
+    // the singular shape. A method-agnostic route (method `'*'`, e.g. a Django
+    // function view) matches any selector; verbless routes (null method) never do.
+    // `method` arrives unvalidated from the MCP envelope (the JSON schema is
+    // advisory), so reject a non-string verb with a structured error instead of
+    // throwing on `.toUpperCase()`; empty/whitespace collapses to no selector.
+    const rawMethod = params.method;
+    if (rawMethod !== undefined && typeof rawMethod !== 'string') {
+      return { error: '"method" must be a string (e.g. "GET", "POST").' };
+    }
+    const wantedMethod =
+      typeof rawMethod === 'string' ? rawMethod.trim().toUpperCase() || undefined : undefined;
+    const matched = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
+    const routes = matched.filter(
+      (r) => !wantedMethod || r.method === '*' || r.method?.toUpperCase() === wantedMethod,
+    );
 
     if (routes.length === 0) {
       const target = params.route || params.file;
-      return { error: `No routes found matching "${target}".` };
+      // Only append the verb when the URL/file matched routes but none used it;
+      // a non-existent URL/file gets the plain "no routes found" message.
+      const verb = wantedMethod && matched.length > 0 ? ` with method "${wantedMethod}"` : '';
+      return { error: `No routes found matching "${target}"${verb}.` };
     }
 
     const flowMap = await this.fetchLinkedFlowsBatch(
@@ -4641,15 +6992,16 @@ export class LocalBackend {
       routes.map((r) => r.id),
     );
 
-    // Count how many routes share the same handler file (for middleware partial detection)
+    // Count verbs per handler from the FULL match (before the method filter) so a
+    // method-scoped query still flags a multi-verb handler's partial middleware.
     const routeCountByHandler = new Map<string, number>();
-    for (const r of routes) {
+    for (const r of matched) {
       if (r.filePath) {
         routeCountByHandler.set(r.filePath, (routeCountByHandler.get(r.filePath) ?? 0) + 1);
       }
     }
 
-    const results = routes.map((r) => {
+    const results: ApiImpactRoute[] = routes.map((r) => {
       // Keys already normalized by fetchRoutesWithConsumers (quotes stripped)
       const responseKeys = r.responseKeys ?? [];
       const errorKeys = r.errorKeys ?? [];
@@ -4722,6 +7074,7 @@ export class LocalBackend {
 
       return {
         route: r.name,
+        method: r.method,
         handler: r.filePath,
         responseShape: {
           success: responseKeys,
@@ -4732,7 +7085,7 @@ export class LocalBackend {
           ? {
               middlewareDetection: 'partial' as const,
               middlewareNote:
-                'Middleware captured from first HTTP method export only — other methods in this handler may use different middleware chains.',
+                'Middleware captured from the first route export only — other route exports in this handler may use different middleware chains.',
             }
           : {}),
         consumers,

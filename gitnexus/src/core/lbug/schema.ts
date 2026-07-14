@@ -194,6 +194,8 @@ CREATE NODE TABLE Route (
   responseKeys STRING[],
   errorKeys STRING[],
   middleware STRING[],
+  method STRING,
+  handlerSymbolId STRING,
   PRIMARY KEY (id)
 )`;
 
@@ -235,6 +237,8 @@ CREATE NODE TABLE BasicBlock (
   startLine INT64,
   endLine INT64,
   text STRING,
+  callees STRING,
+  calleeIds STRING,
   PRIMARY KEY (id)
 )`;
 
@@ -293,7 +297,6 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Function TO \`Union\`,
   FROM Function TO \`Property\`,
   FROM Function TO CodeElement,
-  FROM Function TO File,
   FROM Class TO Method,
   FROM Class TO Function,
   FROM Class TO Class,
@@ -328,7 +331,6 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Method TO \`Constructor\`,
   FROM Method TO \`Property\`,
   FROM Method TO CodeElement,
-  FROM Method TO File,
   FROM \`Template\` TO \`Template\`,
   FROM \`Template\` TO Function,
   FROM \`Template\` TO Method,

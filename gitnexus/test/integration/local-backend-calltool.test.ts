@@ -14,7 +14,13 @@ import {
   LOCAL_BACKEND_FTS_INDEXES,
 } from '../fixtures/local-backend-seed.js';
 
-vi.mock('../../src/storage/repo-manager.js', () => ({
+// Partial mock: registry access is faked, but everything else — critically
+// `loadMeta`, which the staleness check in LocalBackend.ensureInitialized
+// calls on every throttled window — stays REAL. A factory that omitted
+// loadMeta made that call site throw a TypeError that the staleness check's
+// catch silently swallowed, so the code path was never actually exercised.
+vi.mock('../../src/storage/repo-manager.js', async (importActual) => ({
+  ...(await importActual<typeof import('../../src/storage/repo-manager.js')>()),
   listRegisteredRepos: vi.fn().mockResolvedValue([]),
   cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
   findSiblingClones: vi.fn().mockResolvedValue([]),
@@ -96,6 +102,31 @@ withTestLbugDB(
         expect(depNames).toContain('login');
       });
 
+      it.each(['name', 'symbol'] as const)(
+        'impact tool resolves the %s compatibility alias against a real index',
+        async (alias) => {
+          const result = await backend.callTool('impact', {
+            [alias]: 'validate',
+            direction: 'upstream',
+          });
+          expect(result).not.toHaveProperty('error');
+          expect(result.target?.name).toBe('validate');
+          const directDeps = result.byDepth[1] || result.byDepth['1'] || [];
+          expect(directDeps.map((d: any) => d.name)).toContain('login');
+        },
+      );
+
+      it('context tool resolves the file compatibility alias against a real index', async () => {
+        const result = await backend.callTool('context', {
+          name: 'authenticate',
+          file: 'src/base.ts',
+        });
+        expect(result).not.toHaveProperty('error');
+        expect(result.status).toBe('found');
+        expect(result.symbol?.name).toBe('authenticate');
+        expect(result.symbol?.filePath).toBe('src/base.ts');
+      });
+
       it('query tool returns results for keyword search', async () => {
         const result = await backend.callTool('query', { query: 'login' });
         expect(result).not.toHaveProperty('error');
@@ -117,6 +148,26 @@ withTestLbugDB(
         // fails (the `warning`/`partial` fields appear only on degradation).
         expect(result).not.toHaveProperty('warning');
         expect(result).not.toHaveProperty('partial');
+      });
+
+      // #2175: end-to-end proof that the renamed parameters work against a real
+      // index (Claude Code drops a tool arg named exactly "query").
+      it('query tool returns results via the new search_query param (#2175)', async () => {
+        const result = await backend.callTool('query', { search_query: 'login' });
+        expect(result).not.toHaveProperty('error');
+        expect(result).toHaveProperty('processes');
+        expect(result.processes.map((p: any) => p.id)).toContain('proc:login-flow');
+        expect(result.process_symbols.map((s: any) => s.id)).toContain('func:login');
+      });
+
+      it('cypher tool executes via the new statement param (#2175)', async () => {
+        const result = await backend.callTool('cypher', {
+          statement: 'MATCH (n:Function) RETURN n.name AS name ORDER BY n.name',
+        });
+        expect(result).toHaveProperty('markdown');
+        expect(result).toHaveProperty('row_count');
+        expect(result.row_count).toBeGreaterThanOrEqual(3);
+        expect(result.markdown).toContain('login');
       });
 
       // PR #222 port: the query tool batches per-symbol process/cohesion/content

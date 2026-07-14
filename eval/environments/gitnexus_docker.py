@@ -27,11 +27,9 @@ import time
 from pathlib import Path
 
 from constants import (
-    EVAL_SERVER_HOST,
     EVAL_SERVER_HEALTH_INTERVAL_SECONDS,
     EVAL_SERVER_HEALTH_RETRIES,
     EVAL_SERVER_HEALTH_TIMEOUT_SECONDS,
-    EVAL_SERVER_PORT,
 )
 from minisweagent.environments.docker import DockerEnvironment
 from tool_registry import TOOL_SPECS, ToolScriptSpec
@@ -40,19 +38,8 @@ from utils.errors import is_debug_enabled, log_safe_exception
 logger = logging.getLogger("gitnexus_docker")
 
 DEFAULT_CACHE_DIR = Path.home() / ".gitnexus-eval-cache"
-
-
-def _http_probe_host(host: str) -> str:
-    """Return a host literal suitable for probing the daemon from inside the container."""
-    if host == "0.0.0.0":
-        return "127.0.0.1"
-    if host in {"::", "[::]"}:
-        return "[::1]"
-    if host.startswith("[") and host.endswith("]"):
-        return host
-    if ":" in host:
-        return f"[{host}]"
-    return host
+EVAL_SERVER_PORT = 4848
+EVAL_SERVER_HOST = "127.0.0.1"
 
 
 class GitNexusDockerEnvironment(DockerEnvironment):
@@ -195,7 +182,9 @@ class GitNexusDockerEnvironment(DockerEnvironment):
             "timeout": 5,
         })
 
-        health_host = _http_probe_host(self.eval_server_host)
+        # Use 127.0.0.1 for the health probe — reachable whether server binds
+        # loopback or all interfaces (0.0.0.0), avoiding DNS resolution issues.
+        health_host = "127.0.0.1"
 
         # Wait for the server to be ready (up to ~15s for KuzuDB init)
         for i in range(EVAL_SERVER_HEALTH_RETRIES):

@@ -107,13 +107,6 @@ describe('edge types', () => {
     }
   });
 
-  it('exposes Vue event edge types for graph filtering', () => {
-    expect(ALL_EDGE_TYPES).toContain('BINDS_EVENT_HANDLER');
-    expect(ALL_EDGE_TYPES).toContain('EMITS_EVENT');
-    expect(DEFAULT_VISIBLE_EDGES).toContain('BINDS_EVENT_HANDLER');
-    expect(DEFAULT_VISIBLE_EDGES).toContain('EMITS_EVENT');
-  });
-
   it('EDGE_INFO entries have color and label', () => {
     for (const info of Object.values(EDGE_INFO)) {
       expect(info.color).toMatch(/^#[0-9a-f]{6}$/i);

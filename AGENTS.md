@@ -1,7 +1,7 @@
-<!-- version: 1.8.1 -->
-<!-- Last updated: 2026-07-02 -->
+<!-- version: 1.7.0 -->
+<!-- Last updated: 2026-04-23 -->
 
-Last reviewed: 2026-07-02
+Last reviewed: 2026-04-23
 
 **Project:** GitNexus · **Environment:** dev · **Maintainer:** repository maintainers (see GitHub)
 
@@ -55,34 +55,10 @@ listed in [`pr-swarm-review/README.md`](pr-swarm-review/README.md); edit review 
 in the canonical files, never in the wrappers. The review is read-only — it never edits,
 commits, or posts.
 
-## Shared Owned-Repo Policy
-
-This fork follows the shared owned-repo operating policy maintained in
-`100yenadmin/codex-operating-kit`. Keep this section as a pointer plus
-GitNexus-specific conventions; do not copy the full shared runbooks here.
-
-- Track meaningful work in GitHub issues before implementation. Use tracker
-  issues or milestones when work spans multiple PRs, release gates, CI waits,
-  index refreshes, or handoff.
-- Link PRs to the implementation issue and any tracker/milestone. Update the
-  issue or tracker before pausing, handoff, merge, release, or index refresh.
-- Before claiming PR readiness, query current-head `reviewThreads` and report
-  `total`, `currentActionable`, and `outdated`. Treat top-level bot comments,
-  skipped-review/rate-limit notices, and check annotations as separate status
-  inputs, not resolvable review threads.
-- P0-P2 current actionable review threads block merge, release, and readiness
-  claims unless fixed, proven false-positive, or explicitly escalated. P3
-  advisory threads still need terminal disposition before closeout.
-- Release notes should be human-readable first: user/operator outcome, grouped
-  highlights/changes/fixes, then compact verification and evidence. Operator
-  packets, local commands, rollback notes, and index-refresh details may be
-  linked or summarized, but should not replace the visible release narrative.
-
 ## Changelog
 
 | Date | Version | Change |
 |------|---------|--------|
-| 2026-07-02 | 1.8.1 | Added shared owned-repo PR lifecycle and human-readable release-note policy pointer for repo-local agents. |
 | 2026-05-22 | 1.8.0 | Kotlin added to `MIGRATED_LANGUAGES` (registry-primary call resolution by default). Closes #1756 (companion-vs-instance dispatch) and #1757 (lambda scopes); refs #1746. RFC §6.4 corpus criterion waived (corpus-mode wiring is #927-scope); fixture criterion met. |
 | 2026-04-23 | 1.7.0 | TypeScript added to `MIGRATED_LANGUAGES` (registry-primary call resolution by default). |
 | 2026-04-20 | 1.6.0 | Added scope-resolution pipeline pointer (RFC #909 Ring 3); Python migrated to registry-primary. |
@@ -107,7 +83,7 @@ This project is indexed by GitNexus as **GitNexus** (26675 symbols, 35395 relati
 - **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
 - **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
 
 ## Never Do

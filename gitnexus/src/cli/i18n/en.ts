@@ -10,6 +10,9 @@ export const en = {
   'list.title': 'Indexed Repositories ({{count}})',
   'list.indexed': 'Indexed',
   'list.commit': 'Commit',
+  'list.branch': 'Branch',
+  'list.branchIndexes': 'Branch indexes',
+  'list.branchLine': '{{branch}} ({{commit}}, {{indexed}})',
   'list.stats': 'Stats',
   'list.statsValue': '{{files}} files, {{symbols}} symbols, {{edges}} edges',
   'list.clusters': 'Clusters',
@@ -23,6 +26,10 @@ export const en = {
   'status.indexed': 'Indexed',
   'status.indexedCommit': 'Indexed commit',
   'status.currentCommit': 'Current commit',
+  'status.branch': 'Branch',
+  'status.detached': '(detached HEAD)',
+  'status.workspaceIndexLabel':
+    "Workspace index: last analyzed on '{{primary}}' (re-run gitnexus analyze to follow the current branch)",
   'status.status': 'Status',
   'status.upToDate': '✅ up-to-date',
   'status.stale': '⚠️ stale (re-run gitnexus analyze)',
@@ -30,21 +37,28 @@ export const en = {
   'clean.deletedRepo': 'Deleted: {{name}} ({{storagePath}})',
   'clean.notFoundHere': 'No indexed repository found in this directory.',
   'clean.deleteCurrent': 'This will delete the GitNexus index for: {{repoName}}',
+  'clean.branchNotIndexed': 'No indexed branch named "{{branch}}" for this repository.',
+  'clean.deleteBranch': 'This will delete the branch index "{{branch}}" at: {{path}}',
+  'clean.deletedBranch': 'Deleted branch index: {{branch}}',
   'clean.lbugSidecars.state': 'LadybugDB sidecar state: {{state}}',
-  'clean.lbugSidecars.none': 'No quarantined LadybugDB missing-shadow WAL sidecars found.',
+  'clean.lbugSidecars.none':
+    'No parked LadybugDB recovery sidecars found (missing-shadow WAL quarantines or dirty-recovery parks).',
   'clean.lbugSidecars.preview':
-    'This will delete {{count}} quarantined LadybugDB missing-shadow WAL sidecar(s):',
-  'clean.lbugSidecars.deleted':
-    'Deleted {{count}} quarantined LadybugDB missing-shadow WAL sidecar(s).',
+    'This will delete {{count}} parked LadybugDB recovery sidecar(s) (missing-shadow WAL quarantines and dirty-recovery parks):',
+  'clean.lbugSidecars.deleted': 'Deleted {{count}} parked LadybugDB recovery sidecar(s).',
+  'clean.lbugSidecars.failed':
+    'Could not delete {{count}} locked file(s) — stop the process holding them (GitNexus MCP/serve or an antivirus scan) and re-run:',
   'remove.nothingToRemove': 'Nothing to remove: {{message}}',
   'remove.deleteTarget': 'This will delete the GitNexus index for: {{name}}',
   'remove.removed': 'Removed: {{name}}',
   'remove.failed': 'Failed to remove {{name}}: {{message}}',
   'tool.noIndexed': 'GitNexus: No indexed repositories found. Run: gitnexus analyze',
-  'tool.usage.query': 'Usage: gitnexus query <search_query>',
+  'tool.usage.query': 'Usage: gitnexus query [search_query]  or  gitnexus query --query <text>',
   'tool.usage.context': 'Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]',
   'tool.usage.impact':
     'Usage: gitnexus impact <symbol_name> [--uid <uid>] [--file <path>] [--kind <kind>] [--direction upstream|downstream]',
+  'tool.usage.trace':
+    'Usage: gitnexus trace <from> <to> [--from-uid <uid>] [--to-uid <uid>] [--depth <n>]',
   'tool.usage.cypher': 'Usage: gitnexus cypher <cypher_query>',
   'tool.warn.unknownKind':
     "--kind '{{kind}}' is not a known symbol kind (e.g. Function, Class, Method); it will not narrow the result.",
@@ -105,18 +119,22 @@ export const en = {
   'help.option.help': 'display help for command',
   'help.option.version': 'output the version number',
   'help.command.setup.description':
-    'One-time setup: configure MCP for Cursor, Claude Code, OpenCode, Codex',
+    'One-time setup: configure MCP for Cursor, Claude Code, Antigravity, OpenCode, CodeBuddy, Qoder, Codex',
   'help.command.uninstall.description':
     'Reverse `setup`: remove GitNexus MCP entries, skills, and hooks from all detected editors',
   'help.command.analyze.description': 'Index a repository (full analysis)',
   'help.command.index.description':
     'Register an existing .gitnexus/ folder into the global registry (no re-analysis needed)',
   'help.command.serve.description': 'Start local HTTP server for web UI connection',
-  'help.command.mcp.description': 'Start MCP server (stdio) — serves all indexed repos',
+  'help.command.mcp.description':
+    'Start MCP server. Default: stdio. Use --http for a remote HTTP server (Streamable HTTP at POST /mcp + legacy SSE at GET /sse, POST /messages).',
   'help.command.list.description': 'List all indexed repositories',
   'help.command.status.description': 'Show index status for current repo',
   'help.command.doctor.description':
     'Show runtime platform capabilities and embedding configuration',
+  'help.command.embeddings.description': 'Manage the on-demand local embedding runtime',
+  'help.command.embeddings.install.description':
+    'Install the local embedding stack (@huggingface/transformers + onnxruntime-node) on demand. Heals installs where npm skipped the optional packages (e.g. behind an HTTP proxy, #2370). Downloads only from your configured npm registry — mirrors and proxies apply.',
   'help.command.clean.description': 'Delete GitNexus index for current repo',
   'help.command.remove.description':
     'Delete the GitNexus index for a registered repo (by alias, name, or absolute path). Unlike `clean`, does not require being inside the repo. Idempotent on unknown targets.',
@@ -130,9 +148,12 @@ export const en = {
   'help.command.context.description':
     '360-degree view of a code symbol: callers, callees, processes',
   'help.command.impact.description': 'Blast radius analysis: what breaks if you change a symbol',
+  'help.command.trace.description':
+    'Find the shortest directed path between two symbols (call + class-member edges)',
   'help.command.cypher.description': 'Execute raw Cypher query against the knowledge graph',
   'help.command.detectChanges.description':
     'Map git diff hunks to indexed symbols and affected execution flows',
+  'help.command.check.description': 'Run structural checks against the indexed graph',
   'help.command.evalServer.description':
     'Start lightweight HTTP server for fast tool calls during evaluation',
   'help.command.group.description': 'Manage repository groups for cross-index impact analysis',
@@ -148,7 +169,11 @@ export const en = {
     'Cross-repo impact for a symbol in one member repo of a group',
   'help.command.group.query.description': 'Search execution flows across all repos in a group',
   'help.command.group.contracts.description': 'Inspect Contract Registry',
+  'help.option.setup.codingAgent':
+    'Configure only these coding agents (comma-separated or repeatable)',
   'help.option.analyze.force': 'Force full re-index even if up to date',
+  'help.option.analyze.incrementalOnly':
+    'Refuse recovery, migration, or scale escalation that would require a full rebuild',
   'help.option.analyze.repairFts': 'Repair/rebuild search FTS indexes without full re-analysis',
   'help.option.analyze.embeddings':
     'Enable embedding generation for semantic search (off by default). Optional [limit] overrides the 50,000-node safety cap; pass 0 to disable the cap entirely.',
@@ -158,10 +183,6 @@ export const en = {
     'Generate repo-specific skill files from detected communities (no-op when --index-only is also set).',
   'help.option.analyze.skipAgentsMd':
     'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md',
-  'help.option.analyze.skipAiContext':
-    'Skip all AI context side effects: AGENTS.md, CLAUDE.md, and bundled GitNexus skills',
-  'help.option.analyze.defaultBranch':
-    'Default branch used in the generated regression-compare example (base_ref). Falls back to .gitnexusrc, then auto-detected origin/HEAD, then "main".',
   'help.option.analyze.noStats': 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md',
   'help.option.analyze.skipSkills':
     'Skip installing standard GitNexus skill files under .claude/skills/gitnexus/. Does not suppress community skills from --skills (those use .claude/skills/generated/). Use --index-only to skip all AI-context file injection.',
@@ -186,18 +207,23 @@ export const en = {
   'help.option.analyze.embeddingBatchSize': 'Number of nodes per embedding batch',
   'help.option.analyze.embeddingSubBatchSize': 'Number of chunks per embedding model call',
   'help.option.analyze.embeddingDevice': 'Embedding device: auto, cpu, dml, cuda, or wasm',
-  'help.option.analyze.embeddingBaseUrl': 'HTTP embedding API base URL',
-  'help.option.analyze.embeddingModel': 'HTTP embedding model name',
-  'help.option.analyze.embeddingAuthToken': 'HTTP embedding bearer token',
-  'help.option.analyze.embeddingDims': 'HTTP embedding output dimensions',
-  'help.option.index.force': 'Register even if meta.json is missing (stats will be empty)',
+  'help.option.doctor.recoveryPlan':
+    'Print a read-only interrupted-analysis recovery plan and exit',
+  'help.option.index.force': 'Register even if index metadata is missing (stats will be empty)',
   'help.option.index.allowNonGit': 'Allow registering folders that are not Git repositories',
   'help.option.port': 'Port number',
   'help.option.serve.host': 'Bind address (default: 127.0.0.1, use 0.0.0.0 for remote access)',
+  'help.option.mcp.http': 'Serve MCP over HTTP instead of stdio (for remote clients)',
+  'help.option.mcp.host':
+    'HTTP bind address (only with --http). Default: 127.0.0.1 (loopback). Use 0.0.0.0 to expose to all interfaces.',
+  'help.option.mcp.authToken':
+    'Require this bearer token in the Authorization header (only with --http); may also be set via the GITNEXUS_MCP_AUTH_TOKEN env var. Required for a non-loopback bind (--host 0.0.0.0/::), which otherwise refuses to start.',
   'help.option.force.confirmation': 'Skip confirmation prompt',
   'help.option.uninstall.force': 'Apply the changes (default is a dry-run preview)',
   'help.option.clean.all': 'Clean all indexed repos',
-  'help.option.clean.lbugSidecars': 'Clean quarantined LadybugDB missing-shadow WAL sidecars',
+  'help.option.clean.branch': 'Delete only the named branch index (not the workspace index)',
+  'help.option.clean.lbugSidecars':
+    'Clean parked LadybugDB recovery sidecars (missing-shadow WAL quarantines and dirty-recovery parks)',
   'help.option.wiki.force': 'Force full regeneration even if up to date',
   'help.option.wiki.provider':
     'LLM provider: openai, openrouter, azure, custom, cursor, claude, codex, or opencode (default: openai)',
@@ -224,23 +250,39 @@ export const en = {
   'help.option.query.goal': 'What you want to find',
   'help.option.query.limit': 'Max processes to return (default: 5)',
   'help.option.content': 'Include full symbol source code',
-  'help.option.maxTokens': 'Truncate output to N estimated tokens',
   'help.option.repo.target': 'Target repository',
+  'help.option.branch': 'Scope to a specific branch index (multi-branch repos)',
   'help.option.context.uid': 'Direct symbol UID (zero-ambiguity lookup)',
   'help.option.context.file': 'File path to disambiguate common names',
+  'help.option.context.limit': 'Max callers/callees/processes to return',
+  'help.option.query.flag': 'Search query (alias for positional argument)',
   'help.option.impact.kind':
     'Kind filter to disambiguate common names (e.g. Function, Class, Method)',
   'help.option.impact.direction': 'upstream (dependants) or downstream (dependencies)',
   'help.option.impact.depth': 'Max relationship depth (default: 3)',
   'help.option.impact.includeTests': 'Include test files in results',
-  'help.option.impact.limit': 'Max symbols per depth level (default: 100)',
+  'help.option.impact.limit':
+    'Max symbols per depth level and affected processes/modules to return (default: 100)',
   'help.option.impact.offset': 'Skip N symbols per depth level for pagination',
   'help.option.impact.summaryOnly': 'Return counts and risk only, omit symbol list',
+  'help.option.trace.fromUid': 'Source symbol UID (zero-ambiguity lookup)',
+  'help.option.trace.fromFile': 'Source file path to disambiguate common names',
+  'help.option.trace.toUid': 'Target symbol UID (zero-ambiguity lookup)',
+  'help.option.trace.toFile': 'Target file path to disambiguate common names',
+  'help.option.trace.depth': 'Max path length in hops (default: 10)',
+  'help.option.trace.includeTests': 'Traverse through test-file symbols (default: false)',
   'help.option.detectChanges.scope': 'What to analyze: unstaged, staged, all, or compare',
   'help.option.detectChanges.baseRef': 'Branch/commit for compare scope (e.g. main)',
+  'help.option.detectChanges.limit': 'Max changed symbols to return',
+  'help.option.cypher.limit': 'Max result rows to return',
+  'help.option.check.cycles': 'Detect circular imports and fail when any are found',
   'help.option.evalServer.host':
-    'Bind address (default: 127.0.0.1, use 0.0.0.0 to expose to all interfaces)',
+    'Bind address (default: 127.0.0.1; non-loopback requires GITNEXUS_AUTH_TOKEN)',
   'help.option.evalServer.idleTimeout': 'Auto-shutdown after N seconds idle (0 = disabled)',
+  'help.option.embeddings.install.cuda':
+    "Also download the CUDA GPU binaries (runs onnxruntime-node's NuGet postinstall; set GLOBAL_AGENT_HTTPS_PROXY behind a proxy)",
+  'help.option.embeddings.install.force':
+    'Install into the runtime prefix even when the stack already resolves',
   'help.option.group.create.force': 'Overwrite existing group',
   'help.option.group.sync.skipEmbeddings': 'Exact + BM25 only (no embedding fallback)',
   'help.option.group.sync.exactOnly': 'Exact match only',
@@ -262,5 +304,5 @@ export const en = {
   'help.option.group.contracts.repo': 'Filter by repo',
   'help.option.group.contracts.unmatched': 'Show only unmatched contracts',
   'help.analyze.environment':
-    '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1   Skip .gitignore parsing (still reads .gitnexusignore)\n  GITNEXUS_MAX_FILE_SIZE=N  Override large-file skip threshold (KB). Default 512, max 32768.\n  GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=N  Worker idle timeout in milliseconds. Default 30000.\n  GITNEXUS_WAL_CHECKPOINT_THRESHOLD=N  LadybugDB WAL auto-checkpoint threshold in bytes (default 67108864 = 64 MiB; -1 keeps Ladybug stock ~16 MiB).\n  GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES=N  Worker job byte budget. Default 8388608.\n  GITNEXUS_WORKER_POOL_SIZE=N  Parse worker count override. Default cores-1 capped at 16.\n  GITNEXUS_PARSE_CHUNK_CONCURRENCY=N  Concurrent in-flight parse chunks. Default 2.\n  GITNEXUS_WORKER_MAX_RESPAWNS_PER_SLOT=N  Max replacement spawns per slot before drop. Default 3.\n  GITNEXUS_WORKER_MAX_CUMULATIVE_TIMEOUT_MS=N  Total retry wall-time per job. Default 5x sub-batch timeout.\n  GITNEXUS_WORKER_CONSECUTIVE_FAILURE_THRESHOLD=N  Per-slot deaths to trip circuit breaker. Default max(3, poolSize).\n  GITNEXUS_EMBEDDING_THREADS=N  Limit local ONNX CPU threads for --embeddings.\n  GITNEXUS_EMBEDDING_MAX_ATTEMPTS=N  HTTP embedding attempts including the first call. Default 3.\n  GITNEXUS_EMBEDDING_RETRY_CAP_MS=N  Max HTTP embedding retry sleep. Default 5000, Voyage default 30000.\n  GITNEXUS_EMBEDDING_MIN_INTERVAL_MS=N  Minimum delay between HTTP embedding requests. Default 0.\n  GITNEXUS_EMBEDDING_TIMEOUT_MS=N  Per-attempt HTTP embedding timeout. Default 30000, max 300000.\n  GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT=N  Max embedding chunks for exact-scan fallback. Default 10000.\n\nFlags override the corresponding env vars when both are provided.\n\nTip: `.gitnexusignore` supports `.gitignore`-style negation. Add e.g.\n     `!__tests__/` to index a directory that is auto-filtered by default (#771).',
+    '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1   Skip .gitignore parsing (still reads .gitnexusignore)\n  GITNEXUS_MAX_FILE_SIZE=N  Override large-file skip threshold (KB). Default 512, max 32768.\n  GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=N  Worker idle timeout in milliseconds. Default 30000.\n  GITNEXUS_WAL_CHECKPOINT_THRESHOLD=N  LadybugDB WAL auto-checkpoint threshold in bytes (default 67108864 = 64 MiB; -1 keeps Ladybug stock ~16 MiB).\n  GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES=N  Worker job byte budget. Default 8388608.\n  GITNEXUS_WORKER_POOL_SIZE=N  Parse worker count override. Default cores-1 capped at 16.\n  GITNEXUS_PARSE_CHUNK_CONCURRENCY=N  Concurrent in-flight parse chunks. Default 2.\n  GITNEXUS_WORKER_MAX_RESPAWNS_PER_SLOT=N  Max replacement spawns per slot before drop. Default 3.\n  GITNEXUS_WORKER_MAX_CUMULATIVE_TIMEOUT_MS=N  Total retry wall-time per job. Default 5x sub-batch timeout.\n  GITNEXUS_WORKER_CONSECUTIVE_FAILURE_THRESHOLD=N  Per-slot deaths to trip circuit breaker. Default max(3, poolSize).\n  GITNEXUS_WORKER_SHUTDOWN_DRAIN_MS=N  Max wait at pool shutdown for a retired worker still inside native code (terminated at its next safe point instead of aborting the process). Default 30000.\n  GITNEXUS_CPP_CAPTURE_BUDGET_MS=N  Per-file wall-clock budget for C++ capture extraction; on breach the file keeps partial captures with a warning. Default 20000.\n  GITNEXUS_EMBEDDING_THREADS=N  Limit local ONNX CPU threads for --embeddings.\n  GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT=N  Max embedding chunks for exact-scan fallback. Default 10000.\n  GITNEXUS_VECTOR_MAX_DISTANCE=N  Max accepted semantic/vector cosine distance (0 < N <= 2; higher values clamp to 2). Default 0.6 for MCP, 0.5 elsewhere.\n\nFlags override the corresponding env vars when both are provided.\n\nTip: `.gitnexusignore` supports `.gitignore`-style negation. Add e.g.\n     `!__tests__/` to index a directory that is auto-filtered by default (#771).',
 } as const;

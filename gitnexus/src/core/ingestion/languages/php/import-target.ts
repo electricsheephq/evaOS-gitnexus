@@ -16,6 +16,7 @@
  */
 
 import type { ParsedImport, WorkspaceIndex } from 'gitnexus-shared';
+import type { ImportResolutionContext } from '../../scope-resolution/contract/scope-resolver.js';
 import { resolvePhpImportInternal } from '../../import-resolvers/php.js';
 import type { ComposerConfig } from '../../language-config.js';
 import { readFileSync } from 'node:fs';
@@ -24,6 +25,60 @@ import { join } from 'node:path';
 export interface PhpResolveContext {
   readonly fromFile: string;
   readonly allFilePaths: ReadonlySet<string>;
+}
+
+function normalizePhpPath(value: string): string {
+  return value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+}
+
+function namespaceDirectories(
+  targetRaw: string,
+  composerConfig: ComposerConfig | null,
+  resolved: string | null,
+): string[] {
+  const directories = new Set<string>();
+  if (resolved !== null) {
+    const normalizedResolved = normalizePhpPath(resolved);
+    const separator = normalizedResolved.lastIndexOf('/');
+    if (separator >= 0) directories.add(normalizedResolved.slice(0, separator));
+  }
+
+  if (composerConfig === null) return [...directories];
+
+  const normalizedTarget = normalizePhpPath(targetRaw);
+  const mappings = [...composerConfig.psr4.entries()].sort((left, right) => {
+    const lengthDifference = right[0].length - left[0].length;
+    return lengthDifference !== 0 ? lengthDifference : left[0].localeCompare(right[0]);
+  });
+  for (const [namespacePrefix, directoryPrefix] of mappings) {
+    const normalizedPrefix = normalizePhpPath(namespacePrefix);
+    if (
+      normalizedTarget !== normalizedPrefix &&
+      !normalizedTarget.startsWith(`${normalizedPrefix}/`)
+    ) {
+      continue;
+    }
+
+    const remainder = normalizedTarget.slice(normalizedPrefix.length).replace(/^\//, '');
+    const separator = remainder.lastIndexOf('/');
+    const relativeNamespace = separator >= 0 ? remainder.slice(0, separator) : '';
+    directories.add(
+      normalizePhpPath(
+        relativeNamespace === '' ? directoryPrefix : `${directoryPrefix}/${relativeNamespace}`,
+      ),
+    );
+    break;
+  }
+  return [...directories];
+}
+
+function isDirectChild(filePath: string, directory: string): boolean {
+  const normalizedPath = normalizePhpPath(filePath);
+  const separator = normalizedPath.lastIndexOf('/');
+  if (separator < 0) return directory === '';
+  const parent = normalizedPath.slice(0, separator);
+  const normalizedDirectory = normalizePhpPath(directory);
+  return parent === normalizedDirectory || parent.endsWith(`/${normalizedDirectory}`);
 }
 
 // ─── loadResolutionConfig ──────────────────────────────────────────────────
@@ -117,6 +172,7 @@ export function resolvePhpImportTargetInternal(
   _fromFile: string,
   allFilePaths: ReadonlySet<string>,
   resolutionConfig?: unknown,
+  context?: ImportResolutionContext,
 ): string | null {
   if (targetRaw === '') return null;
 
@@ -129,7 +185,7 @@ export function resolvePhpImportTargetInternal(
   const normalizedFileList = [...allFiles].map((f) => f.replace(/\\/g, '/'));
   const allFileList = [...allFiles];
 
-  return resolvePhpImportInternal(
+  const resolved = resolvePhpImportInternal(
     targetRaw,
     composerConfig,
     allFiles,
@@ -137,4 +193,42 @@ export function resolvePhpImportTargetInternal(
     allFileList,
     undefined,
   );
+
+  const parsedImport = context?.parsedImport;
+  const symbolKind =
+    parsedImport?.kind === 'named' || parsedImport?.kind === 'alias'
+      ? parsedImport.importedSymbolKind
+      : undefined;
+  if (
+    context === undefined ||
+    parsedImport === undefined ||
+    (symbolKind !== 'function' && symbolKind !== 'const')
+  ) {
+    return resolved;
+  }
+
+  const importedName = targetRaw.replace(/\\/g, '/').split('/').filter(Boolean).at(-1);
+  if (importedName === undefined) return resolved;
+
+  const directories = namespaceDirectories(targetRaw, composerConfig, resolved);
+  const candidateFiles = context.parsedFiles.filter((parsed) =>
+    directories.some((directory) => isDirectChild(parsed.filePath, directory)),
+  );
+  const expectedType = symbolKind === 'function' ? 'Function' : 'Variable';
+  const declaringFiles = candidateFiles.filter((parsed) =>
+    parsed.localDefs.some((def) => {
+      if (def.type !== expectedType) return false;
+      const simpleName = (def.qualifiedName ?? '').split(/[\\.]/).at(-1);
+      return simpleName === importedName;
+    }),
+  );
+
+  if (declaringFiles.length > 1) return null;
+  if (declaringFiles.length === 1) return declaringFiles[0].filePath;
+
+  // PHP constants are not currently emitted as local definitions. A single
+  // file in the namespace directory is still unambiguous; multiple files must
+  // fail closed rather than inheriting Set iteration order.
+  if (symbolKind === 'const' && candidateFiles.length === 1) return candidateFiles[0].filePath;
+  return resolved;
 }

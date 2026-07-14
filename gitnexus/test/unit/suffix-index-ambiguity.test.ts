@@ -173,6 +173,24 @@ describe('resolvePythonImport — namespace packages (no __init__.py)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Suffix index determinism
+// ---------------------------------------------------------------------------
+
+describe('buildSuffixIndex determinism', () => {
+  it('selects the same ambiguous suffix target regardless of input order', () => {
+    const firstInput = ['packages/zeta/user.ts', 'packages/alpha/user.ts'];
+    const reversedInput = [...firstInput].reverse();
+    const first = makeCtx(firstInput);
+    const reversed = makeCtx(reversedInput);
+
+    expect(first.index.get('user.ts')).toBe('packages/alpha/user.ts');
+    expect(reversed.index.get('user.ts')).toBe('packages/alpha/user.ts');
+    expect(first.files).toEqual(firstInput);
+    expect(reversed.files).toEqual(reversedInput);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Ruby: bare require does NOT use proximity
 // ---------------------------------------------------------------------------
 

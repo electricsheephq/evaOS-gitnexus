@@ -94,7 +94,7 @@ describe('resolve-analyze-cmd.cjs (canonical invocation resolver)', () => {
         `pnpm ${allow} dlx ${cjs.NPX_REF} analyze`,
         `pnpm ${allowEmb} dlx ${cjs.NPX_REF} analyze --embeddings`,
       ],
-      ['npx', `npx -y ${cjs.NPX_REF} analyze`, `npx -y ${cjs.NPX_REF} analyze --embeddings`],
+      ['npx', `npx ${cjs.NPX_REF} analyze`, `npx ${cjs.NPX_REF} analyze --embeddings`],
     ] as const;
     for (const [mode, plain, withEmbeddings] of cases) {
       process.env.GITNEXUS_INVOCATION = mode;
@@ -336,7 +336,7 @@ describe('buildRunnerArgv (project-local runner exec, #1945)', () => {
   it('prefixes the registry ref for npx mode', () => {
     expect(cjs.buildRunnerArgv('npx', ['analyze'])).toEqual({
       program: 'npx',
-      args: ['-y', 'gitnexus@latest', 'analyze'],
+      args: ['gitnexus@latest', 'analyze'],
     });
   });
 

@@ -60,9 +60,14 @@ export function populateGoRangeBindings(
 
       // Identify the value variable (skip the `_` discard if present)
       const idents = left.namedChildren.filter((c) => c.type === 'identifier');
-      const valueVar = idents.length >= 2 ? idents[1].text : idents[0]?.text;
+      let valueVar: string | null = null;
+      if (idents.length >= 2) {
+        valueVar = idents[1].text; // for _, v := range ...
+      } else if (idents.length === 1) {
+        valueVar = idents[0].text; // for v := range ...
+      }
 
-      if (valueVar === undefined || valueVar === '_') continue;
+      if (valueVar === null || valueVar === '_') continue;
 
       // Resolve range expression type
       let elementType: string | null = null;

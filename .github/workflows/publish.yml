@@ -1,12 +1,12 @@
 name: Publish
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sole publisher for the `gitnexus` npm package, GitHub Releases, tags, and
-# Docker images. Pushes to main validate through release-candidate.yml only and
-# never publish artifacts.
+# Sole publisher for the `gitnexus` npm package, GitHub Releases, and Docker
+# images. Replaces the former two-workflow design — see issue #1609 for the
+# double-publish race this unification closes.
 #
 # Two release modes, both routed through this file:
-#   • Release candidate (rc)  — triggered by workflow_dispatch.
+#   • Release candidate (rc)  — triggered only by workflow_dispatch on `main`.
 #       The RC path computes the next rc version, applies it in-CI, pushes a
 #       detached release commit with v<X.Y.Z>-rc.<N> + rc/<SHA> marker
 #       atomically, then publishes to npm with --tag rc and creates a GitHub
@@ -60,9 +60,9 @@ on:
 # Workflow-level deny-all; each job declares the minimum it needs.
 permissions: {}
 
-# Distinct refs (refs/heads/main, refs/tags/v*) run in parallel. The
-# release-PR-skip in rc-guard is the load-bearing invariant that prevents
-# an RC main-push and a stable tag-push colliding on the same release commit.
+# Manual RC dispatches and stable tag pushes use distinct refs and may run in
+# parallel. The release-PR skip remains a defense against a manually dispatched
+# RC colliding with a stable tag on the same release commit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -154,7 +154,7 @@ jobs:
       should_run: ${{ steps.decide.outputs.should_run }}
       head_sha: ${{ steps.decide.outputs.head_sha }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -272,6 +272,8 @@ jobs:
     if: ${{ always() && needs.ci.result == 'success' && (needs.route.outputs.mode == 'stable' || needs.rc-guard.outputs.should_run == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment:
+      name: internal-release
     permissions:
       # contents: write — RC path needs it for `git push --atomic` (v-tag +
       # marker). Stable path runs in the same job and inherits the grant; it
@@ -324,7 +326,7 @@ jobs:
       # on the RC path.
       - name: Checkout (RC)
         if: needs.route.outputs.mode == 'rc'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -341,7 +343,7 @@ jobs:
 
       - name: Checkout (stable)
         if: needs.route.outputs.mode == 'stable'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         # No `token:` — actions/checkout uses GITHUB_TOKEN by default. Stable
         # path performs no git pushes; the default scope is sufficient.
         with:
@@ -576,6 +578,21 @@ jobs:
           npm version "${{ steps.rc-version.outputs.rc_version }}" \
             --no-git-tag-version --allow-same-version
 
+      - name: Synchronize rc plugin manifest versions
+        if: needs.route.outputs.mode == 'rc'
+        shell: bash
+        working-directory: gitnexus
+        run: node scripts/sync-plugin-versions.mjs
+
+      - name: Verify rc plugin manifest versions
+        if: needs.route.outputs.mode == 'rc'
+        shell: bash
+        working-directory: gitnexus
+        run: >-
+          npx vitest run --project default
+          test/unit/sync-plugin-versions.test.ts
+          test/unit/cli-commands.test.ts
+
       - name: Build gitnexus
         run: npm run build
         working-directory: gitnexus
@@ -660,7 +677,13 @@ jobs:
           # Detached release commit with the version bump — main stays
           # pristine, but the v-tag's tree matches the published package
           # exactly (release-integrity).
-          git add package.json package-lock.json 2>/dev/null || git add package.json
+          git add \
+            package.json \
+            package-lock.json \
+            ../gitnexus-claude-plugin/.claude-plugin/plugin.json \
+            ../.claude-plugin/marketplace.json \
+            ../gitnexus-claude-plugin/.codex-plugin/plugin.json \
+            ../.agents/plugins/marketplace.json
           git commit -m "release: ${VTAG}" --allow-empty
           RELEASE_SHA="$(git rev-parse HEAD)"
           echo "Detached release commit: $RELEASE_SHA"
@@ -776,7 +799,6 @@ jobs:
       #   Workflow:    publish.yml
       #   Environment: (none)
       - name: Publish to npm
-        id: npm-publish
         shell: bash
         working-directory: gitnexus
         env:
@@ -800,7 +822,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
         with:
           tag_name: ${{ steps.vtag-gate.outputs.vtag }}
           name: >-
@@ -829,23 +851,19 @@ jobs:
             ) || '' }}
 
       # ── RC partial-failure cleanup ───────────────────────────────────────
-      # If npm publish fails after the atomic tag-push step, the v-tag and
-      # rc/<SHA> marker are already on origin but no immutable npm version
-      # exists. External consumers
+      # If anything after the atomic tag-push step failed (npm publish
+      # blew up, GitHub Release call timed out, etc.), the v-tag and
+      # rc/<SHA> marker are already on origin. External consumers
       # (Renovate, Dependabot, Releases RSS) can ingest a phantom tag for
       # a version that was never published to npm. This step deletes them
       # automatically so the operator's recovery is just "redispatch with
       # force=true on the next commit", not a manual ref cleanup.
       #
-      # If npm publish succeeds and a later GitHub Release step fails, keep the
-      # provenance tags: npm versions are immutable, and the recovery is to
-      # repair the release record, not to remove source tags for a real artifact.
-      #
       # Scoped strictly to RC + real (non-dry-run) + the rc-tags step
       # actually produced a vtag (otherwise nothing to clean up). The
       # App token is still valid (~1h TTL, job timeout 20min).
       - name: Cleanup pushed tags on partial failure
-        if: ${{ failure() && needs.route.outputs.mode == 'rc' && steps.rc-tags.outputs.vtag != '' && steps.npm-publish.conclusion != 'success' }}
+        if: ${{ failure() && needs.route.outputs.mode == 'rc' && steps.rc-tags.outputs.vtag != '' }}
         shell: bash
         working-directory: gitnexus
         env:

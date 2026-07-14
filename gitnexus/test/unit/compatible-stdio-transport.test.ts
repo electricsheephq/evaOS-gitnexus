@@ -233,23 +233,6 @@ describe('CompatibleStdioServerTransport', () => {
     );
   });
 
-  it('removes the stdin EOF listener when closed', async () => {
-    await transport.start();
-    expect(stdin.listenerCount('end')).toBe(1);
-
-    await transport.close();
-    expect(stdin.listenerCount('end')).toBe(0);
-
-    const nextStdin = new PassThrough();
-    const nextStdout = new PassThrough();
-    const nextTransport = new CompatibleStdioServerTransport(nextStdin, nextStdout);
-    await nextTransport.start();
-    expect(nextStdin.listenerCount('end')).toBe(1);
-
-    await nextTransport.close();
-    expect(nextStdin.listenerCount('end')).toBe(0);
-  });
-
   it('does not detect content-length framing from short ambiguous prefix', async () => {
     await transport.start();
     const onError = vi.fn();

@@ -8,6 +8,8 @@ vi.mock('../../src/core/run-analyze.js', () => ({
 
 vi.mock('../../src/core/lbug/lbug-adapter.js', () => ({
   closeLbug: vi.fn(async () => undefined),
+  closeLbugBeforeExit: vi.fn(async () => undefined),
+  isLbugReady: vi.fn(() => false),
 }));
 
 vi.mock('../../src/storage/repo-manager.js', () => ({
@@ -103,64 +105,5 @@ describe('analyzeCommand --embeddings [limit] parsing', () => {
     const opts = runFullAnalysisMock.mock.calls[0][1];
     expect(opts.embeddings).toBe(false);
     expect(opts.embeddingsNodeLimit).toBeUndefined();
-  });
-
-  it('sets HTTP embedding CLI flags only for the analyze invocation', async () => {
-    const prior = {
-      url: process.env.GITNEXUS_EMBEDDING_URL,
-      model: process.env.GITNEXUS_EMBEDDING_MODEL,
-      apiKey: process.env.GITNEXUS_EMBEDDING_API_KEY,
-      dims: process.env.GITNEXUS_EMBEDDING_DIMS,
-    };
-    runFullAnalysisMock.mockImplementationOnce(async () => {
-      expect(process.env.GITNEXUS_EMBEDDING_URL).toBe('https://api.voyageai.com/v1');
-      expect(process.env.GITNEXUS_EMBEDDING_MODEL).toBe('voyage-code-3');
-      expect(process.env.GITNEXUS_EMBEDDING_API_KEY).toBe('test-embedding-token');
-      expect(process.env.GITNEXUS_EMBEDDING_DIMS).toBe('2048');
-      return {
-        repoName: 'repo',
-        repoPath: '/repo',
-        stats: {},
-        alreadyUpToDate: true,
-      };
-    });
-    const { analyzeCommand } = await import('../../src/cli/analyze.js');
-
-    await analyzeCommand(undefined, {
-      embeddings: true,
-      embeddingBaseUrl: ' https://api.voyageai.com/v1 ',
-      embeddingModel: ' voyage-code-3 ',
-      embeddingAuthToken: ' test-embedding-token ',
-      embeddingDims: '2048',
-    });
-
-    expect(process.env.GITNEXUS_EMBEDDING_URL).toBe(prior.url);
-    expect(process.env.GITNEXUS_EMBEDDING_MODEL).toBe(prior.model);
-    expect(process.env.GITNEXUS_EMBEDDING_API_KEY).toBe(prior.apiKey);
-    expect(process.env.GITNEXUS_EMBEDDING_DIMS).toBe(prior.dims);
-  });
-
-  it('applies --embedding-dims before LadybugDB embedding schema is imported', async () => {
-    runFullAnalysisMock.mockImplementationOnce(async () => {
-      const { EMBEDDING_DIMS, EMBEDDING_SCHEMA } = await import('../../src/core/lbug/schema.js');
-      expect(EMBEDDING_DIMS).toBe(2048);
-      expect(EMBEDDING_SCHEMA).toContain('embedding FLOAT[2048]');
-      return {
-        repoName: 'repo',
-        repoPath: '/repo',
-        stats: {},
-        alreadyUpToDate: true,
-      };
-    });
-    const { analyzeCommand } = await import('../../src/cli/analyze.js');
-
-    await analyzeCommand(undefined, {
-      embeddings: true,
-      embeddingBaseUrl: 'https://api.voyageai.com/v1',
-      embeddingModel: 'voyage-code-3',
-      embeddingDims: '2048',
-    });
-
-    expect(runFullAnalysisMock).toHaveBeenCalledTimes(1);
   });
 });

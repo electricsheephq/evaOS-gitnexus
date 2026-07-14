@@ -14,25 +14,8 @@ import {
   runPipelineFromRepo,
   type PipelineResult,
 } from './resolvers/helpers.js';
-import {
-  isLanguageAvailable,
-  loadParser,
-  loadLanguage,
-} from '../../src/core/tree-sitter/parser-loader.js';
-import { SupportedLanguages } from '../../src/config/supported-languages.js';
 
 const CROSS_FILE_FIXTURES = path.resolve(__dirname, '..', 'fixtures', 'cross-file-binding');
-
-let kotlinAvailable = isLanguageAvailable(SupportedLanguages.Kotlin);
-if (kotlinAvailable) {
-  try {
-    await loadParser();
-    await loadLanguage(SupportedLanguages.Kotlin);
-  } catch {
-    kotlinAvailable = false;
-  }
-}
-const describeKotlin = kotlinAvailable ? describe : describe.skip;
 
 // ---------------------------------------------------------------------------
 // Simple cross-file: models → service → app
@@ -407,7 +390,7 @@ describe('Phase 9 — Cross-File Call-Result Binding: Go', () => {
   });
 });
 
-describeKotlin('Phase 9 — Cross-File Call-Result Binding: Kotlin', () => {
+describe('Phase 9 — Cross-File Call-Result Binding: Kotlin', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -819,7 +802,7 @@ describe('Consumer-Before-Provider: C#', () => {
   });
 });
 
-describeKotlin('Consumer-Before-Provider: Kotlin', () => {
+describe('Consumer-Before-Provider: Kotlin', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {

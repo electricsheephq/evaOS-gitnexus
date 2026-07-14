@@ -69,8 +69,7 @@ export const REL_TYPES = [
   'ENTRY_POINT_OF',
   'WRAPS',
   'QUERIES',
-  'BINDS_EVENT_HANDLER',
-  'EMITS_EVENT',
+  'INJECTS',
   // Taint/PDG substrate (issue #2080) — reserved edge types, emitted by no
   // phase yet (CFG → M1, REACHING_DEF → M2, TAINTED/SANITIZES/TAINT_PATH →
   // M3/M4). REACHING_DEF's variable name rides the relation's `reason` column.
@@ -79,6 +78,12 @@ export const REL_TYPES = [
   'TAINTED',
   'SANITIZES',
   'TAINT_PATH',
+  // Control dependence (PDG, issue #2085 M5) — CDG carries its 'T'|'F' branch
+  // label in the relation's `reason` column; POST_DOMINATE is debug-only
+  // (behind GITNEXUS_PDG_EMIT_POST_DOMINATE). Both are BasicBlock→BasicBlock,
+  // reusing the existing FROM BasicBlock TO BasicBlock pair in RELATION_SCHEMA.
+  'CDG',
+  'POST_DOMINATE',
 ] as const;
 
 export type RelType = (typeof REL_TYPES)[number];

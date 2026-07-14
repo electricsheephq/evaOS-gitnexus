@@ -1,5 +1,5 @@
 /**
- * Receiver-bound CALLS / ACCESSES emit pass — generic 7-case
+ * Receiver-bound CALLS / ACCESSES emit pass — generic 8-case
  * dispatcher consuming `ScopeResolver` for the language-specific bits
  * (super recognizer, field-fallback toggle).
  *
@@ -9,19 +9,26 @@
  *   1. **super branch** — `provider.isSuperReceiver(receiverName)` →
  *      MRO walk skipping self
  *   2. **Case 0 (compound)** — receiver has `.` or `(` → compound resolver
- *   3. **Case 1 (namespace)** — receiver in `namespaceTargets` → exported def
- *   4. **Case 2 (class-name / static receiver)** — receiver resolves to a
+ *   3. **Case 0.5 (implicit `this` receiver)** — GATED: fires only when
+ *      the language sets `resolveThisViaEnclosingClass === true` AND the
+ *      receiver is literally `this` → enclosing-class + MRO chain walk
+ *      with C++ member-name-hiding semantics. Languages that leave the
+ *      toggle unset skip this case entirely; their `this` sites fall
+ *      through to Case 4 via the synthesized `this` typeBinding (which
+ *      also emits interface-dispatch fan-out that this case does not).
+ *   4. **Case 1 (namespace)** — receiver in `namespaceTargets` → exported def
+ *   5. **Case 2 (class-name / static receiver)** — receiver resolves to a
  *      class-like binding (Class/Interface/Struct/Record/Enum/Trait) → MRO
  *      walk on that class. Also handles static-style invocations
  *      (`ILogger.Warn(...)`) with kind-aware reason/confidence for
  *      read/write ACCESSES.
- *   5. **Case 3 (dotted typeBinding for namespace prefix)** —
+ *   6. **Case 3 (dotted typeBinding for namespace prefix)** —
  *      `typeRef.rawName` like `models.User`
- *   6. **Case 3b (chain-typebinding)** — `typeRef.rawName` has a dot
+ *   7. **Case 3b (chain-typebinding)** — `typeRef.rawName` has a dot
  *      but not a namespace prefix → compound resolver
- *   7. **Case 4 (simple typeBinding)** — `typeRef.rawName` has no dot →
+ *   8. **Case 4 (simple typeBinding)** — `typeRef.rawName` has no dot →
  *      MRO walk + `findOwnedMember`
- *   8. **Case 5 (value-receiver bridge)** — receiver is a `Const`/`Variable`
+ *   9. **Case 5 (value-receiver bridge)** — receiver is a `Const`/`Variable`
  *      whose `nodeId` is referenced as an `ownerId` in `model.methods`
  *      (object-literal services). Last-resort fallback for lowercase
  *      receivers with no class-like or type-binding match. Mirrors
@@ -54,7 +61,12 @@ import {
   findValueBindingInScope,
   isClassLike,
 } from '../scope/walkers.js';
-import { tryEmitEdge, tryEmitEdgeWithExplicitTargetId } from '../graph-bridge/edges.js';
+import {
+  tryEmitEdge,
+  tryEmitEdgeWithExplicitTargetId,
+  type CalleeIdCaptureCtx,
+} from '../graph-bridge/edges.js';
+import type { CalleeIdSink } from '../graph-bridge/callee-id-sink.js';
 import { resolveCompoundReceiverClass } from '../passes/compound-receiver.js';
 import { resolveDefGraphId } from '../graph-bridge/ids.js';
 import {
@@ -81,10 +93,12 @@ type ReceiverBoundProviderSubset = Pick<
   | 'collapseMemberCallsByCallerTarget'
   | 'unwrapCollectionAccessor'
   | 'hoistTypeBindingsToModule'
+  | 'stripReceiverCastExpressions'
   | 'resolveQualifiedReceiverMember'
   | 'resolveReceiverMember'
   | 'resolveThisViaEnclosingClass'
   | 'conversionRankFn'
+  | 'conversionOnlyArgTypePrefixes'
   | 'constraintCompatibility'
   | 'isStaticOnly'
 >;
@@ -147,6 +161,10 @@ export function emitReceiverBoundCalls(
   model: SemanticModel,
   options: {
     readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
+    /** Resolved-callee-id capture sink (#2227 U2). Threaded in only under
+     *  `--pdg`; `undefined` ⇒ zero overhead, byte-identity (R4). Per-file
+     *  capture contexts are built from this + `parsed.filePath` in the loop. */
+    readonly calleeIdSink?: CalleeIdSink;
   } = {},
 ): number {
   let emitted = 0;
@@ -161,6 +179,7 @@ export function emitReceiverBoundCalls(
     fieldFallback,
     unwrapCollectionAccessor: provider.unwrapCollectionAccessor,
     hoistTypeBindingsToModule,
+    stripReceiverCastExpressions: provider.stripReceiverCastExpressions === true,
   };
 
   // Build an interface → implementors map from IMPLEMENTS edges.
@@ -199,14 +218,21 @@ export function emitReceiverBoundCalls(
     primaryMemberDef: SymbolDefinition,
     site: ParsedFile['referenceSites'][number],
     confidence: number,
+    calleeCapture: CalleeIdCaptureCtx | undefined,
   ): number => {
     if (ownerDef.type !== 'Interface') return 0;
     const impls = implementorsByInterfaceDefId.get(ownerDef.nodeId);
     if (impls === undefined) return 0;
     let n = 0;
     for (const implDef of impls) {
-      const implMember = findOwnedMember(implDef.nodeId, memberName, model);
-      if (implMember === undefined) continue;
+      const implMember = pickOverload(implDef.nodeId, memberName, site, model, provider);
+      if (
+        implMember === undefined ||
+        implMember === OVERLOAD_AMBIGUOUS ||
+        implMember.isDeleted === true
+      ) {
+        continue;
+      }
       if (implMember.nodeId === primaryMemberDef.nodeId) continue;
       const ok = tryEmitEdge(
         graph,
@@ -218,6 +244,7 @@ export function emitReceiverBoundCalls(
         seen,
         confidence,
         collapse,
+        calleeCapture,
       );
       if (ok) n++;
     }
@@ -226,6 +253,13 @@ export function emitReceiverBoundCalls(
 
   for (const parsed of parsedFiles) {
     const namespaceTargets = collectNamespaceTargets(parsed, scopes);
+    // Per-file resolved-callee-id capture context (#2227 U2). Built once per
+    // file; `undefined` when the sink is absent (pdg off) so the `tryEmitEdge`
+    // capture is a no-op and emission stays byte-identical (R4).
+    const calleeCapture: CalleeIdCaptureCtx | undefined =
+      options.calleeIdSink !== undefined
+        ? { sink: options.calleeIdSink, filePath: parsed.filePath }
+        : undefined;
 
     for (const site of parsed.referenceSites) {
       if (site.kind !== 'call' && site.kind !== 'read' && site.kind !== 'write') continue;
@@ -257,11 +291,46 @@ export function emitReceiverBoundCalls(
               ? extendsOnly(enclosingClass.nodeId)
               : scopes.methodDispatch.mroFor(enclosingClass.nodeId);
           let memberDef: SymbolDefinition | undefined;
+          let ambiguousOwnerId: string | undefined;
           for (const ownerId of ancestors) {
-            memberDef = findOwnedMember(ownerId, memberName, model);
-            if (memberDef !== undefined) break;
+            const picked =
+              site.kind === 'call'
+                ? pickOverload(ownerId, memberName, site, model, provider)
+                : findOwnedMember(ownerId, memberName, model);
+            if (picked === OVERLOAD_AMBIGUOUS) {
+              ambiguousOwnerId = ownerId;
+              break;
+            }
+            if (picked !== undefined) {
+              memberDef = picked;
+              break;
+            }
+          }
+          if (ambiguousOwnerId !== undefined) {
+            recordReceiverOverloadSuppression(
+              options.recordResolutionOutcome,
+              parsed.filePath,
+              site,
+              ambiguousOwnerId,
+              memberName,
+              model,
+              provider,
+            );
+            handledSites.add(siteKey);
+            continue;
           }
           if (memberDef !== undefined) {
+            if (
+              suppressDeletedCallTarget(
+                options.recordResolutionOutcome,
+                parsed.filePath,
+                site,
+                memberDef,
+              )
+            ) {
+              handledSites.add(siteKey);
+              continue;
+            }
             // Super/base calls resolve through the MRO chain, not
             // through imports — the ancestor method is found by
             // walking `methodDispatch.mroFor(enclosingClass)`, which
@@ -288,6 +357,7 @@ export function emitReceiverBoundCalls(
               seen,
               0.85,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             // Always mark handled when the site was resolved, even
@@ -312,9 +382,9 @@ export function emitReceiverBoundCalls(
         if (currentClass !== undefined) {
           const chain = [currentClass.nodeId, ...scopes.methodDispatch.mroFor(currentClass.nodeId)];
           let memberDef: SymbolDefinition | undefined;
+          let ambiguousOwnerId: string | undefined;
           // Static-only filter (#1756 / U3): same shape as Case 4's
-          // chain walk (skip-and-walk-on) but without overload
-          // narrowing — Case 0 uses `findOwnedMember` directly. When
+          // overload-aware chain walk (skip-and-walk-on). When
           // an owner's resolved candidate is static-only (Kotlin
           // companion-promoted), continue to the next ancestor in
           // the MRO chain so a legitimate instance member can bind.
@@ -326,16 +396,45 @@ export function emitReceiverBoundCalls(
           // shapes like `Logger.create("a")`), so there's no wrong
           // target to suppress.
           for (const ownerId of chain) {
-            const candidate = findOwnedMember(ownerId, memberName, model);
-            if (candidate === undefined) continue;
-            if (provider.isStaticOnly?.(candidate) === true) {
-              // Skip static-only candidate; walk to next ancestor.
+            const picked =
+              site.kind === 'call'
+                ? pickFirstNonStaticOnly(ownerId, memberName, site, model, provider)
+                : findOwnedMember(ownerId, memberName, model);
+            if (picked === OVERLOAD_AMBIGUOUS) {
+              ambiguousOwnerId = ownerId;
+              break;
+            }
+            if (picked === STATIC_ONLY_FILTERED || picked === undefined) {
               continue;
             }
-            memberDef = candidate;
+            memberDef = picked;
             break;
           }
+          if (ambiguousOwnerId !== undefined) {
+            recordReceiverOverloadSuppression(
+              options.recordResolutionOutcome,
+              parsed.filePath,
+              site,
+              ambiguousOwnerId,
+              memberName,
+              model,
+              provider,
+            );
+            handledSites.add(siteKey);
+            continue;
+          }
           if (memberDef !== undefined) {
+            if (
+              suppressDeletedCallTarget(
+                options.recordResolutionOutcome,
+                parsed.filePath,
+                site,
+                memberDef,
+              )
+            ) {
+              handledSites.add(siteKey);
+              continue;
+            }
             const ok = tryEmitEdge(
               graph,
               scopes,
@@ -346,6 +445,7 @@ export function emitReceiverBoundCalls(
               seen,
               0.85,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             // Always mark handled when the site was resolved, even
@@ -398,6 +498,17 @@ export function emitReceiverBoundCalls(
           }
           if (languageResolution?.kind === 'resolved') {
             const memberDef = languageResolution.definition;
+            if (
+              suppressDeletedCallTarget(
+                options.recordResolutionOutcome,
+                parsed.filePath,
+                site,
+                memberDef,
+              )
+            ) {
+              handledSites.add(siteKey);
+              continue;
+            }
             const reason =
               site.kind === 'write' || site.kind === 'read'
                 ? site.kind
@@ -415,6 +526,7 @@ export function emitReceiverBoundCalls(
               seen,
               confidence,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             handledSites.add(siteKey);
@@ -438,6 +550,7 @@ export function emitReceiverBoundCalls(
                 {
                   argumentTypeClasses: site.argumentTypeClasses,
                   conversionRankFn: provider.conversionRankFn,
+                  conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
                   constraintCompatibility: provider.constraintCompatibility,
                 },
               );
@@ -482,6 +595,17 @@ export function emitReceiverBoundCalls(
             continue;
           }
           if (memberDef !== undefined) {
+            if (
+              suppressDeletedCallTarget(
+                options.recordResolutionOutcome,
+                parsed.filePath,
+                site,
+                memberDef,
+              )
+            ) {
+              handledSites.add(siteKey);
+              continue;
+            }
             const reason =
               site.kind === 'write' || site.kind === 'read'
                 ? site.kind
@@ -499,6 +623,7 @@ export function emitReceiverBoundCalls(
               seen,
               confidence,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             handledSites.add(siteKey);
@@ -509,11 +634,23 @@ export function emitReceiverBoundCalls(
 
       // ── Case 1: namespace receiver ───────────────────────────────
       const targetFiles = namespaceTargets.get(receiverName);
-      if (targetFiles !== undefined) {
+      if (targetFiles !== undefined && provider.resolveQualifiedReceiverMember === undefined) {
         let found = false;
         for (const targetFile of targetFiles) {
           const memberDef = findExportedDef(targetFile, memberName, index);
           if (memberDef !== undefined) {
+            if (
+              suppressDeletedCallTarget(
+                options.recordResolutionOutcome,
+                parsed.filePath,
+                site,
+                memberDef,
+              )
+            ) {
+              handledSites.add(siteKey);
+              found = true;
+              break;
+            }
             const ok = tryEmitEdge(
               graph,
               scopes,
@@ -524,6 +661,7 @@ export function emitReceiverBoundCalls(
               seen,
               0.85,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             handledSites.add(siteKey);
@@ -565,6 +703,17 @@ export function emitReceiverBoundCalls(
           continue;
         }
         if (memberDef !== undefined) {
+          if (
+            suppressDeletedCallTarget(
+              options.recordResolutionOutcome,
+              parsed.filePath,
+              site,
+              memberDef,
+            )
+          ) {
+            handledSites.add(siteKey);
+            continue;
+          }
           const ok = tryEmitEdge(
             graph,
             scopes,
@@ -575,6 +724,7 @@ export function emitReceiverBoundCalls(
             seen,
             0.85,
             collapse,
+            calleeCapture,
           );
           if (ok) emitted++;
           handledSites.add(siteKey);
@@ -587,9 +737,18 @@ export function emitReceiverBoundCalls(
       if (classDef !== undefined) {
         const chain = [classDef.nodeId, ...scopes.methodDispatch.mroFor(classDef.nodeId)];
         let memberDef: SymbolDefinition | undefined;
+        let ambiguousOwnerId: string | undefined;
         for (const ownerId of chain) {
-          memberDef = findOwnedMember(ownerId, memberName, model);
-          if (memberDef !== undefined) {
+          const picked =
+            site.kind === 'call'
+              ? pickOverload(ownerId, memberName, site, model, provider)
+              : findOwnedMember(ownerId, memberName, model);
+          if (picked === OVERLOAD_AMBIGUOUS) {
+            ambiguousOwnerId = ownerId;
+            break;
+          }
+          if (picked !== undefined) {
+            memberDef = picked;
             // The MRO chain is most-derived-first ([classDef, ...ancestors]).
             // If the most-derived definition is arity-incompatible with the
             // call site, PHP throws ArgumentCountError at runtime — it does
@@ -605,7 +764,31 @@ export function emitReceiverBoundCalls(
             break;
           }
         }
+        if (ambiguousOwnerId !== undefined) {
+          recordReceiverOverloadSuppression(
+            options.recordResolutionOutcome,
+            parsed.filePath,
+            site,
+            ambiguousOwnerId,
+            memberName,
+            model,
+            provider,
+          );
+          handledSites.add(siteKey);
+          continue;
+        }
         if (memberDef !== undefined) {
+          if (
+            suppressDeletedCallTarget(
+              options.recordResolutionOutcome,
+              parsed.filePath,
+              site,
+              memberDef,
+            )
+          ) {
+            handledSites.add(siteKey);
+            continue;
+          }
           const reason =
             site.kind === 'write' || site.kind === 'read'
               ? site.kind
@@ -623,6 +806,7 @@ export function emitReceiverBoundCalls(
             seen,
             confidence,
             collapse,
+            calleeCapture,
           );
           if (ok) emitted++;
           handledSites.add(siteKey);
@@ -641,8 +825,38 @@ export function emitReceiverBoundCalls(
           for (const targetFile3 of targetFiles3) {
             const classDef3 = findExportedDef(targetFile3, className, index);
             if (classDef3 !== undefined) {
-              const memberDef = findOwnedMember(classDef3.nodeId, memberName, model);
-              if (memberDef !== undefined) {
+              const picked =
+                site.kind === 'call'
+                  ? pickOverload(classDef3.nodeId, memberName, site, model, provider)
+                  : findOwnedMember(classDef3.nodeId, memberName, model);
+              if (picked === OVERLOAD_AMBIGUOUS) {
+                recordReceiverOverloadSuppression(
+                  options.recordResolutionOutcome,
+                  parsed.filePath,
+                  site,
+                  classDef3.nodeId,
+                  memberName,
+                  model,
+                  provider,
+                );
+                handledSites.add(siteKey);
+                found3 = true;
+                break;
+              }
+              if (picked !== undefined) {
+                const memberDef = picked;
+                if (
+                  suppressDeletedCallTarget(
+                    options.recordResolutionOutcome,
+                    parsed.filePath,
+                    site,
+                    memberDef,
+                  )
+                ) {
+                  handledSites.add(siteKey);
+                  found3 = true;
+                  break;
+                }
                 const ok = tryEmitEdge(
                   graph,
                   scopes,
@@ -651,6 +865,11 @@ export function emitReceiverBoundCalls(
                   memberDef,
                   memberDef.filePath !== parsed.filePath ? 'import-resolved' : 'global',
                   seen,
+                  // Explicit defaults so the trailing capture ctx (#2227 U2) can
+                  // be threaded without changing dedup/confidence behavior.
+                  0.85,
+                  false,
+                  calleeCapture,
                 );
                 if (ok) {
                   emitted++;
@@ -700,8 +919,9 @@ export function emitReceiverBoundCalls(
         if (ownerDef !== undefined) {
           const chain = [ownerDef.nodeId, ...scopes.methodDispatch.mroFor(ownerDef.nodeId)];
           let memberDef: SymbolDefinition | undefined;
-          // Static-only filter (#1756 / U3): mirrors Case 0's chain
-          // walk — `findOwnedMember` without overload narrowing. When
+          let ambiguousOwnerId: string | undefined;
+          // Static-only filter (#1756 / U3): mirrors Case 0's
+          // overload-aware chain walk. When
           // a static-only candidate is found at an ancestor, walk on
           // so a legitimate instance member can bind. If the entire
           // chain is static-only, no edge is emitted (Case 3b is fed
@@ -709,15 +929,45 @@ export function emitReceiverBoundCalls(
           // `emitReferencesViaLookup` for compound shapes, so no
           // handled-site marker is needed for chain-only-static).
           for (const ownerId of chain) {
-            const candidate = findOwnedMember(ownerId, memberName, model);
-            if (candidate === undefined) continue;
-            if (provider.isStaticOnly?.(candidate) === true) {
+            const picked =
+              site.kind === 'call'
+                ? pickFirstNonStaticOnly(ownerId, memberName, site, model, provider)
+                : findOwnedMember(ownerId, memberName, model);
+            if (picked === OVERLOAD_AMBIGUOUS) {
+              ambiguousOwnerId = ownerId;
+              break;
+            }
+            if (picked === STATIC_ONLY_FILTERED || picked === undefined) {
               continue;
             }
-            memberDef = candidate;
+            memberDef = picked;
             break;
           }
+          if (ambiguousOwnerId !== undefined) {
+            recordReceiverOverloadSuppression(
+              options.recordResolutionOutcome,
+              parsed.filePath,
+              site,
+              ambiguousOwnerId,
+              memberName,
+              model,
+              provider,
+            );
+            handledSites.add(siteKey);
+            continue;
+          }
           if (memberDef !== undefined) {
+            if (
+              suppressDeletedCallTarget(
+                options.recordResolutionOutcome,
+                parsed.filePath,
+                site,
+                memberDef,
+              )
+            ) {
+              handledSites.add(siteKey);
+              continue;
+            }
             const ok = tryEmitEdge(
               graph,
               scopes,
@@ -728,6 +978,7 @@ export function emitReceiverBoundCalls(
               seen,
               0.85,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             // Always mark handled when the site was resolved, even
@@ -790,6 +1041,17 @@ export function emitReceiverBoundCalls(
           }
           if (languageResolution?.kind === 'resolved') {
             const memberDef = languageResolution.definition;
+            if (
+              suppressDeletedCallTarget(
+                options.recordResolutionOutcome,
+                parsed.filePath,
+                site,
+                memberDef,
+              )
+            ) {
+              handledSites.add(siteKey);
+              continue;
+            }
             const reason =
               site.kind === 'write' || site.kind === 'read'
                 ? site.kind
@@ -807,6 +1069,7 @@ export function emitReceiverBoundCalls(
               seen,
               confidence,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             handledSites.add(siteKey);
@@ -892,6 +1155,17 @@ export function emitReceiverBoundCalls(
             continue;
           }
           if (memberDef !== undefined) {
+            if (
+              suppressDeletedCallTarget(
+                options.recordResolutionOutcome,
+                parsed.filePath,
+                site,
+                memberDef,
+              )
+            ) {
+              handledSites.add(siteKey);
+              continue;
+            }
             // For read/write ACCESSES, mirror the legacy DAG's reason
             // convention so consumers asserting `reason === 'write'`
             // keep working.
@@ -912,12 +1186,20 @@ export function emitReceiverBoundCalls(
               seen,
               confidence,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             // Interface dispatch: when the primary owner is an
             // Interface, emit secondary CALLS edges to every
             // implementing class's same-named method.
-            emitted += emitInterfaceDispatchFor(ownerDef, memberName, memberDef, site, confidence);
+            emitted += emitInterfaceDispatchFor(
+              ownerDef,
+              memberName,
+              memberDef,
+              site,
+              confidence,
+              calleeCapture,
+            );
             // Always mark handled when the site was resolved, even
             // if the edge was deduplicated (collapse mode), so
             // `emitReferencesViaLookup` doesn't re-emit from the
@@ -968,6 +1250,17 @@ export function emitReceiverBoundCalls(
           continue;
         }
         if (picked !== undefined) {
+          if (
+            suppressDeletedCallTarget(
+              options.recordResolutionOutcome,
+              parsed.filePath,
+              site,
+              picked,
+            )
+          ) {
+            handledSites.add(siteKey);
+            continue;
+          }
           // Static-only filter (#1756 / U3): unlike Case 4 there's no
           // MRO chain to walk here — Case 5 dispatches on a single
           // owner via `pickOverload`. When the picked candidate is
@@ -998,6 +1291,7 @@ export function emitReceiverBoundCalls(
             seen,
             confidence,
             collapse,
+            calleeCapture,
           );
           if (ok) emitted++;
           handledSites.add(siteKey);
@@ -1033,6 +1327,7 @@ function pickOverload(
   const candidates = narrowOverloadCandidates(overloads, site.arity, site.argumentTypes, {
     argumentTypeClasses: site.argumentTypeClasses,
     conversionRankFn: provider.conversionRankFn,
+    conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
     constraintCompatibility: provider.constraintCompatibility,
   });
   // When narrowing leaves >1 candidate that share identical normalized
@@ -1140,6 +1435,7 @@ function pickFirstNonStaticOnly(
   const candidates = narrowOverloadCandidates(overloads, site.arity, site.argumentTypes, {
     argumentTypeClasses: site.argumentTypeClasses,
     conversionRankFn: provider.conversionRankFn,
+    conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
     constraintCompatibility: provider.constraintCompatibility,
   });
   // Same ambiguity handling as `pickOverload`: when normalization
@@ -1150,6 +1446,25 @@ function pickFirstNonStaticOnly(
   if (isOverloadAmbiguousAfterNormalization(candidates, site.arity)) return OVERLOAD_AMBIGUOUS;
   if (candidates.length > 1) return OVERLOAD_AMBIGUOUS;
   return candidates[0] ?? overloads[0];
+}
+
+function suppressDeletedCallTarget(
+  record: ResolutionOutcomeRecorder | undefined,
+  filePath: string,
+  site: ParsedFile['referenceSites'][number],
+  target: SymbolDefinition,
+): boolean {
+  if (site.kind !== 'call' || target.isDeleted !== true) return false;
+  record?.({
+    kind: 'suppressed',
+    phase: 'receiver-bound-calls',
+    filePath,
+    name: site.name,
+    range: site.atRange,
+    reason: 'selected-callable-deleted',
+    candidateIds: [target.nodeId],
+  });
+  return true;
 }
 
 function recordReceiverOverloadSuppression(
@@ -1166,6 +1481,7 @@ function recordReceiverOverloadSuppression(
   const candidates = narrowOverloadCandidates(overloads, site.arity, site.argumentTypes, {
     argumentTypeClasses: site.argumentTypeClasses,
     conversionRankFn: provider.conversionRankFn,
+    conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
     constraintCompatibility: provider.constraintCompatibility,
   });
   const reason: ResolutionSuppressionReason = isOverloadAmbiguousAfterNormalization(

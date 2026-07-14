@@ -323,6 +323,7 @@ describe('WikiGenerator --review mode', () => {
       initWikiDb: vi.fn().mockResolvedValue(undefined),
       closeWikiDb: vi.fn().mockResolvedValue(undefined),
       touchWikiDb: vi.fn(),
+      pinWikiDb: vi.fn(() => vi.fn()),
       getFilesWithExports: vi
         .fn()
         .mockResolvedValue(fakeFiles.map((f) => ({ filePath: f, symbols: [] }))),
@@ -1762,6 +1763,7 @@ describe('WikiGenerator grouping prompt isolation', () => {
       initWikiDb: vi.fn().mockResolvedValue(undefined),
       closeWikiDb: vi.fn().mockResolvedValue(undefined),
       touchWikiDb: vi.fn(),
+      pinWikiDb: vi.fn(() => vi.fn()),
       getFilesWithExports: vi.fn().mockResolvedValue([{ filePath: 'src/auth.ts', symbols: [] }]),
       getAllFiles: vi.fn().mockResolvedValue(['src/auth.ts']),
       getIntraModuleCallEdges: vi.fn().mockResolvedValue([]),
@@ -1815,5 +1817,15 @@ describe('WikiGenerator grouping prompt isolation', () => {
     const groupingSystemPrompt = callLLMSpy.mock.calls[0][2];
     expect(groupingSystemPrompt).toBe(GROUPING_SYSTEM_PROMPT);
     expect(groupingSystemPrompt).not.toContain('chinese');
+  });
+});
+
+describe('sanitizeWikiErrorForConsole', () => {
+  it('renders untrusted errors as one terminal-safe line', async () => {
+    const { sanitizeWikiErrorForConsole } = await import('../../src/cli/wiki.js');
+
+    expect(sanitizeWikiErrorForConsole('first\r\nsecond\nthird\u001b[31mred\u2028last')).toBe(
+      'firstsecondthird\uFFFD[31mred last',
+    );
   });
 });
