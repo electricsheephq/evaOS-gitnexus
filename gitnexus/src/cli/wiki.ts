@@ -58,7 +58,8 @@ function parsePositiveIntegerOption(
 
 export function sanitizeWikiErrorForConsole(value: unknown): string {
   return String(value ?? 'Unknown error')
-    .replace(/[\r\n\u2028\u2029]+/g, ' ')
+    .replace(/\n|\r/g, '')
+    .replace(/[\u2028\u2029]+/g, ' ')
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, '\uFFFD');
 }
 
