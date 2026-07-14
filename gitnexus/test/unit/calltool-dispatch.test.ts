@@ -454,6 +454,23 @@ describe('LocalBackend.callTool', () => {
     expect(groupImpactSpy.mock.calls[0][0]).toMatchObject({ target: 'validate' });
   });
 
+  it('preserves impact target_uid-only selection before @group forwarding', async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    const groupImpactSpy = vi
+      .spyOn(backend.getGroupService(), 'groupImpact')
+      .mockResolvedValue({ status: 'uid-selected' } as any);
+
+    await backend.callTool('impact', {
+      target_uid: 'Function:src/auth.ts:validate',
+      direction: 'upstream',
+      repo: '@grp',
+    });
+
+    expect(groupImpactSpy.mock.calls[0][0]).toMatchObject({
+      target_uid: 'Function:src/auth.ts:validate',
+    });
+  });
+
   it('dispatches query tool', async () => {
     (executeParameterized as any).mockResolvedValue([]);
     const result = await backend.callTool('query', { query: 'auth' });

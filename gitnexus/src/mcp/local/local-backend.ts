@@ -784,7 +784,8 @@ export class LocalBackend {
     if (!this.groupToolSvc) {
       const port: GroupToolPort = {
         resolveRepo: (p) => this.resolveRepo(p),
-        impact: (r, p) => this.impact(r as RepoHandle, p),
+        impact: (r, p) =>
+          this.impact(r as RepoHandle, { ...p, target: p.target ?? '' } as ImpactParams),
         query: (r, p) => this.query(r as RepoHandle, p),
         impactByUid: (id, uid, d, o) => this.impactByUid(id, uid, d, o),
         context: (r, p) => this.context(r as RepoHandle, p),
@@ -6546,6 +6547,7 @@ export class LocalBackend {
         target: params.target,
         direction: params.direction,
       };
+      if (params.target_uid !== undefined) impactArgs.target_uid = params.target_uid;
       if (params.maxDepth !== undefined) impactArgs.maxDepth = params.maxDepth;
       if (params.crossDepth !== undefined) impactArgs.crossDepth = params.crossDepth;
       if (params.relationTypes !== undefined) impactArgs.relationTypes = params.relationTypes;
