@@ -65,22 +65,22 @@ else process.exit(2);
   return { root, prefix, asset, checksums };
 }
 
-function run(values) {
-  return spawnSync(
-    process.execPath,
-    [
-      SCRIPT,
-      '--asset',
-      values.asset,
-      '--checksums',
-      values.checksums,
-      '--prefix',
-      values.prefix,
-      '--expected-version',
-      '1.6.10-electric.2',
-    ],
-    { encoding: 'utf8' },
-  );
+function runArgs(args) {
+  return spawnSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8' });
+}
+
+function run(values, trailingArgs = []) {
+  return runArgs([
+    '--asset',
+    values.asset,
+    '--checksums',
+    values.checksums,
+    '--prefix',
+    values.prefix,
+    '--expected-version',
+    '1.6.10-electric.2',
+    ...trailingArgs,
+  ]);
 }
 
 test.after(() => {
@@ -104,4 +104,21 @@ test('fails closed when the installed LadybugDB version drifts', () => {
   const result = run(fixture({ ladybugVersion: '0.18.0' }));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /expected 0\.18\.1/u);
+});
+
+test('rejects unknown and duplicate release-gate arguments', () => {
+  const values = fixture();
+  const unknown = run(values, ['--verbose', 'true']);
+  assert.notEqual(unknown.status, 0);
+  assert.match(unknown.stderr, /unexpected argument: --verbose/u);
+
+  const duplicate = run(values, ['--asset', values.asset]);
+  assert.notEqual(duplicate.status, 0);
+  assert.match(duplicate.stderr, /duplicate argument: --asset/u);
+});
+
+test('rejects a following flag as a missing argument value', () => {
+  const result = runArgs(['--asset', '--checksums', 'SHA256SUMS']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /missing value for --asset/u);
 });

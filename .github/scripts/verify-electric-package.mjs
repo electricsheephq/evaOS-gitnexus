@@ -8,20 +8,24 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const EXPECTED_LADYBUG_VERSION = '0.18.1';
+const ARGUMENT_KEYS = new Set(['asset', 'checksums', 'prefix', 'expected-version']);
+const USAGE =
+  'usage: verify-electric-package.mjs --asset <tarball> --checksums <file> --prefix <dir> --expected-version <version>';
 
 function parseArgs(argv) {
   const values = {};
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
     const value = argv[index + 1];
-    if (!key?.startsWith('--') || !value) {
-      throw new Error(
-        'usage: verify-electric-package.mjs --asset <tarball> --checksums <file> --prefix <dir> --expected-version <version>',
-      );
-    }
-    values[key.slice(2)] = value;
+    if (!key?.startsWith('--'))
+      throw new Error(`unexpected argument: ${key ?? '<missing>'}\n${USAGE}`);
+    const name = key.slice(2);
+    if (!ARGUMENT_KEYS.has(name)) throw new Error(`unexpected argument: ${key}\n${USAGE}`);
+    if (Object.hasOwn(values, name)) throw new Error(`duplicate argument: ${key}`);
+    if (!value || value.startsWith('--')) throw new Error(`missing value for ${key}\n${USAGE}`);
+    values[name] = value;
   }
-  for (const key of ['asset', 'checksums', 'prefix', 'expected-version']) {
+  for (const key of ARGUMENT_KEYS) {
     if (!values[key]) throw new Error(`missing --${key}`);
   }
   return values;

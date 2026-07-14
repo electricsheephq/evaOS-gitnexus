@@ -300,6 +300,9 @@ jobs:
         with:
           build: 'true'
 
+      - name: Test Electric package verifier
+        run: node --test .github/scripts/verify-electric-package.test.mjs
+
       - name: Pack gitnexus tarball
         shell: bash
         run: npm pack
