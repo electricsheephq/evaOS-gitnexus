@@ -82,6 +82,7 @@ export function runCli(prefix, args, timeoutMs = PACKAGED_CLI_TIMEOUT_MS) {
   const result = spawnSync(executable, args, {
     encoding: 'utf8',
     env: { ...process.env, NO_COLOR: '1' },
+    killSignal: 'SIGKILL',
     shell: process.platform === 'win32',
     timeout: timeoutMs,
   });

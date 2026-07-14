@@ -131,7 +131,10 @@ test('accepts CRLF checksum files', () => {
 
 test('fails fast when the packaged CLI hangs', () => {
   const values = fixture();
-  fs.writeFileSync(values.cliScript, '#!/usr/bin/env node\nsetTimeout(() => {}, 10_000);\n');
+  fs.writeFileSync(
+    values.cliScript,
+    "#!/usr/bin/env node\nprocess.on('SIGTERM', () => {});\nsetTimeout(() => {}, 10_000);\n",
+  );
   if (process.platform !== 'win32') fs.chmodSync(values.cliScript, 0o755);
   assert.throws(() => runCli(values.prefix, ['--help'], 25), /timed out after 25ms/u);
 });
