@@ -159,6 +159,23 @@ test('fails closed when the installed launcher is unusable', () => {
   assert.match(result.stderr, /gitnexus(?: CLI entry| launcher)|EACCES/u);
 });
 
+test('fails closed when the installed launcher targets the wrong entry', () => {
+  const values = fixture();
+  if (process.platform === 'win32') {
+    fs.writeFileSync(path.join(values.prefix, 'gitnexus.cmd'), '@node "%~dp0\\wrong.js" %*\r\n');
+  } else {
+    const wrongEntry = path.join(values.installed, 'dist', 'cli', 'wrong.js');
+    fs.writeFileSync(wrongEntry, '#!/usr/bin/env node\n');
+    fs.chmodSync(wrongEntry, 0o755);
+    const launcher = path.join(values.prefix, 'bin', 'gitnexus');
+    fs.rmSync(launcher);
+    fs.symlinkSync(wrongEntry, launcher);
+  }
+  const result = run(values);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /launcher does not target/u);
+});
+
 test('fails closed on vendor build artifacts', () => {
   const values = fixture();
   fs.mkdirSync(path.join(values.installed, 'vendor', 'tree-sitter-typescript', 'build'));

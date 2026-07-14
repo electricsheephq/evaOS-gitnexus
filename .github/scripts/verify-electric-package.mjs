@@ -92,7 +92,15 @@ function verifyInstalledLauncher(prefix, entry) {
     throw new Error(`installed gitnexus CLI entry must declare a Node shebang: ${entry}`);
   }
   if (process.platform === 'win32') {
-    requireRegularFile(path.join(prefix, 'gitnexus.cmd'));
+    const launcher = path.join(prefix, 'gitnexus.cmd');
+    requireRegularFile(launcher);
+    const installed = locateInstalledPackage(prefix);
+    const relativeEntry = path.relative(installed, entry).split(path.sep).join('/');
+    const launcherText = fs.readFileSync(launcher, 'utf8').split('\\').join('/').toLowerCase();
+    const expectedTarget = `node_modules/gitnexus/${relativeEntry}`.toLowerCase();
+    if (!launcherText.includes(expectedTarget)) {
+      throw new Error(`installed gitnexus launcher does not target ${expectedTarget}`);
+    }
     return;
   }
   const launcher = path.join(prefix, 'bin', 'gitnexus');
@@ -100,6 +108,9 @@ function verifyInstalledLauncher(prefix, entry) {
     throw new Error(`installed gitnexus launcher is missing: ${launcher}`);
   fs.accessSync(entry, fs.constants.X_OK);
   fs.accessSync(launcher, fs.constants.X_OK);
+  if (fs.realpathSync(launcher) !== fs.realpathSync(entry)) {
+    throw new Error(`installed gitnexus launcher does not target ${entry}`);
+  }
 }
 
 export function runCli(prefix, args, timeoutMs = PACKAGED_CLI_TIMEOUT_MS) {
