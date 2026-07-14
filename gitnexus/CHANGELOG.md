@@ -4,6 +4,29 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.1] - 2026-07-14
+
+### Added
+
+- **Protected GitHub-only Electric releases** with exact-head CI, isolated package installation, SHA-256 assets, resumable drafts, and a protected approval gate (#109, #110, #111)
+- **Bounded MCP interfaces** with parameter aliases, deterministic output budgets, fail-closed read-only mode, and repository allowlist/default policy (#73, #74, #76, #77)
+- **Read-only recovery planning and strict incremental-only analysis** for safer interrupted-analysis handling (#72)
+- **Resilient HTTP embeddings and isolated optional reranking** with bounded retries, durable resume, and upstream-compatible ranking when reranking is disabled (#78, #79)
+
+### Fixed
+
+- **Static and document-heavy repositories retain searchable embeddings** through text-bearing File-node fallback (#66)
+- **Large incremental analysis fails loudly and recovers deterministically** across deletes, FTS, staged sidecars, dirty markers, and escalation boundaries (#67, #68, #71)
+- **Non-loopback eval-server binds require bearer authentication** while loopback development remains available without a token (#75)
+- **VECTOR delete/reopen diagnostics and fallback behavior** are explicit and tested (#80, #82)
+- **Graph construction is deterministic** across community projection, graph lookup collisions, repository traversal, and Rust/PHP import resolution (#91, #94, #96)
+- **Release, dependency, CLI, cache, and terminal-output hardening** carried by the reconciled internal source candidate (#85, #87, #89, #100, #102, #104, #106, #108)
+
+### Changed
+
+- This Electric release is distributed as a downloadable GitHub Release tarball and checksum only. It does not publish to npm or a container registry and does not perform a runtime rollout, index migration, or embedding refresh.
+- Source provenance is upstream `v1.6.10-rc.19` at `d43c479ac58c18d397958f48a99465d6c3110b1d`, reconciled through fork PR #98. It does not claim ancestry from an upstream stable `v1.6.10` tag.
+
 ## [1.6.9] - 2026-07-04
 
 ### Added
