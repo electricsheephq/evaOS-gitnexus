@@ -69,21 +69,35 @@ function locateInstalledPackage(prefix) {
   return installed;
 }
 
+function locateInstalledCli(prefix) {
+  const installed = locateInstalledPackage(prefix);
+  const packageJson = JSON.parse(fs.readFileSync(path.join(installed, 'package.json'), 'utf8'));
+  const relativeEntry =
+    typeof packageJson.bin === 'string' ? packageJson.bin : packageJson.bin?.gitnexus;
+  if (typeof relativeEntry !== 'string' || relativeEntry.trim() === '') {
+    throw new Error('installed gitnexus package must declare a gitnexus CLI entry');
+  }
+  const entry = path.resolve(installed, relativeEntry);
+  const relative = path.relative(installed, entry);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`installed gitnexus CLI entry escapes the package root: ${relativeEntry}`);
+  }
+  requireRegularFile(entry);
+  return entry;
+}
+
 export function runCli(prefix, args, timeoutMs = PACKAGED_CLI_TIMEOUT_MS) {
   for (const arg of args) {
     if (!/^[a-z0-9-]+$/iu.test(arg)) {
       throw new Error(`unsafe packaged CLI argument: ${arg}`);
     }
   }
-  const executable =
-    process.platform === 'win32'
-      ? path.join(prefix, 'gitnexus.cmd')
-      : path.join(prefix, 'bin', 'gitnexus');
-  const result = spawnSync(executable, args, {
+  const entry = locateInstalledCli(prefix);
+  const result = spawnSync(process.execPath, [entry, ...args], {
     encoding: 'utf8',
     env: { ...process.env, NO_COLOR: '1' },
     killSignal: 'SIGKILL',
-    shell: process.platform === 'win32',
+    shell: false,
     timeout: timeoutMs,
   });
   if (result.error?.code === 'ETIMEDOUT') {

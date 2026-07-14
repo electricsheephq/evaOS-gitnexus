@@ -45,7 +45,11 @@ function fixture({ ladybugVersion = '0.18.1', checksumLineEnding = '\n' } = {}) 
   fs.mkdirSync(ladybug, { recursive: true });
   fs.writeFileSync(
     path.join(installed, 'package.json'),
-    JSON.stringify({ name: 'gitnexus', version: '1.6.10-electric.2' }),
+    JSON.stringify({
+      name: 'gitnexus',
+      version: '1.6.10-electric.2',
+      bin: { gitnexus: 'dist/cli/index.js' },
+    }),
   );
   fs.mkdirSync(path.join(installed, 'vendor', 'tree-sitter-typescript'), { recursive: true });
   for (const name of ['tree-sitter-dart', 'tree-sitter-proto', 'tree-sitter-swift']) {
@@ -66,19 +70,9 @@ if (args[0] === '--version') console.log('1.6.10-electric.2');
 else if (args[0] === '--help' || (args[0] === 'mcp' && args[1] === '--help')) process.exit(0);
 else process.exit(2);
 `;
-  let cliScript;
-  if (process.platform === 'win32') {
-    cliScript = path.join(prefix, 'gitnexus-test.cjs');
-    fs.mkdirSync(prefix, { recursive: true });
-    fs.writeFileSync(cliScript, cliSource);
-    fs.writeFileSync(path.join(prefix, 'gitnexus.cmd'), '@node "%~dp0\\gitnexus-test.cjs" %*\r\n');
-  } else {
-    const bin = path.join(prefix, 'bin');
-    fs.mkdirSync(bin, { recursive: true });
-    cliScript = path.join(bin, 'gitnexus');
-    fs.writeFileSync(cliScript, cliSource);
-    fs.chmodSync(cliScript, 0o755);
-  }
+  const cliScript = path.join(installed, 'dist', 'cli', 'index.js');
+  fs.mkdirSync(path.dirname(cliScript), { recursive: true });
+  fs.writeFileSync(cliScript, cliSource);
 
   const asset = path.join(root, 'gitnexus-1.6.10-electric.2.tgz');
   fs.writeFileSync(asset, 'deterministic tarball fixture');
