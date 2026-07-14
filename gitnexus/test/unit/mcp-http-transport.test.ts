@@ -19,6 +19,8 @@ import type { AddressInfo } from 'net';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
   createAuthMiddleware,
   createStreamableHttpHandler,
@@ -267,6 +269,32 @@ describe('startMcpHttpServer', () => {
     });
 
     expect(JSON.parse(body)).toEqual({ status: 'ok' });
+  });
+
+  it('advertises provider-compatible schemas over Streamable HTTP', async () => {
+    const backend = createMockBackend();
+    const { handler, cleanup } = createStreamableHttpHandler(backend as never);
+    const app = express();
+    app.use(express.json());
+    app.all('/mcp', (req, res) => void handler(req, res));
+    const { port, close } = await listen(app);
+    const client = new Client({ name: 'http-schema-test', version: '0.0.0' });
+    const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
+
+    try {
+      await client.connect(transport);
+      const response = await client.listTools();
+      expect(response.tools.length).toBeGreaterThan(0);
+      for (const tool of response.tools) {
+        expect(tool.inputSchema).not.toHaveProperty('anyOf');
+        expect(tool.inputSchema).not.toHaveProperty('oneOf');
+        expect(tool.inputSchema).not.toHaveProperty('allOf');
+      }
+    } finally {
+      await client.close();
+      await close();
+      await cleanup();
+    }
   });
 
   it('POST /mcp without auth token returns 401 when --auth-token is configured', async () => {

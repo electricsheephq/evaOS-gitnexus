@@ -276,6 +276,11 @@ describe('MCP repository policy', () => {
       await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
 
       const tools = await client.listTools();
+      for (const tool of tools.tools) {
+        expect(tool.inputSchema).not.toHaveProperty('anyOf');
+        expect(tool.inputSchema).not.toHaveProperty('oneOf');
+        expect(tool.inputSchema).not.toHaveProperty('allOf');
+      }
       expect(tools.tools.map((tool) => tool.name)).not.toContain('group_list');
       expect(tools.tools.map((tool) => tool.name)).not.toContain('group_sync');
       for (const tool of tools.tools) {

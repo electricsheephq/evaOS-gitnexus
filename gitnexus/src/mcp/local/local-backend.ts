@@ -154,16 +154,30 @@ const TOOL_STRING_ALIASES: Readonly<Record<string, readonly StringAliasDefinitio
   context: [{ canonical: 'file_path', aliases: ['file'] }],
 };
 
+interface RequiredStringGroup {
+  keys: readonly string[];
+  error: string;
+}
+
+const TOOL_REQUIRED_STRING_GROUPS: Readonly<Record<string, RequiredStringGroup>> = {
+  impact: {
+    keys: ['target'],
+    error: 'impact requires at least one of target, name, or symbol.',
+  },
+  api_impact: {
+    keys: ['route', 'file'],
+    error: 'Either "route" or "file" is required for api_impact.',
+  },
+};
+
 function normalizeToolParams(
   method: string,
   params: unknown,
 ): { params: Record<string, unknown> } | { error: string } {
   const input = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
   const definitions = TOOL_STRING_ALIASES[method];
-  if (!definitions) return { params: input };
-
   const normalized = { ...input };
-  for (const { canonical, aliases } of definitions) {
+  for (const { canonical, aliases } of definitions ?? []) {
     const keys = [canonical, ...aliases];
     const supplied = keys.flatMap((key) => {
       const value = input[key];
@@ -181,6 +195,18 @@ function normalizeToolParams(
     for (const alias of aliases) delete normalized[alias];
     if (supplied.length > 0) normalized[canonical] = supplied[0].value;
   }
+
+  const requiredGroup = TOOL_REQUIRED_STRING_GROUPS[method];
+  if (
+    requiredGroup &&
+    !requiredGroup.keys.some((key) => {
+      const value = normalized[key];
+      return typeof value === 'string' && value.trim().length > 0;
+    })
+  ) {
+    return { error: requiredGroup.error };
+  }
+
   return { params: normalized };
 }
 

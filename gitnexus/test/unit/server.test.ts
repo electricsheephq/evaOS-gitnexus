@@ -98,6 +98,9 @@ describe('createMCPServer', () => {
       for (const tool of response.tools) {
         const definition = GITNEXUS_TOOLS.find((t) => t.name === tool.name)!;
         expect(tool.annotations).toEqual(definition.annotations);
+        expect(tool.inputSchema).not.toHaveProperty('anyOf');
+        expect(tool.inputSchema).not.toHaveProperty('oneOf');
+        expect(tool.inputSchema).not.toHaveProperty('allOf');
       }
     } finally {
       await client.close();

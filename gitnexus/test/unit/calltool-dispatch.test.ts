@@ -380,6 +380,23 @@ describe('LocalBackend.callTool', () => {
   });
 
   it.each([
+    ['impact', { direction: 'upstream' }, /target.*name.*symbol/i],
+    ['impact', { target: '   ', direction: 'upstream' }, /target.*name.*symbol/i],
+    ['api_impact', {}, /route.*file/i],
+    ['api_impact', { route: ' ', file: '' }, /route.*file/i],
+  ])(
+    'rejects missing %s lookup keys before repository resolution',
+    async (method, params, error) => {
+      const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+
+      const result = await backend.callTool(method, params);
+
+      expect(result.error).toMatch(error);
+      expect(resolveSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
     ['impact', { target: 'validate', name: 'login', direction: 'upstream' }],
     ['impact', { name: 'validate', symbol: 'login', direction: 'upstream' }],
     ['context', { name: 'validate', file_path: 'src/auth.ts', file: 'src/login.ts' }],
