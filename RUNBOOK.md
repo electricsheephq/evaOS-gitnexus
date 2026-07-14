@@ -195,12 +195,22 @@ The workflow reruns exact-head CI, builds `gitnexus-<version>.tgz`, installs and
 smokes that tarball in an isolated prefix, writes `SHA256SUMS`, and pauses at the
 protected `internal-release` environment before creating
 `electric/v<version>`. It never opens a GitNexus index or calls an embedding
-provider.
+provider. The release is staged as a draft: a failed asset upload leaves an
+exact-head tag and resumable draft, and redispatch safely resumes them. A
+published release or a same-name tag pointing elsewhere fails closed; never
+delete or rewrite a published tag to retry.
+
+`check-electric-release-policy.mjs` is defense in depth, not a shell-language
+interpreter. It rejects direct npm/Docker publication, registry-write
+permissions, registry configuration and credential variables, dynamic registry
+push inputs, and new unapproved OIDC jobs. Required review, branch protection,
+the protected environment, and the absence of registry credentials remain part
+of the release boundary.
 
 After downloading both assets, verify and install locally:
 
 ```bash
-sha256sum --check SHA256SUMS
+shasum -a 256 --check SHA256SUMS
 npm install --global ./gitnexus-1.6.10-electric.1.tgz
 gitnexus --version
 ```

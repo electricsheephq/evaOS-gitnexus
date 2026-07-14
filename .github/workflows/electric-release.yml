@@ -31,6 +31,8 @@ jobs:
       tag: ${{ steps.identity.outputs.tag }}
       head_sha: ${{ steps.identity.outputs.head_sha }}
       notes_path: ${{ steps.identity.outputs.notes_path }}
+      tag_exists: ${{ steps.identity.outputs.tag_exists }}
+      release_exists: ${{ steps.identity.outputs.release_exists }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -56,9 +58,13 @@ jobs:
           fi
 
           HEAD_SHA="$(git rev-parse HEAD)"
-          REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+          if [ "$HEAD_SHA" != "$GITHUB_SHA" ]; then
+            echo "::error::Checked-out commit does not match the workflow run SHA."
+            exit 1
+          fi
+          REMOTE_MAIN="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
           if [ -z "$REMOTE_MAIN" ] || [ "$HEAD_SHA" != "$REMOTE_MAIN" ]; then
-            echo "::error::Checked-out commit is not current remote main."
+            echo "::error::Workflow run SHA is not current GitHub main."
             exit 1
           fi
 
@@ -109,9 +115,15 @@ jobs:
             echo "::error::Missing release notes: $NOTES_PATH"
             exit 1
           fi
+
+          TAG_EXISTS=false
           if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
-            echo "::error::Tag already exists: $TAG"
-            exit 1
+            TAG_TARGET="$(git rev-parse "refs/tags/$TAG^{}")"
+            if [ "$TAG_TARGET" != "$HEAD_SHA" ]; then
+              echo "::error::Existing tag $TAG points to $TAG_TARGET, expected $HEAD_SHA"
+              exit 1
+            fi
+            TAG_EXISTS=true
           fi
 
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
@@ -121,11 +133,19 @@ jobs:
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "https://api.github.com/repos/$REPO/releases/tags/$ENCODED_TAG")"
+          RELEASE_EXISTS=false
           case "$STATUS" in
             404) ;;
             200)
-              echo "::error::GitHub Release already exists for $TAG"
-              exit 1
+              if [ "$(jq -r .draft /tmp/electric-release.json)" != "true" ]; then
+                echo "::error::Published GitHub Release already exists for $TAG"
+                exit 1
+              fi
+              if [ "$TAG_EXISTS" != "true" ]; then
+                echo "::error::Draft release exists without the expected exact-head tag: $TAG"
+                exit 1
+              fi
+              RELEASE_EXISTS=true
               ;;
             *)
               echo "::error::Unable to verify release absence; GitHub returned HTTP $STATUS"
@@ -138,6 +158,8 @@ jobs:
             echo "tag=$TAG"
             echo "head_sha=$HEAD_SHA"
             echo "notes_path=$NOTES_PATH"
+            echo "tag_exists=$TAG_EXISTS"
+            echo "release_exists=$RELEASE_EXISTS"
           } >> "$GITHUB_OUTPUT"
 
   ci:
@@ -176,7 +198,7 @@ jobs:
 
           npm pack --dry-run --json > "$RUNNER_TEMP/npm-pack-dry-run.json"
           npm pack --json --pack-destination "$ASSET_DIR" > "$RUNNER_TEMP/npm-pack.json"
-          FILENAME="$(node -e "const value=require('$RUNNER_TEMP/npm-pack.json'); if(value.length!==1) process.exit(1); process.stdout.write(value[0].filename)")"
+          FILENAME="$(PACK_JSON="$RUNNER_TEMP/npm-pack.json" node -e "const fs=require('node:fs'); const value=JSON.parse(fs.readFileSync(process.env.PACK_JSON,'utf8')); if(value.length!==1) process.exit(1); process.stdout.write(value[0].filename)")"
           ASSET_PATH="$ASSET_DIR/$FILENAME"
           if [ ! -s "$ASSET_PATH" ]; then
             echo "::error::npm pack did not create $ASSET_PATH"
@@ -231,7 +253,8 @@ jobs:
       - name: Verify downloaded checksums
         shell: bash
         run: cd release-assets && sha256sum --check SHA256SUMS
-      - name: Create annotated Electric tag
+      - name: Create annotated Electric tag when absent
+        if: needs.inspect.outputs.tag_exists != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -253,14 +276,57 @@ jobs:
           gh api --method POST "repos/$REPO/git/refs" \
             -f "ref=refs/tags/$TAG" \
             -f "sha=$TAG_OBJECT" >/dev/null
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
-        with:
-          tag_name: ${{ needs.inspect.outputs.tag }}
-          name: GitNexus ${{ needs.inspect.outputs.version }}
-          body_path: ${{ needs.inspect.outputs.notes_path }}
-          prerelease: ${{ inputs.prerelease }}
-          files: |
-            release-assets/gitnexus-*.tgz
+      - name: Create or resume draft release and upload assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.inspect.outputs.tag }}
+          VERSION: ${{ needs.inspect.outputs.version }}
+          HEAD_SHA: ${{ needs.inspect.outputs.head_sha }}
+          NOTES_PATH: ${{ needs.inspect.outputs.notes_path }}
+          RELEASE_EXISTS: ${{ needs.inspect.outputs.release_exists }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_EXISTS" != "true" ]; then
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --draft \
+              --target "$HEAD_SHA" \
+              --title "GitNexus $VERSION" \
+              --notes-file "$NOTES_PATH"
+          fi
+          gh release upload "$TAG" \
+            --repo "$REPO" \
+            --clobber \
+            "release-assets/gitnexus-$VERSION.tgz" \
             release-assets/SHA256SUMS
-          fail_on_unmatched_files: true
+      - name: Verify assets and publish the draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.inspect.outputs.tag }}
+          VERSION: ${{ needs.inspect.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          RELEASE_JSON="$(gh api "repos/$REPO/releases/tags/$TAG")"
+          RELEASE_ID="$(jq -r .id <<< "$RELEASE_JSON")"
+          jq -e --arg tag "$TAG" --arg asset "gitnexus-$VERSION.tgz" '
+            .tag_name == $tag and
+            .draft == true and
+            ([.assets[] | select(.name == $asset and .size > 0)] | length) == 1 and
+            ([.assets[] | select(.name == "SHA256SUMS" and .size > 0)] | length) == 1
+          ' <<< "$RELEASE_JSON" >/dev/null
+
+          PUBLISHED_JSON="$(gh api --method PATCH "repos/$REPO/releases/$RELEASE_ID" \
+            -F draft=false \
+            -F prerelease="$PRERELEASE")"
+          PUBLISHED_JSON="$PUBLISHED_JSON" PRERELEASE="$PRERELEASE" node <<'NODE'
+          const value = JSON.parse(process.env.PUBLISHED_JSON);
+          const expectedPrerelease = process.env.PRERELEASE === 'true';
+          if (value.draft !== false || value.prerelease !== expectedPrerelease) {
+            throw new Error('GitHub Release did not reach the requested published state');
+          }
+          NODE

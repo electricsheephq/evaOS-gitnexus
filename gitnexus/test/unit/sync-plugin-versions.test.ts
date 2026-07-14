@@ -106,7 +106,7 @@ describe('sync-plugin-versions', () => {
     expect(await fs.readFile(claudePluginPath, 'utf8')).toBe(before);
   });
 
-  it('verifies every plugin manifest before the Electric release action', async () => {
+  it('verifies every plugin manifest before creating or resuming the Electric release', async () => {
     const workflow = await fs.readFile(
       path.join(REPO_ROOT, '.github', 'workflows', 'electric-release.yml'),
       'utf8',
@@ -114,7 +114,9 @@ describe('sync-plugin-versions', () => {
     const verifyPosition = workflow.indexOf(
       '- name: Verify release identity and manifest versions',
     );
-    const releasePosition = workflow.indexOf('softprops/action-gh-release@');
+    const releasePosition = workflow.indexOf(
+      '- name: Create or resume draft release and upload assets',
+    );
 
     expect(verifyPosition).toBeGreaterThan(-1);
     expect(releasePosition).toBeGreaterThan(verifyPosition);

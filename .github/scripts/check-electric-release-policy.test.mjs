@@ -62,12 +62,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
-        with:
-          tag_name: electric/v1.6.10-electric.1
-          files: |
-            release-assets/gitnexus-*.tgz
-            release-assets/SHA256SUMS
+      - run: |
+          if [ "$TAG_EXISTS" != "true" ]; then
+            echo "create annotated tag"
+          fi
+          if [ "$RELEASE_EXISTS" != "true" ]; then
+            gh release create "$TAG" --draft --notes-file notes.md
+          fi
+          gh release upload "$TAG" --clobber gitnexus-*.tgz SHA256SUMS
+          gh api --method PATCH releases/1 -F draft=false
 `;
 
 function createFixture(workflow = validWorkflow) {
@@ -169,6 +172,41 @@ test('rejects registry-capable permissions and non-minimal release permissions',
   assert.match(result.stderr, /packages: write/);
   assert.match(result.stderr, /id-token: write/);
   assert.match(result.stderr, /only contents: write/);
+});
+
+test('rejects registry credentials, registry configuration, and unapproved OIDC jobs', () => {
+  const root = createFixture();
+  fs.writeFileSync(
+    path.join(root, '.github/workflows/unsafe.yml'),
+    `name: Unsafe\non:\n  workflow_dispatch:\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    permissions:\n      id-token: write\n    steps:\n      - uses: actions/setup-node@deadbeef\n        with:\n          registry-url: https://registry.npmjs.org\n      - run: npm run release\n        env:\n          NODE_AUTH_TOKEN: \${{ secrets.NPM_TOKEN }}\n`,
+  );
+  const result = runChecker(root);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /registry configuration/);
+  assert.match(result.stderr, /registry credential/);
+  assert.match(result.stderr, /unapproved id-token: write/);
+});
+
+test('rejects workflow-level OIDC permission outside the explicit allowlist', () => {
+  const root = createFixture();
+  fs.writeFileSync(
+    path.join(root, '.github/workflows/unsafe.yml'),
+    `name: Unsafe\non:\n  workflow_dispatch:\npermissions:\n  id-token: write\njobs:\n  run:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm run release\n`,
+  );
+  const result = runChecker(root);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /unapproved id-token: write/);
+});
+
+test('rejects a release flow without resumable draft and asset upload semantics', () => {
+  let workflow = replaceOnce(validWorkflow, ' --draft', '');
+  workflow = replaceOnce(workflow, ' --clobber', '');
+  workflow = replaceOnce(workflow, ' -F draft=false', '');
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /draft release/);
+  assert.match(result.stderr, /resumable asset upload/);
+  assert.match(result.stderr, /publish the verified draft/);
 });
 
 test('rejects missing electric tag, tarball, or checksum wiring', () => {

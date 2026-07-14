@@ -45,8 +45,20 @@ function visit(value, visitor, trail = []) {
 const failures = [];
 const fail = (message) => failures.push(message);
 
+const APPROVED_OIDC_JOBS = new Set([
+  'build-tree-sitter-prebuilds.yml:aggregate',
+  'claude.yml:claude',
+  'scorecard.yml:analysis',
+]);
+
+const REGISTRY_CREDENTIAL_PATTERN =
+  /(?:NODE_AUTH_TOKEN|NPM_TOKEN|NPM_CONFIG_REGISTRY|DOCKER(?:HUB)?_(?:TOKEN|USERNAME|PASSWORD)|GHCR_TOKEN|REGISTRY_(?:TOKEN|USERNAME|PASSWORD)|PACKAGE_REGISTRY|PUBLISH_(?:TOKEN|COMMAND|SCRIPT))/i;
+
 function checkNoRegistryPublication(workflows) {
   for (const [filename, workflow] of workflows) {
+    if (workflow.value?.permissions?.['id-token'] === 'write') {
+      fail(`${filename}:permissions grants unapproved id-token: write`);
+    }
     visit(workflow.value, (value, trail) => {
       const location = `${filename}:${trail.join('.') || '<root>'}`;
       if (typeof value === 'string') {
@@ -55,8 +67,17 @@ function checkNoRegistryPublication(workflows) {
           fail(`${location} contains docker login`);
         }
         if (/\bdocker\s+push\b/i.test(value)) fail(`${location} contains docker push`);
+        if (REGISTRY_CREDENTIAL_PATTERN.test(value)) {
+          fail(`${location} references a registry credential or registry command variable`);
+        }
       }
       const key = trail.at(-1);
+      if (typeof key === 'string' && REGISTRY_CREDENTIAL_PATTERN.test(key)) {
+        fail(`${location} declares a registry credential or registry command variable`);
+      }
+      if (key === 'registry-url' || key === 'registry_url') {
+        fail(`${location} contains registry configuration`);
+      }
       if (key === 'packages' && value === 'write') fail(`${location} grants packages: write`);
       if (key === 'push-to-registry' && value !== false && value !== 'false') {
         fail(`${location} enables registry push`);
@@ -64,6 +85,12 @@ function checkNoRegistryPublication(workflows) {
     });
 
     for (const [jobName, job] of Object.entries(workflow.value?.jobs ?? {})) {
+      if (
+        job?.permissions?.['id-token'] === 'write' &&
+        !APPROVED_OIDC_JOBS.has(`${filename}:${jobName}`)
+      ) {
+        fail(`${filename}:jobs.${jobName} grants unapproved id-token: write`);
+      }
       for (const [index, step] of (job?.steps ?? []).entries()) {
         if (!step || typeof step !== 'object' || typeof step.uses !== 'string') continue;
         if (
@@ -150,20 +177,18 @@ function checkReleaseWorkflow(workflows) {
     ['npm pack --dry-run', 'npm pack dry-run'],
     ['internal-release', 'protected environment'],
     ['refs/heads/main', 'main ref guard'],
+    ['TAG_EXISTS', 'exact-head tag resume guard'],
+    ['RELEASE_EXISTS', 'draft release resume guard'],
+    ['gh release create', 'draft release creation'],
+    ['--draft', 'draft release creation'],
+    ['gh release upload', 'release asset upload'],
+    ['--clobber', 'resumable asset upload'],
+    ['-F draft=false', 'publish the verified draft'],
   ];
   for (const [literal, description, pattern] of requiredText) {
     if (pattern ? !pattern.test(candidate.raw) : !candidate.raw.includes(literal)) {
       fail(`electric-release.yml must include ${description}`);
     }
-  }
-
-  const releaseSteps = Array.isArray(releaseJob?.steps) ? releaseJob.steps : [];
-  const releaseAction = releaseSteps.find(
-    (step) =>
-      typeof step?.uses === 'string' && step.uses.startsWith('softprops/action-gh-release@'),
-  );
-  if (!releaseAction || !/^softprops\/action-gh-release@[0-9a-f]{40}$/.test(releaseAction.uses)) {
-    fail('electric-release.yml must pin softprops/action-gh-release to a commit SHA');
   }
 }
 
