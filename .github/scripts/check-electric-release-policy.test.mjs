@@ -74,6 +74,8 @@ jobs:
     steps:
       - name: Reverify resumable release state
         run: |
+          CURRENT_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
+          if [ "$CURRENT_MAIN_SHA" != "$HEAD_SHA" ]; then exit 1; fi
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
           curl "https://api.github.com/repos/$REPO/git/ref/tags/$ENCODED_TAG"
           echo "tag_exists=$TAG_EXISTS"
@@ -262,7 +264,7 @@ test('rejects a release flow without resumable draft and asset upload semantics'
 test('rejects a release flow without protected-job state re-verification', () => {
   const workflow = replaceOnce(
     validWorkflow,
-    '      - name: Reverify resumable release state\n        run: |\n          ENCODED_TAG="$(jq -rn --arg value "$TAG" \'$value | @uri\')"\n          curl "https://api.github.com/repos/$REPO/git/ref/tags/$ENCODED_TAG"\n          echo "tag_exists=$TAG_EXISTS"\n          echo "release_exists=$RELEASE_EXISTS"\n',
+    '      - name: Reverify resumable release state\n        run: |\n          CURRENT_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"\n          if [ "$CURRENT_MAIN_SHA" != "$HEAD_SHA" ]; then exit 1; fi\n          ENCODED_TAG="$(jq -rn --arg value "$TAG" \'$value | @uri\')"\n          curl "https://api.github.com/repos/$REPO/git/ref/tags/$ENCODED_TAG"\n          echo "tag_exists=$TAG_EXISTS"\n          echo "release_exists=$RELEASE_EXISTS"\n',
     '',
   );
   const result = runChecker(createFixture(workflow));
@@ -308,6 +310,13 @@ test('rejects an unencoded slash-bearing tag-state lookup', () => {
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /URL-encoded tag-state lookup/);
+});
+
+test('rejects protected mutation without a fresh current-main guard', () => {
+  const workflow = replaceOnce(validWorkflow, 'git/ref/heads/main', 'git/ref/heads/stale');
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /fresh current-main guard/);
 });
 
 test('rejects missing electric tag, tarball, or checksum wiring', () => {

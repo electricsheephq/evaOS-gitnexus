@@ -233,6 +233,8 @@ function checkReleaseWorkflow(workflows) {
 
   const reverifyStep = findNamedStep(releaseJob, 'Reverify resumable release state');
   checkRunRequirements(reverifyStep, 'reverify resumable release state step', [
+    ['git/ref/heads/main', 'fresh current-main guard'],
+    ['if [ "$CURRENT_MAIN_SHA" != "$HEAD_SHA" ]; then', 'fresh current-main guard'],
     ['ENCODED_TAG', 'URL-encoded tag-state lookup'],
     ['git/ref/tags/$ENCODED_TAG', 'URL-encoded tag-state lookup'],
     ['TAG_EXISTS', 'fresh tag-state output'],

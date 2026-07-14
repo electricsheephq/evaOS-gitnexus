@@ -278,6 +278,11 @@ jobs:
           HEAD_SHA: ${{ needs.inspect.outputs.head_sha }}
         run: |
           set -euo pipefail
+          CURRENT_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
+          if [ "$CURRENT_MAIN_SHA" != "$HEAD_SHA" ]; then
+            echo "::error::main advanced from inspected release head $HEAD_SHA to $CURRENT_MAIN_SHA"
+            exit 1
+          fi
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
           TAG_STATUS="$(curl --silent --show-error --output /tmp/electric-tag-state.json \
             --write-out '%{http_code}' \
