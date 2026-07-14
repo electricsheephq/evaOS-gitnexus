@@ -7,7 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { EXPECTED_LADYBUG_VERSION } from './verify-electric-package.mjs';
+import { EXPECTED_LADYBUG_VERSION, runCli } from './verify-electric-package.mjs';
 
 const SCRIPT = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -66,17 +66,18 @@ if (args[0] === '--version') console.log('1.6.10-electric.2');
 else if (args[0] === '--help' || (args[0] === 'mcp' && args[1] === '--help')) process.exit(0);
 else process.exit(2);
 `;
+  let cliScript;
   if (process.platform === 'win32') {
-    const cliScript = path.join(prefix, 'gitnexus-test.cjs');
+    cliScript = path.join(prefix, 'gitnexus-test.cjs');
     fs.mkdirSync(prefix, { recursive: true });
     fs.writeFileSync(cliScript, cliSource);
     fs.writeFileSync(path.join(prefix, 'gitnexus.cmd'), '@node "%~dp0\\gitnexus-test.cjs" %*\r\n');
   } else {
     const bin = path.join(prefix, 'bin');
     fs.mkdirSync(bin, { recursive: true });
-    const executable = path.join(bin, 'gitnexus');
-    fs.writeFileSync(executable, cliSource);
-    fs.chmodSync(executable, 0o755);
+    cliScript = path.join(bin, 'gitnexus');
+    fs.writeFileSync(cliScript, cliSource);
+    fs.chmodSync(cliScript, 0o755);
   }
 
   const asset = path.join(root, 'gitnexus-1.6.10-electric.2.tgz');
@@ -84,7 +85,7 @@ else process.exit(2);
   const digest = createHash('sha256').update(fs.readFileSync(asset)).digest('hex');
   const checksums = path.join(root, 'SHA256SUMS');
   fs.writeFileSync(checksums, `${digest}  ${path.basename(asset)}${checksumLineEnding}`);
-  return { root, prefix, installed, asset, checksums };
+  return { root, prefix, installed, cliScript, asset, checksums };
 }
 
 function runArgs(args) {
@@ -126,6 +127,13 @@ test('verifies checksum, package identity, native import, CLI, and MCP help', ()
 test('accepts CRLF checksum files', () => {
   const result = run(fixture({ checksumLineEnding: '\r\n' }));
   assert.equal(result.status, 0, result.stderr);
+});
+
+test('fails fast when the packaged CLI hangs', () => {
+  const values = fixture();
+  fs.writeFileSync(values.cliScript, '#!/usr/bin/env node\nsetTimeout(() => {}, 10_000);\n');
+  if (process.platform !== 'win32') fs.chmodSync(values.cliScript, 0o755);
+  assert.throws(() => runCli(values.prefix, ['--help'], 25), /timed out after 25ms/u);
 });
 
 test('fails closed on vendor build artifacts', () => {

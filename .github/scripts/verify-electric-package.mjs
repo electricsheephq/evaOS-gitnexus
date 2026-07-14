@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const EXPECTED_LADYBUG_VERSION = '0.18.1';
+const PACKAGED_CLI_TIMEOUT_MS = 60_000;
 const ARGUMENT_KEYS = new Set(['asset', 'checksums', 'prefix', 'expected-version']);
 const USAGE =
   'usage: verify-electric-package.mjs --asset <tarball> --checksums <file> --prefix <dir> --expected-version <version>';
@@ -68,7 +69,7 @@ function locateInstalledPackage(prefix) {
   return installed;
 }
 
-function runCli(prefix, args) {
+export function runCli(prefix, args, timeoutMs = PACKAGED_CLI_TIMEOUT_MS) {
   for (const arg of args) {
     if (!/^[a-z0-9-]+$/iu.test(arg)) {
       throw new Error(`unsafe packaged CLI argument: ${arg}`);
@@ -82,7 +83,11 @@ function runCli(prefix, args) {
     encoding: 'utf8',
     env: { ...process.env, NO_COLOR: '1' },
     shell: process.platform === 'win32',
+    timeout: timeoutMs,
   });
+  if (result.error?.code === 'ETIMEDOUT') {
+    throw new Error(`gitnexus ${args.join(' ')} timed out after ${timeoutMs}ms`);
+  }
   if (result.error || result.status !== 0) {
     throw new Error(
       `gitnexus ${args.join(' ')} failed: ${result.error?.message ?? result.stderr.trim()}`,
