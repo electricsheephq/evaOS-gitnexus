@@ -16,6 +16,7 @@
  */
 
 import type { ParsedImport, WorkspaceIndex } from 'gitnexus-shared';
+import type { ImportResolutionContext } from '../../scope-resolution/contract/scope-resolver.js';
 import { resolvePhpImportInternal } from '../../import-resolvers/php.js';
 import type { ComposerConfig } from '../../language-config.js';
 import { readFileSync } from 'node:fs';
@@ -117,6 +118,7 @@ export function resolvePhpImportTargetInternal(
   _fromFile: string,
   allFilePaths: ReadonlySet<string>,
   resolutionConfig?: unknown,
+  context?: ImportResolutionContext,
 ): string | null {
   if (targetRaw === '') return null;
 
@@ -129,7 +131,7 @@ export function resolvePhpImportTargetInternal(
   const normalizedFileList = [...allFiles].map((f) => f.replace(/\\/g, '/'));
   const allFileList = [...allFiles];
 
-  return resolvePhpImportInternal(
+  const resolved = resolvePhpImportInternal(
     targetRaw,
     composerConfig,
     allFiles,
@@ -137,4 +139,32 @@ export function resolvePhpImportTargetInternal(
     allFileList,
     undefined,
   );
+
+  const parsedImport = context?.parsedImport;
+  const symbolKind =
+    parsedImport?.kind === 'named' || parsedImport?.kind === 'alias'
+      ? parsedImport.importedSymbolKind
+      : undefined;
+  if (resolved === null || (symbolKind !== 'function' && symbolKind !== 'const')) return resolved;
+
+  const importedName = targetRaw.replace(/\\/g, '/').split('/').filter(Boolean).at(-1);
+  if (importedName === undefined) return resolved;
+
+  const normalizedResolved = resolved.replace(/\\/g, '/');
+  const resolvedDirectory = normalizedResolved.slice(0, normalizedResolved.lastIndexOf('/') + 1);
+  const expectedType = symbolKind === 'function' ? 'Function' : 'Variable';
+  const declaringFiles = context.parsedFiles.filter((parsed) => {
+    const normalizedPath = parsed.filePath.replace(/\\/g, '/');
+    if (!normalizedPath.startsWith(resolvedDirectory)) return false;
+    if (normalizedPath.slice(resolvedDirectory.length).includes('/')) return false;
+
+    return parsed.localDefs.some((def) => {
+      if (def.type !== expectedType) return false;
+      const simpleName = (def.qualifiedName ?? '').split(/[\\.]/).at(-1);
+      return simpleName === importedName;
+    });
+  });
+
+  if (declaringFiles.length > 1) return null;
+  return declaringFiles.length === 1 ? declaringFiles[0].filePath : resolved;
 }
