@@ -41,6 +41,10 @@ jobs:
           echo .agents/plugins/marketplace.json
           echo "manifest version mismatch"
           echo MAX_MANIFEST_BYTES
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > /tmp/release-pages.json
+          RELEASE_MATCHES="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' /tmp/release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          echo "Multiple releases exist for $TAG"
   ci:
     needs: inspect
     uses: ./.github/workflows/ci.yml
@@ -81,6 +85,10 @@ jobs:
           if [ "$CURRENT_MAIN_SHA" != "$HEAD_SHA" ]; then exit 1; fi
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
           curl "https://api.github.com/repos/$REPO/git/ref/tags/$ENCODED_TAG"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > /tmp/release-pages.json
+          RELEASE_MATCHES="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' /tmp/release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          echo "Multiple releases exist for $TAG"
           echo "tag_exists=$TAG_EXISTS"
           echo "release_exists=$RELEASE_EXISTS"
       - name: Create annotated Electric tag when absent
@@ -99,7 +107,10 @@ jobs:
           ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
           gh release download "$TAG" --pattern "gitnexus-$VERSION.tgz" --pattern SHA256SUMS
           sha256sum --check SHA256SUMS
-          gh api "repos/$REPO/releases/tags/$ENCODED_TAG"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > /tmp/release-pages.json
+          RELEASE_MATCHES="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' /tmp/release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          echo "Multiple releases exist for $TAG"
           gh api --method PATCH releases/1 -F draft=false
 `;
 
@@ -271,8 +282,8 @@ test('rejects a release flow without resumable draft and asset upload semantics'
 test('rejects a release flow without protected-job state re-verification', () => {
   const workflow = replaceOnce(
     validWorkflow,
-    '      - name: Reverify resumable release state\n        run: |\n          CURRENT_MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"\n          if [ "$CURRENT_MAIN_SHA" != "$HEAD_SHA" ]; then exit 1; fi\n          ENCODED_TAG="$(jq -rn --arg value "$TAG" \'$value | @uri\')"\n          curl "https://api.github.com/repos/$REPO/git/ref/tags/$ENCODED_TAG"\n          echo "tag_exists=$TAG_EXISTS"\n          echo "release_exists=$RELEASE_EXISTS"\n',
-    '',
+    '      - name: Reverify resumable release state\n',
+    '      - name: Missing protected state verification\n',
   );
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
@@ -378,11 +389,44 @@ test('rejects tag creation that does not target the exact inspected head', () =>
   assert.match(result.stderr, /exact-head tag target/);
 });
 
-test('rejects a raw slash-bearing final release lookup', () => {
-  const workflow = replaceOnce(validWorkflow, 'releases/tags/$ENCODED_TAG', 'releases/tags/$TAG');
+test('rejects the draft-invisible release-by-tag endpoint', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    'gh api --paginate --slurp "repos/$REPO/releases?per_page=100"',
+    'gh api "repos/$REPO/releases/tags/$ENCODED_TAG"',
+  );
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /URL-encoded final release lookup/);
+  assert.match(result.stderr, /draft-safe paginated release list lookup/);
+});
+
+test('rejects a release list lookup without pagination', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    'gh api --paginate --slurp "repos/$REPO/releases?per_page=100"',
+    'gh api "repos/$REPO/releases?per_page=100"',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /draft-safe paginated release list lookup/);
+});
+
+test('rejects release discovery without exact tag filtering', () => {
+  const workflow = replaceOnce(validWorkflow, '.tag_name == $tag', '.draft == true');
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /exact release tag filter/);
+});
+
+test('rejects release discovery without duplicate detection', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '          echo "Multiple releases exist for $TAG"\n',
+    '',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /duplicate release rejection/);
 });
 
 test('rejects publish without re-downloading and checksum-verifying release assets', () => {

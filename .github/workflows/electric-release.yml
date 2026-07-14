@@ -141,18 +141,18 @@ jobs:
             TAG_EXISTS=true
           fi
 
-          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
-          STATUS="$(curl --silent --show-error --output /tmp/electric-release.json \
-            --write-out '%{http_code}' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/$REPO/releases/tags/$ENCODED_TAG")"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" \
+            > /tmp/electric-release-pages.json
+          RELEASE_MATCHES="$(jq -c --arg tag "$TAG" \
+            '[.[][] | select(.tag_name == $tag)]' \
+            /tmp/electric-release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
           RELEASE_EXISTS=false
-          case "$STATUS" in
-            404) ;;
-            200)
-              if [ "$(jq -r .draft /tmp/electric-release.json)" != "true" ]; then
+          case "$RELEASE_COUNT" in
+            0) ;;
+            1)
+              RELEASE_JSON="$(jq -c '.[0]' <<< "$RELEASE_MATCHES")"
+              if [ "$(jq -r .draft <<< "$RELEASE_JSON")" != "true" ]; then
                 echo "::error::Published GitHub Release already exists for $TAG"
                 exit 1
               fi
@@ -163,7 +163,7 @@ jobs:
               RELEASE_EXISTS=true
               ;;
             *)
-              echo "::error::Unable to verify release absence; GitHub returned HTTP $STATUS"
+              echo "::error::Multiple releases exist for $TAG"
               exit 1
               ;;
           esac
@@ -315,24 +315,25 @@ jobs:
               exit 1
               ;;
           esac
-          RELEASE_STATUS="$(curl --silent --show-error --output /tmp/electric-release-state.json \
-            --write-out '%{http_code}' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/$REPO/releases/tags/$ENCODED_TAG")"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" \
+            > /tmp/electric-release-state-pages.json
+          RELEASE_MATCHES="$(jq -c --arg tag "$TAG" \
+            '[.[][] | select(.tag_name == $tag)]' \
+            /tmp/electric-release-state-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
           RELEASE_EXISTS=false
-          case "$RELEASE_STATUS" in
-            404) ;;
-            200)
-              if [ "$TAG_EXISTS" != "true" ] || [ "$(jq -r .draft /tmp/electric-release-state.json)" != "true" ]; then
+          case "$RELEASE_COUNT" in
+            0) ;;
+            1)
+              RELEASE_JSON="$(jq -c '.[0]' <<< "$RELEASE_MATCHES")"
+              if [ "$TAG_EXISTS" != "true" ] || [ "$(jq -r .draft <<< "$RELEASE_JSON")" != "true" ]; then
                 echo "::error::Existing release state is not a resumable exact-head draft"
                 exit 1
               fi
               RELEASE_EXISTS=true
               ;;
             *)
-              echo "::error::Unable to reverify release state; GitHub returned HTTP $RELEASE_STATUS"
+              echo "::error::Multiple releases exist for $TAG"
               exit 1
               ;;
           esac
@@ -409,8 +410,25 @@ jobs:
             sha256sum --check SHA256SUMS
           )
 
-          ENCODED_TAG="$(jq -rn --arg value "$TAG" '$value | @uri')"
-          RELEASE_JSON="$(gh api "repos/$REPO/releases/tags/$ENCODED_TAG")"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" \
+            > /tmp/electric-publish-release-pages.json
+          RELEASE_MATCHES="$(jq -c --arg tag "$TAG" \
+            '[.[][] | select(.tag_name == $tag)]' \
+            /tmp/electric-publish-release-pages.json)"
+          RELEASE_COUNT="$(jq 'length' <<< "$RELEASE_MATCHES")"
+          case "$RELEASE_COUNT" in
+            0)
+              echo "::error::No draft release exists for $TAG"
+              exit 1
+              ;;
+            1)
+              RELEASE_JSON="$(jq -c '.[0]' <<< "$RELEASE_MATCHES")"
+              ;;
+            *)
+              echo "::error::Multiple releases exist for $TAG"
+              exit 1
+              ;;
+          esac
           RELEASE_ID="$(jq -r .id <<< "$RELEASE_JSON")"
           jq -e --arg tag "$TAG" --arg asset "gitnexus-$VERSION.tgz" '
             .tag_name == $tag and

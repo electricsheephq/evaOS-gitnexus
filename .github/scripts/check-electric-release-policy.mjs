@@ -63,6 +63,23 @@ function checkRunRequirements(match, stepDescription, requirements) {
 const failures = [];
 const fail = (message) => failures.push(message);
 
+function checkDraftSafeReleaseLookup(match, stepDescription) {
+  checkRunRequirements(match, stepDescription, [
+    [
+      'gh api --paginate --slurp "repos/$REPO/releases?per_page=100"',
+      'draft-safe paginated release list lookup',
+    ],
+    ['.tag_name == $tag', 'exact release tag filter'],
+    ['RELEASE_COUNT', 'bounded release match count'],
+    ['Multiple releases exist for $TAG', 'duplicate release rejection'],
+  ]);
+  if (typeof match?.step?.run === 'string' && match.step.run.includes('releases/tags/')) {
+    fail(
+      `electric-release.yml ${stepDescription} must not use the draft-invisible releases/tags endpoint`,
+    );
+  }
+}
+
 const APPROVED_OIDC_JOBS = new Set([
   'build-tree-sitter-prebuilds.yml:aggregate',
   'claude.yml:claude',
@@ -214,6 +231,7 @@ function checkReleaseWorkflow(workflows) {
     ['manifest version mismatch', 'manifest mismatch failure'],
     ['MAX_MANIFEST_BYTES', 'bounded manifest parsing'],
   ]);
+  checkDraftSafeReleaseLookup(inspectStep, 'manifest verification step');
 
   const packageStep = findNamedStep(workflow?.jobs?.package, 'Pack and install isolated CLI');
   checkRunRequirements(packageStep, 'package proof step', [
@@ -251,6 +269,7 @@ function checkReleaseWorkflow(workflows) {
     ['TAG_EXISTS', 'fresh tag-state output'],
     ['RELEASE_EXISTS', 'fresh release-state output'],
   ]);
+  checkDraftSafeReleaseLookup(reverifyStep, 'reverify resumable release state step');
 
   const tagStep = findNamedStep(releaseJob, 'Create annotated Electric tag when absent');
   if (tagStep?.step?.if !== "steps.resume_state.outputs.tag_exists != 'true'") {
@@ -276,11 +295,10 @@ function checkReleaseWorkflow(workflows) {
   checkRunRequirements(publishStep, 'publish the verified draft step', [
     ['gh release download', 'fresh release asset download'],
     ['sha256sum --check', 'fresh release checksum verification'],
-    ['ENCODED_TAG', 'URL-encoded final release lookup'],
-    ['releases/tags/$ENCODED_TAG', 'URL-encoded final release lookup'],
     ['gh api --method PATCH', 'GitHub Release PATCH'],
     ['-F draft=false', 'publish the verified draft'],
   ]);
+  checkDraftSafeReleaseLookup(publishStep, 'publish the verified draft step');
 
   const releaseNeeds = Array.isArray(releaseJob?.needs) ? releaseJob.needs : [releaseJob?.needs];
   if (!releaseNeeds.includes('inspect') || !releaseNeeds.includes('package')) {
