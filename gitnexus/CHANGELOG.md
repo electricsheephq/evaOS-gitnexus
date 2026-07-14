@@ -4,6 +4,19 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.2] - 2026-07-15
+
+### Added
+
+- **Fresh MCP context metadata after out-of-process analysis** by reading allowed repositories' current `meta.json` on each context-resource request, with cached registry fallback for missing or corrupt metadata and no metadata reads for denied repositories (#118, #122)
+- **Provider-compatible MCP tool schemas** without root `anyOf`, `oneOf`, or `allOf`, while preserving canonical and alias property names and enforcing required selectors before repository resolution (#119, #123)
+
+### Changed
+
+- **LadybugDB is pinned exactly to `0.18.1`** and the GitHub-only release gate now installs one tarball into clean Linux, macOS, and Windows prefixes before publication (#120, #124)
+- Package proof fails closed on checksum, package identity, exact dependency version, direct native import, launcher identity, CLI/MCP smoke, vendor build debris, or shipped native-grammar link drift.
+- Distribution remains a downloadable GitHub Release tarball plus `SHA256SUMS`; npm, container, index, embedding, and OpenClaw runtime operations are unchanged.
+
 ## [1.6.10-electric.1] - 2026-07-14
 
 ### Added
