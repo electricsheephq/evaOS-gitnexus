@@ -136,7 +136,9 @@ test('fails fast when the packaged CLI hangs', () => {
     "#!/usr/bin/env node\nprocess.on('SIGTERM', () => {});\nsetTimeout(() => {}, 10_000);\n",
   );
   if (process.platform !== 'win32') fs.chmodSync(values.cliScript, 0o755);
-  assert.throws(() => runCli(values.prefix, ['--help'], 25), /timed out after 25ms/u);
+  const started = Date.now();
+  assert.throws(() => runCli(values.prefix, ['--help'], 1_000), /timed out after 1000ms/u);
+  assert.ok(Date.now() - started < 5_000, 'hard timeout must not wait for natural child exit');
 });
 
 test('fails closed on vendor build artifacts', () => {
