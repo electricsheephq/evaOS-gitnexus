@@ -56,6 +56,9 @@ jobs:
         run: |
           npm pack --dry-run
           npm pack
+          FILENAME="gitnexus-$EXPECTED_VERSION.tgz"
+          ASSET_PATH="$FILENAME"
+          if [ ! -f "$ASSET_PATH" ] || [ ! -s "$ASSET_PATH" ]; then exit 1; fi
           VERSION_OUTPUT="$EXPECTED_VERSION"
           if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then exit 1; fi
           shasum -a 256 gitnexus-*.tgz > SHA256SUMS
@@ -307,6 +310,40 @@ test('rejects packaging that does not depend on exact-head CI', () => {
   const result = runChecker(createFixture(workflow));
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /package job must depend on exact-head ci/);
+});
+
+test('rejects packaging without the deterministic asset name', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '          FILENAME="gitnexus-$EXPECTED_VERSION.tgz"\n',
+    '          FILENAME="$(node -e \'JSON.parse(process.env.PACK_OUTPUT)\')"\n',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /deterministic package asset filename/);
+});
+
+test('rejects npm pack stdout parsing even when deterministic naming remains', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '          FILENAME="gitnexus-$EXPECTED_VERSION.tgz"\n',
+    '          FILENAME="gitnexus-$EXPECTED_VERSION.tgz"\n' +
+      "          node -e 'JSON.parse(process.env.PACK_OUTPUT)'\n",
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must not parse npm pack stdout as JSON/);
+});
+
+test('rejects package proof without regular-file and non-empty validation', () => {
+  const workflow = replaceOnce(
+    validWorkflow,
+    '          if [ ! -f "$ASSET_PATH" ] || [ ! -s "$ASSET_PATH" ]; then exit 1; fi\n',
+    '          if [ ! -s "$ASSET_PATH" ]; then exit 1; fi\n',
+  );
+  const result = runChecker(createFixture(workflow));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /non-empty regular package asset validation/);
 });
 
 test('rejects an unencoded slash-bearing tag-state lookup', () => {

@@ -211,11 +211,11 @@ jobs:
           PREFIX="$RUNNER_TEMP/electric-release-prefix"
           mkdir -p "$ASSET_DIR" "$PREFIX"
 
-          npm pack --dry-run --json > "$RUNNER_TEMP/npm-pack-dry-run.json"
-          npm pack --json --pack-destination "$ASSET_DIR" > "$RUNNER_TEMP/npm-pack.json"
-          FILENAME="$(PACK_JSON="$RUNNER_TEMP/npm-pack.json" node -e "const fs=require('node:fs'); const value=JSON.parse(fs.readFileSync(process.env.PACK_JSON,'utf8')); if(value.length!==1) process.exit(1); process.stdout.write(value[0].filename)")"
+          npm pack --dry-run > "$RUNNER_TEMP/npm-pack-dry-run.log"
+          npm pack --pack-destination "$ASSET_DIR" > "$RUNNER_TEMP/npm-pack.log"
+          FILENAME="gitnexus-$EXPECTED_VERSION.tgz"
           ASSET_PATH="$ASSET_DIR/$FILENAME"
-          if [ ! -s "$ASSET_PATH" ]; then
+          if [ ! -f "$ASSET_PATH" ] || [ ! -s "$ASSET_PATH" ]; then
             echo "::error::npm pack did not create $ASSET_PATH"
             exit 1
           fi
