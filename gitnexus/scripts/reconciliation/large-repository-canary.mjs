@@ -108,10 +108,11 @@ const collectExtensionFiles = (dir) => {
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) collectExtensionFiles(fullPath);
     if (entry.isFile()) {
+      const contents = fs.readFileSync(fullPath);
       extensionFiles.push({
         path: path.relative(extensionSource, fullPath),
-        bytes: fs.statSync(fullPath).size,
-        sha256: crypto.createHash('sha256').update(fs.readFileSync(fullPath)).digest('hex'),
+        bytes: contents.byteLength,
+        sha256: crypto.createHash('sha256').update(contents).digest('hex'),
       });
     }
   }
