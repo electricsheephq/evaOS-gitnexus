@@ -39,6 +39,16 @@ export function assertMcpReadOnlyToolCall(
   if (typeof args?.repo === 'string' && args.repo.trim().startsWith('@')) {
     throw new Error('Group routing is not available in GitNexus MCP read-only mode.');
   }
+  // crossDepth/subgroup only do anything on the @group path rejected above,
+  // but rejecting them here keeps the advertised schema and the dispatch
+  // contract in agreement.
+  for (const groupOnlyArg of ['crossDepth', 'subgroup']) {
+    if (args?.[groupOnlyArg] !== undefined) {
+      throw new Error(
+        `Parameter "${groupOnlyArg}" is not available in GitNexus MCP read-only mode.`,
+      );
+    }
+  }
 }
 
 export function readOnlyResourceTemplateAllowed(uriTemplate: string, readOnly: boolean): boolean {
@@ -64,6 +74,9 @@ export function assertMcpReadOnlyResource(uri: string, readOnly: boolean): void 
   }
 }
 
+// Cosmetic only: dispatch enforcement above is the actual boundary. If the
+// generated resource format drifts and a hidden route slips through here, the
+// caller still gets a clean rejection at dispatch.
 export function filterMcpReadOnlyResourceContent(content: string, readOnly: boolean): string {
   if (!readOnly) return content;
   return content

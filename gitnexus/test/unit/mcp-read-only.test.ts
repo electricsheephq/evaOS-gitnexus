@@ -139,6 +139,22 @@ describe('MCP read-only mode', () => {
     },
   );
 
+  it.each([
+    ['impact', { target: 'auth', direction: 'upstream', crossDepth: 5 }],
+    ['impact', { target: 'auth', direction: 'upstream', subgroup: 'services' }],
+  ])('rejects group-only arguments before backend dispatch: %s %o', async (name, args) => {
+    enableReadOnly();
+    const session = await connect();
+    try {
+      const response = await session.client.callTool({ name, arguments: args });
+      expect(response.isError).toBe(true);
+      expect((response.content[0] as { text: string }).text).toMatch(/read-only mode/i);
+      expect(session.backend.callTool).not.toHaveBeenCalled();
+    } finally {
+      await session.close();
+    }
+  });
+
   it.each(['search', 'explore', 'overview'])('preserves legacy read alias %s', async (name) => {
     enableReadOnly();
     const session = await connect();
