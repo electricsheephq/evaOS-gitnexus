@@ -81,6 +81,29 @@ describe('direct CLI tool commands', () => {
     expect(process.exitCode).toBe(1);
   });
 
+  it('fails closed when cypher returns a backend error payload', async () => {
+    callToolMock.mockResolvedValue({ error: 'Binder exception: missing relationship property' });
+    const { cypherCommand } = await import('../../src/cli/tool.js');
+
+    await cypherCommand('MATCH ()-[r:CodeRelation]->() RETURN r.missing');
+
+    expect(writeSyncMock).toHaveBeenCalledWith(
+      1,
+      expect.stringContaining('Binder exception: missing relationship property'),
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('keeps a successful cypher result at exit zero', async () => {
+    callToolMock.mockResolvedValue({ markdown: '| count |\n| --- |\n| 1 |', row_count: 1 });
+    const { cypherCommand } = await import('../../src/cli/tool.js');
+
+    await cypherCommand('MATCH (n) RETURN count(n) AS count');
+
+    expect(writeSyncMock).toHaveBeenCalledWith(1, expect.stringContaining('"row_count": 1'));
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it('dispatches detect_changes with CLI-shaped arguments', async () => {
     callToolMock.mockResolvedValue({
       summary: {
