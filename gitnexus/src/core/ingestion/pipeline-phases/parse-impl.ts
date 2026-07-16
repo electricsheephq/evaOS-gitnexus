@@ -986,7 +986,18 @@ export async function runChunkedParseAndResolve(
         // them under the chunk hash for the next run.
         chunkCacheMisses++;
         if (durableParsedFileDir !== undefined && chunkHash !== null) {
-          await prepareDurableParsedFileChunk(durableParsedFileDir, chunkHash);
+          try {
+            await prepareDurableParsedFileChunk(durableParsedFileDir, chunkHash);
+          } catch (err) {
+            // This cache is an optimization; an fs cleanup failure must not
+            // abort analysis. Workers still mkdir/write their shard path, so
+            // the degraded case retains the prior append-style behavior.
+            logger.warn(
+              { err, chunkHash },
+              `parsedfile-cache: failed to prepare durable chunk ${chunkHash.slice(0, 8)} — ` +
+                'continuing without generation cleanup',
+            );
+          }
         }
         const progressForChunk = (current: number, _total: number, filePath: string) => {
           const globalCurrent = filesParsedSoFar + current;

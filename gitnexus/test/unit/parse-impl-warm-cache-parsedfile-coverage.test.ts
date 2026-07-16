@@ -26,7 +26,7 @@
  *      shards are absent; and a mixed-mode run (one file changed) hits the
  *      unchanged chunk while re-parsing the changed one.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -51,6 +51,7 @@ import {
 } from '../../src/storage/parsedfile-store.js';
 import type { ParseWorkerResult } from '../../src/core/ingestion/workers/parse-worker.js';
 import type { ParsedFile } from 'gitnexus-shared';
+import { _captureLogger } from '../../src/core/logger.js';
 
 // A structurally-minimal ParsedFile. `loadParsedFilesForPaths` keys on
 // `filePath`; the rest are empty so a restored shard is byte-stable and
@@ -334,6 +335,27 @@ describe('parse-impl warm-cache ParsedFile coverage (#2038)', () => {
       filePath: string;
     }>;
     expect(parsed.map((item) => item.filePath)).toEqual(['src/repeated.ts']);
+  });
+
+  it('continues parsing when durable generation cleanup fails', async () => {
+    const f = writeFile('src/cleanup-failure.ts', 'export const value = 1;\n');
+    const originalRm = fs.promises.rm.bind(fs.promises);
+    const rm = vi.spyOn(fs.promises, 'rm').mockImplementation(async (target, options) => {
+      if (String(target).includes(`${path.sep}parsedfile-cache${path.sep}`)) {
+        throw new Error('EACCES: durable cache is read-only');
+      }
+      return originalRm(target, options);
+    });
+    const logs = _captureLogger();
+
+    try {
+      await expect(run(newCache(), [f])).resolves.toBeUndefined();
+      expect(fs.existsSync(markerPath)).toBe(true);
+      expect(logs.text()).toContain('failed to prepare durable chunk');
+    } finally {
+      logs.restore();
+      rm.mockRestore();
+    }
   });
 
   it('run #2 (all hits) spawns NO worker — the warm path is served from caches', async () => {
