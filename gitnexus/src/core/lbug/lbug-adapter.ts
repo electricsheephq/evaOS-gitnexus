@@ -2123,17 +2123,21 @@ export const wipeLbugDbFiles = async (lbugPath: string): Promise<void> => {
 export const isLbugReady = (): boolean => conn !== null && db !== null;
 
 /**
- * Multi-label alternation over exactly the labels that can own embedding
- * rows (embedding-pipeline.ts queries EMBEDDABLE_LABELS and nothing else),
- * reserved keywords backtick-escaped via {@link escapeTableName}. Probed on
- * @ladybugdb/core 0.18.0 (this shipping review, FIX 4): the full 19-label
+ * Multi-label alternation over every label that can own embedding rows:
+ * EMBEDDABLE_LABELS for the symbol-first path plus File for the text-bearing
+ * fallback used by static/docs-heavy repositories. File deliberately stays
+ * out of EMBEDDABLE_LABELS so normal code repositories retain symbol-first
+ * selection. Reserved keywords are backtick-escaped via
+ * {@link escapeTableName}. Probed on @ladybugdb/core 0.18.0 (this shipping
+ * review, FIX 4): the full 20-label
  * alternation parses, executes, and deletes exactly the joined rows —
  * replacing the unlabeled `MATCH (n)` that scanned EVERY node table per
  * chunk (BasicBlock-dominated under `--pdg`) when only embeddable labels
  * can match an embedding row.
  */
+const EMBEDDING_OWNER_LABELS = [...EMBEDDABLE_LABELS, 'File'] as const;
 const embeddableLabelMatch = (): string =>
-  EMBEDDABLE_LABELS.map((l) => escapeTableName(l)).join('|');
+  EMBEDDING_OWNER_LABELS.map((l) => escapeTableName(l)).join('|');
 
 // LADYBUGDB-CONTRACT: matches @ladybugdb/core ^0.18.0 native binder text,
 // probe-recorded: `Binder exception: Table CodeEmbedding does not exist.`
@@ -2178,7 +2182,7 @@ export const deleteNodesForFile = async (
     // (src/lib/utils.ts) with qualified names that embed the file path — so
     // the old `e.nodeId STARTS WITH '<filePath>'` shape never matched a row
     // (tri-review 4669518496 P2-1). Join through the nodes on exact id
-    // equality instead, scoped to the embeddable labels (FIX 4 — see
+    // equality instead, scoped to all embedding-owner labels (FIX 4 — see
     // embeddableLabelMatch); ordering is load-bearing — after the DETACH
     // DELETE loop below the join would match nothing.
     try {
@@ -2299,10 +2303,11 @@ export const deleteNodesForFiles = async (
     // the previous bare-path `e.nodeId STARTS WITH '<filePath>'` OR-chain
     // could never match anything (tri-review 4669518496 P2-1: the embedding
     // delete was a no-op). Join through the nodes instead: one multi-label
-    // MATCH over exactly the embeddable labels (FIX 4, probe-proven on
+    // MATCH over exactly the embedding-owner labels, including fallback File
+    // rows (FIX 4, probe-proven on
     // 0.18.0 — see embeddableLabelMatch; the old unlabeled `MATCH (n)`
     // scanned every node table per chunk, BasicBlock-dominated under
-    // `--pdg`, when only embeddable labels can own rows), and
+    // `--pdg`, when only embedding-owner labels can own rows), and
     // `e.nodeId = n.id` equality is exact — no `File:a.ts` / `File:a.tsx`
     // prefix collisions. ORDER IS LOAD-BEARING: this must run BEFORE the
     // DETACH DELETE loop below — once the nodes are gone the join matches
