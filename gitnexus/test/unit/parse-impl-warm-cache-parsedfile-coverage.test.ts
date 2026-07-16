@@ -26,11 +26,27 @@
  *      shards are absent; and a mixed-mode run (one file changed) hits the
  *      unchanged chunk while re-parsing the changed one.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+
+// Partial mock: lets one test make prepareDurableParsedFileChunk fail without
+// touching the worker-side persist path (which shares the same directory).
+const prepareOverride = vi.hoisted(() => ({
+  impl: undefined as undefined | (() => Promise<void>),
+}));
+vi.mock('../../src/storage/parsedfile-store.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/storage/parsedfile-store.js')>();
+  return {
+    ...real,
+    prepareDurableParsedFileChunk: (durableDir: string, chunkHash: string) =>
+      prepareOverride.impl
+        ? prepareOverride.impl()
+        : real.prepareDurableParsedFileChunk(durableDir, chunkHash),
+  };
+});
 
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
 import { runChunkedParseAndResolve } from '../../src/core/ingestion/pipeline-phases/parse-impl.js';
@@ -313,6 +329,16 @@ describe('parse-impl warm-cache ParsedFile coverage (#2038)', () => {
     expect(fs.existsSync(chunkDir)).toBe(true);
     expect(fs.readdirSync(chunkDir).filter((n) => n.endsWith('.json')).length).toBeGreaterThan(0);
     expect(cache.usedKeys.has(chunkHash)).toBe(true);
+  });
+
+  it('a failing durable-generation reset degrades instead of failing the analyze', async () => {
+    const f = writeFile('src/degrade.ts', 'export function degrade() { return 1; }\n');
+    prepareOverride.impl = () => Promise.reject(new Error('EACCES: simulated cache failure'));
+    try {
+      await expect(run(newCache(), [f])).resolves.toBeUndefined();
+    } finally {
+      prepareOverride.impl = undefined;
+    }
   });
 
   it('a repeated cache miss replaces the durable chunk generation', async () => {

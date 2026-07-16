@@ -986,7 +986,17 @@ export async function runChunkedParseAndResolve(
         // them under the chunk hash for the next run.
         chunkCacheMisses++;
         if (durableParsedFileDir !== undefined && chunkHash !== null) {
-          await prepareDurableParsedFileChunk(durableParsedFileDir, chunkHash);
+          try {
+            await prepareDurableParsedFileChunk(durableParsedFileDir, chunkHash);
+          } catch (err) {
+            // The durable store is an optimization — degrade like the restore
+            // path does instead of failing the analyze. Workers recreate the
+            // directory on write, so at worst the old generation lingers.
+            logger.warn(
+              { err, chunkHash: chunkHash.slice(0, 8) },
+              'parsedfile-cache: could not reset durable chunk generation; continuing',
+            );
+          }
         }
         const progressForChunk = (current: number, _total: number, filePath: string) => {
           const globalCurrent = filesParsedSoFar + current;
