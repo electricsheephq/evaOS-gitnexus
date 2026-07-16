@@ -44,6 +44,20 @@ async function getBackend(): Promise<LocalBackend> {
  * Falls back to stderr if the fd write fails (e.g., broken pipe).
  */
 function output(data: any): void {
+  // Every direct tool command shares the LocalBackend error-payload contract.
+  // Fail closed here so a printed `{ error: string }` can never look successful
+  // to shell scripts, regardless of which command produced it. Preserve a
+  // stronger pre-existing exit code when commands are invoked programmatically.
+  if (
+    data &&
+    typeof data === 'object' &&
+    'error' in data &&
+    typeof data.error === 'string' &&
+    data.error.trim().length > 0 &&
+    (process.exitCode === undefined || process.exitCode === 0)
+  ) {
+    process.exitCode = 1;
+  }
   const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
   try {
     writeSync(1, text + '\n');
@@ -301,15 +315,6 @@ export async function cypherCommand(
     }
   }
   output(result);
-  if (
-    result &&
-    typeof result === 'object' &&
-    'error' in result &&
-    typeof result.error === 'string' &&
-    result.error.trim().length > 0
-  ) {
-    process.exitCode = 1;
-  }
 }
 
 export async function detectChangesCommand(options?: {

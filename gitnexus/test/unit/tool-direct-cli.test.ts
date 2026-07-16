@@ -94,6 +94,29 @@ describe('direct CLI tool commands', () => {
     expect(process.exitCode).toBe(1);
   });
 
+  it('fails closed when query returns a backend error payload', async () => {
+    callToolMock.mockResolvedValue({ error: 'Repository index is unavailable.' });
+    const { queryCommand } = await import('../../src/cli/tool.js');
+
+    await queryCommand('find callers');
+
+    expect(writeSyncMock).toHaveBeenCalledWith(
+      1,
+      expect.stringContaining('Repository index is unavailable.'),
+    );
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('fails closed when context returns a backend error payload', async () => {
+    callToolMock.mockResolvedValue({ error: 'Symbol lookup failed.' });
+    const { contextCommand } = await import('../../src/cli/tool.js');
+
+    await contextCommand('targetSymbol');
+
+    expect(writeSyncMock).toHaveBeenCalledWith(1, expect.stringContaining('Symbol lookup failed.'));
+    expect(process.exitCode).toBe(1);
+  });
+
   it('keeps a successful cypher result at exit zero', async () => {
     callToolMock.mockResolvedValue({ markdown: '| count |\n| --- |\n| 1 |', row_count: 1 });
     const { cypherCommand } = await import('../../src/cli/tool.js');
