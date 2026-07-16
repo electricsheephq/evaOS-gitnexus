@@ -104,6 +104,26 @@ describe('direct CLI tool commands', () => {
     expect(process.exitCode).toBeUndefined();
   });
 
+  it('fails closed when query returns a backend error payload', async () => {
+    callToolMock.mockResolvedValue({ error: 'Repository "missing" not found.' });
+    const { queryCommand } = await import('../../src/cli/tool.js');
+
+    await queryCommand('auth flow');
+
+    expect(writeSyncMock).toHaveBeenCalledWith(1, expect.stringContaining('not found'));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('fails closed when context returns a backend error payload', async () => {
+    callToolMock.mockResolvedValue({ error: 'Symbol not found: nope' });
+    const { contextCommand } = await import('../../src/cli/tool.js');
+
+    await contextCommand('nope');
+
+    expect(writeSyncMock).toHaveBeenCalledWith(1, expect.stringContaining('Symbol not found'));
+    expect(process.exitCode).toBe(1);
+  });
+
   it('dispatches detect_changes with CLI-shaped arguments', async () => {
     callToolMock.mockResolvedValue({
       summary: {
