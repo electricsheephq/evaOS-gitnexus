@@ -69,6 +69,24 @@ describe('shared doctor read-pool probe', () => {
     });
     expect(poolMocks.closeLbug).toHaveBeenCalledOnce();
   });
+
+  it('does not initialize when cleanup support is unavailable', async () => {
+    const closeLbug = poolMocks.closeLbug;
+    Reflect.set(poolMocks, 'closeLbug', undefined);
+    try {
+      await expect(probeDoctorPool('/repo/.gitnexus/lbug')).resolves.toMatchObject({
+        fts: false,
+        vector: false,
+        exercisedConnections: 0,
+        connectionCount: 0,
+        reason: 'non-recovering read-pool capability probe is unavailable',
+      });
+      expect(poolMocks.initLbugNonRecovering).not.toHaveBeenCalled();
+    } finally {
+      Reflect.set(poolMocks, 'closeLbug', closeLbug);
+    }
+  });
+
   it('closes the diagnostic pool when non-recovering initialization fails', async () => {
     poolMocks.initLbugNonRecovering.mockRejectedValue(new Error('WAL requires recovery'));
 

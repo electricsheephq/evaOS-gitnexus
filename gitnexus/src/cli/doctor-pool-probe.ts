@@ -17,7 +17,7 @@ interface DoctorPoolAdapter {
   probePoolConnections(repoId: string): Promise<number>;
 }
 
-const EXPECTED_POOL_CONNECTIONS = 8;
+export const EXPECTED_POOL_CONNECTIONS = 8;
 
 /**
  * Probe the production indexed read pool without invoking a recovery path.
@@ -33,7 +33,12 @@ export async function probeDoctorPool(dbPath: string): Promise<DoctorPoolProbe> 
     const pool =
       (await import('../core/lbug/pool-adapter.js')) as unknown as Partial<DoctorPoolAdapter>;
     closePool = pool.closeLbug;
-    if (!pool.initLbugNonRecovering || !pool.getPoolCapabilities || !pool.probePoolConnections) {
+    if (
+      !closePool ||
+      !pool.initLbugNonRecovering ||
+      !pool.getPoolCapabilities ||
+      !pool.probePoolConnections
+    ) {
       throw new Error('non-recovering read-pool capability probe is unavailable');
     }
 

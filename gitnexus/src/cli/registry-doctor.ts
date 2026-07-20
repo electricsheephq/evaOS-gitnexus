@@ -9,7 +9,11 @@ import {
   type RegistryEntry,
   type RepoMeta,
 } from '../storage/repo-manager.js';
-import { probeDoctorPool, type DoctorPoolProbe } from './doctor-pool-probe.js';
+import {
+  EXPECTED_POOL_CONNECTIONS,
+  probeDoctorPool,
+  type DoctorPoolProbe,
+} from './doctor-pool-probe.js';
 
 export interface RegistryCounts {
   nodes: number | null;
@@ -327,7 +331,11 @@ const unavailableCapabilities = (): RegistryCapabilityReport => ({
 });
 
 const liveCapabilities = (probe: DoctorPoolProbe): RegistryCapabilityReport => {
-  if (probe.reason || probe.connectionCount !== 8 || probe.exercisedConnections !== 8) {
+  if (
+    probe.reason ||
+    probe.connectionCount !== EXPECTED_POOL_CONNECTIONS ||
+    probe.exercisedConnections !== EXPECTED_POOL_CONNECTIONS
+  ) {
     return unavailableCapabilities();
   }
   return {

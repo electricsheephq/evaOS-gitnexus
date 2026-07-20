@@ -107,6 +107,26 @@ describe('registry canonical remote enforcement (#133)', () => {
     expect(await readRegistry()).toHaveLength(1);
   });
 
+  it('serializes concurrent first-time registrations for one canonical remote', async () => {
+    const remote = 'https://github.com/electricsheephq/evaos-gitnexus.git';
+    const results = await Promise.allSettled([
+      registerRepo(repoA.dbPath, meta(repoA.dbPath, remote)),
+      registerRepo(repoB.dbPath, meta(repoB.dbPath, remote)),
+    ]);
+
+    const fulfilled = results.filter((result) => result.status === 'fulfilled');
+    const rejected = results.filter((result) => result.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      reason: expect.any(RepositoryRemoteCollisionError),
+    });
+
+    const registry = await readRegistry();
+    expect(registry).toHaveLength(1);
+    expect([path.resolve(repoA.dbPath), path.resolve(repoB.dbPath)]).toContain(registry[0]?.path);
+  });
+
   it('keeps repositories without a normalized remote path-based and local-only', async () => {
     await registerRepo(repoA.dbPath, meta(repoA.dbPath));
     await registerRepo(repoB.dbPath, meta(repoB.dbPath));

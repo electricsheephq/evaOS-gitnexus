@@ -883,6 +883,104 @@ const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
   await fs.rename(tmp, target);
 };
 
+interface RegistryLockRecord {
+  schema: 'gitnexus.registry-lock/v1';
+  pid: number;
+  nonce: string;
+  startedAt: string;
+}
+
+const REGISTRY_LOCK_RETRY_DELAY_MS = 25;
+const REGISTRY_LOCK_MAX_ATTEMPTS = 200;
+const REGISTRY_LOCK_UNINITIALIZED_GRACE_MS = 5_000;
+
+const registryProcessIsAlive = (pid: number): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+};
+
+const readRegistryLock = async (lockPath: string): Promise<RegistryLockRecord | null> => {
+  try {
+    const parsed = JSON.parse(await fs.readFile(lockPath, 'utf8')) as Partial<RegistryLockRecord>;
+    if (
+      parsed.schema !== 'gitnexus.registry-lock/v1' ||
+      !Number.isSafeInteger(parsed.pid) ||
+      typeof parsed.nonce !== 'string' ||
+      !parsed.nonce ||
+      typeof parsed.startedAt !== 'string'
+    ) {
+      return null;
+    }
+    return parsed as RegistryLockRecord;
+  } catch {
+    return null;
+  }
+};
+
+const waitForRegistryLock = async (): Promise<void> => {
+  await new Promise((resolve) => setTimeout(resolve, REGISTRY_LOCK_RETRY_DELAY_MS));
+};
+
+const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
+  const lockPath = `${getGlobalRegistryPath()}.lock`;
+  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  const record: RegistryLockRecord = {
+    schema: 'gitnexus.registry-lock/v1',
+    pid: process.pid,
+    nonce: randomBytes(16).toString('hex'),
+    startedAt: new Date().toISOString(),
+  };
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+
+  for (let attempt = 0; attempt < REGISTRY_LOCK_MAX_ATTEMPTS; attempt++) {
+    try {
+      handle = await fs.open(lockPath, 'wx', 0o600);
+      await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
+      await handle.sync();
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        const acquired = handle;
+        handle = undefined;
+        await acquired?.close().catch(() => {});
+        if (acquired) await fs.rm(lockPath, { force: true });
+        throw error;
+      }
+
+      const owner = await readRegistryLock(lockPath);
+      if (owner && !registryProcessIsAlive(owner.pid)) {
+        const current = await readRegistryLock(lockPath);
+        if (current?.nonce === owner.nonce) await fs.rm(lockPath, { force: true });
+        continue;
+      }
+      if (!owner) {
+        const state = await fs.stat(lockPath).catch(() => null);
+        if (state && Date.now() - state.mtimeMs > REGISTRY_LOCK_UNINITIALIZED_GRACE_MS) {
+          await fs.rm(lockPath, { force: true });
+          continue;
+        }
+      }
+      await waitForRegistryLock();
+    }
+  }
+
+  if (!handle) {
+    throw new Error('GitNexus: unable to acquire the registry mutation lock');
+  }
+  try {
+    return await operation();
+  } finally {
+    await handle.close().catch(() => {});
+    const current = await readRegistryLock(lockPath);
+    if (current?.nonce === record.nonce) await fs.rm(lockPath, { force: true });
+  }
+};
+
 /**
  * Options for {@link registerRepo}. All optional — callers without any
  * disambiguation requirement can keep calling `registerRepo(path, meta)`
@@ -1200,36 +1298,38 @@ export const registerRepo = async (
   // R9): re-derive THIS run's delta against the FRESHEST snapshot so a
   // concurrent change to the OTHER axis (a branch upsert vs a primary refresh)
   // survives instead of being clobbered by a stale entry-time view.
-  const fresh = await readRegistry();
-  // Close the analyze/index TOCTOU window: another process may have registered
-  // this remote after the initial read but before our atomic registry write.
-  assertRemoteIdentityAvailable(fresh, resolved, remoteUrl);
-  const freshIdx = fresh.findIndex((e) => {
-    const a = canonicalizePath(e.path);
-    return registryPathEquals(a, canonicalInput);
-  });
-  const freshExisting = freshIdx >= 0 ? fresh[freshIdx] : null;
-  let merged: RegistryEntry;
-  if (summary) {
-    // Branch run: keep the FRESH top-level + branches, just upsert our summary.
-    const base = freshExisting ?? entry;
-    const branches = (base.branches ?? []).filter((b) => b.branch !== summary.branch);
-    branches.push(summary);
-    merged = { ...base, name, branches };
-  } else {
-    // Primary run: apply our refreshed top-level, but defer to the FRESH
-    // branches[] (a concurrent branch upsert or `clean --branch` wins).
-    merged = { ...entry };
-    if (freshExisting?.branches) merged.branches = freshExisting.branches;
-    else delete merged.branches;
-  }
-  if (freshIdx >= 0) {
-    fresh[freshIdx] = merged;
-  } else {
-    fresh.push(merged);
-  }
+  await withRegistryMutationLock(async () => {
+    const fresh = await readRegistry();
+    // Close the analyze/index TOCTOU window: another process may have registered
+    // this remote after the initial read but before our atomic registry write.
+    assertRemoteIdentityAvailable(fresh, resolved, remoteUrl);
+    const freshIdx = fresh.findIndex((e) => {
+      const a = canonicalizePath(e.path);
+      return registryPathEquals(a, canonicalInput);
+    });
+    const freshExisting = freshIdx >= 0 ? fresh[freshIdx] : null;
+    let merged: RegistryEntry;
+    if (summary) {
+      // Branch run: keep the FRESH top-level + branches, just upsert our summary.
+      const base = freshExisting ?? entry;
+      const branches = (base.branches ?? []).filter((b) => b.branch !== summary.branch);
+      branches.push(summary);
+      merged = { ...base, name, branches };
+    } else {
+      // Primary run: apply our refreshed top-level, but defer to the FRESH
+      // branches[] (a concurrent branch upsert or `clean --branch` wins).
+      merged = { ...entry };
+      if (freshExisting?.branches) merged.branches = freshExisting.branches;
+      else delete merged.branches;
+    }
+    if (freshIdx >= 0) {
+      fresh[freshIdx] = merged;
+    } else {
+      fresh.push(merged);
+    }
 
-  await writeRegistry(fresh);
+    await writeRegistry(fresh);
+  });
   return name;
 };
 
