@@ -7,7 +7,12 @@ import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'path';
 import { readRegistry, type RegistryEntry, type CwdMatch } from '../storage/repo-manager.js';
-import { findGitRootByDotGit, getCurrentCommit, getRemoteUrl } from '../storage/git.js';
+import {
+  findGitRootByDotGit,
+  getCurrentCommit,
+  getRemoteUrl,
+  normalizeRepositoryRemote,
+} from '../storage/git.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -147,10 +152,13 @@ export async function checkCwdMatch(cwd: string): Promise<CwdMatch> {
   if (!cwdGitRoot) return { match: 'none' };
 
   const cwdRemote = getRemoteUrl(cwdGitRoot);
-  if (!cwdRemote) return { match: 'none' };
+  const cwdRemoteIdentity = normalizeRepositoryRemote(cwdRemote);
+  if (!cwdRemoteIdentity) return { match: 'none' };
 
   const sibling = entries.find(
-    (e) => e.remoteUrl === cwdRemote && norm(e.path) !== norm(cwdGitRoot),
+    (e) =>
+      normalizeRepositoryRemote(e.remoteUrl) === cwdRemoteIdentity &&
+      norm(e.path) !== norm(cwdGitRoot),
   );
   if (!sibling) return { match: 'none' };
 

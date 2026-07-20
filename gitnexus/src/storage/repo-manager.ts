@@ -19,7 +19,12 @@ import { realpathSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { randomBytes } from 'crypto';
-import { getInferredRepoName, resolveRepoIdentityRoot } from './git.js';
+import {
+  getInferredRepoName,
+  getRemoteUrl,
+  normalizeRepositoryRemote,
+  resolveRepoIdentityRoot,
+} from './git.js';
 import { retryRename } from './fs-atomic.js';
 import { logger } from '../core/logger.js';
 import {
@@ -945,6 +950,62 @@ export class RegistryNameCollisionError extends Error {
   }
 }
 
+/**
+ * Stable local-CLI failure for a second top-level index of the same logical
+ * remote. Registry insertion order defines the current canonical record: the
+ * first registered normalized remote remains canonical until an operator
+ * explicitly repairs the registry.
+ */
+export class RepositoryRemoteCollisionError extends Error {
+  readonly kind = 'RepositoryRemoteCollisionError' as const;
+  readonly code = 'repository_remote_collision' as const;
+
+  constructor(
+    public readonly canonicalPath: string,
+    public readonly requestedPath: string,
+    public readonly remoteIdentity: string,
+  ) {
+    super(
+      `repository_remote_collision: this Git remote already has a canonical top-level index at "${canonicalPath}". ` +
+        `Refusing to register a second index at "${requestedPath}". Use the canonical path or repair the registry explicitly.`,
+    );
+    this.name = 'RepositoryRemoteCollisionError';
+  }
+}
+
+const assertRemoteIdentityAvailable = (
+  entries: readonly RegistryEntry[],
+  repoPath: string,
+  remoteUrl: string | undefined,
+): void => {
+  const remoteIdentity = normalizeRepositoryRemote(remoteUrl);
+  if (!remoteIdentity) return;
+
+  const canonical = entries.find(
+    (entry) => normalizeRepositoryRemote(entry.remoteUrl) === remoteIdentity,
+  );
+  if (!canonical) return;
+
+  const requestedPath = canonicalizePath(repoPath);
+  const canonicalPath = canonicalizePath(canonical.path);
+  if (registryPathEquals(canonicalPath, requestedPath)) return;
+
+  throw new RepositoryRemoteCollisionError(canonical.path, path.resolve(repoPath), remoteIdentity);
+};
+
+/**
+ * Read-only preflight used before analysis opens or mutates an index. Remotes
+ * that cannot form a fleet-safe identity (no origin, filesystem path, file:)
+ * return immediately and retain the legacy path-based local-only behavior.
+ */
+export const assertCanonicalRepositoryIdentity = async (
+  repoPath: string,
+  remoteUrl: string | undefined,
+): Promise<void> => {
+  if (!normalizeRepositoryRemote(remoteUrl)) return;
+  assertRemoteIdentityAvailable(await readRegistry(), repoPath, remoteUrl);
+};
+
 /** Returns true when a previously-registered entry's `name` differs from
  *  both `path.basename(entry.path)` and the git-remote-derived name —
  *  i.e. a user explicitly aliased it via `analyze --name <alias>` on a
@@ -1018,7 +1079,13 @@ export const registerRepo = async (
   // falling back to `path.resolve` when the path doesn't exist.
   const canonicalInput = canonicalizePath(repoPath);
 
+  // Capture a current origin when callers provide older metadata without the
+  // remote fingerprint (`gitnexus index` and direct API callers). No origin
+  // leaves the repository path-scoped and local-only.
+  const remoteUrl = meta.remoteUrl?.trim() || getRemoteUrl(resolved);
+
   const entries = await readRegistry();
+  assertRemoteIdentityAvailable(entries, resolved, remoteUrl);
   const existingIdx = entries.findIndex((e) => {
     // Canonicalise the STORED entry too so pre-canonicalisation
     // registries (written by older versions, or paths passed in a
@@ -1106,7 +1173,7 @@ export const registerRepo = async (
       storagePath,
       indexedAt: flatMeta?.indexedAt ?? meta.indexedAt,
       lastCommit: flatMeta?.lastCommit ?? meta.lastCommit,
-      remoteUrl: flatMeta?.remoteUrl ?? meta.remoteUrl,
+      remoteUrl: flatMeta?.remoteUrl ?? remoteUrl,
       stats: flatMeta?.stats ?? meta.stats,
       ...(flatMeta?.branch ? { branch: flatMeta.branch } : {}),
     };
@@ -1122,7 +1189,7 @@ export const registerRepo = async (
       storagePath,
       indexedAt: meta.indexedAt,
       lastCommit: meta.lastCommit,
-      remoteUrl: meta.remoteUrl,
+      remoteUrl,
       stats: meta.stats,
       ...(meta.branch ? { branch: meta.branch } : {}),
       ...(existing?.branches ? { branches: existing.branches } : {}),
@@ -1134,6 +1201,9 @@ export const registerRepo = async (
   // concurrent change to the OTHER axis (a branch upsert vs a primary refresh)
   // survives instead of being clobbered by a stale entry-time view.
   const fresh = await readRegistry();
+  // Close the analyze/index TOCTOU window: another process may have registered
+  // this remote after the initial read but before our atomic registry write.
+  assertRemoteIdentityAvailable(fresh, resolved, remoteUrl);
   const freshIdx = fresh.findIndex((e) => {
     const a = canonicalizePath(e.path);
     return registryPathEquals(a, canonicalInput);
@@ -1720,12 +1790,15 @@ export const findSiblingClones = async (
   remoteUrl: string | undefined,
   selfPath: string,
 ): Promise<RegistryEntry[]> => {
-  if (!remoteUrl) return [];
+  const remoteIdentity = normalizeRepositoryRemote(remoteUrl);
+  if (!remoteIdentity) return [];
   const entries = await readRegistry();
   const isWin = process.platform === 'win32';
   const norm = (p: string) => (isWin ? path.resolve(p).toLowerCase() : path.resolve(p));
   const self = norm(selfPath);
-  return entries.filter((e) => e.remoteUrl === remoteUrl && norm(e.path) !== self);
+  return entries.filter(
+    (e) => normalizeRepositoryRemote(e.remoteUrl) === remoteIdentity && norm(e.path) !== self,
+  );
 };
 
 /**

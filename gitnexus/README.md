@@ -250,6 +250,9 @@ gitnexus clean --all --force     # Delete all indexes
 gitnexus wiki [path]             # Generate LLM-powered docs from knowledge graph
 gitnexus wiki --model <model>    # Wiki with custom LLM model (default: minimax/minimax-m2.5)
 gitnexus doctor                  # Show runtime platform capabilities and embedding configuration
+gitnexus doctor --mcp-config --json  # Validate MCP repo policy without binding or opening an index
+gitnexus doctor --registry --json    # Read-only registry/index consistency report (paths hidden)
+gitnexus doctor --registry --json --show-paths  # Explicitly include absolute registry paths
 
 # Direct graph queries — the same tools the MCP server exposes, no MCP daemon needed
 gitnexus query "<concept>"                                    # Process-grouped hybrid search
@@ -310,6 +313,21 @@ export GITNEXUS_RERANK_TIMEOUT_MS=30000
 ## Multi-Repo Support
 
 GitNexus supports indexing multiple repositories. Each `gitnexus analyze` registers the repo in a global registry (`~/.gitnexus/registry.json`). The MCP server serves all indexed repos automatically.
+
+One normalized GitHub remote has one canonical top-level index. GitHub SSH,
+HTTPS, and Git remotes are compared without transport, case, a trailing slash,
+or the `.git` suffix; analyzing a second clone fails with
+`repository_remote_collision` and names the existing canonical path. Re-run
+analysis from that path instead. Repositories without a fleet-safe remote
+(including local filesystem and `file:` remotes) stay path-scoped and are
+reported as local-only.
+
+Before starting MCP, `gitnexus doctor --mcp-config --json` checks the configured
+allowlist/default with the production resolver but does not bind a transport or
+open an index. `gitnexus doctor --registry --json` reports remote/alias
+collisions, registry/metadata/database count agreement, recovery sidecars,
+locks, and recorded capabilities through read-only handles. Absolute paths are
+omitted unless `--show-paths` is supplied explicitly.
 
 ## Supported Languages
 

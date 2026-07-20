@@ -61,6 +61,7 @@ import {
   loadMeta,
   ensureGitNexusIgnored,
   registerRepo,
+  assertCanonicalRepositoryIdentity,
   adoptFlatBranchLabel,
   isReadOnlyFilesystemError,
   isRepoRegistered,
@@ -594,6 +595,15 @@ export async function runFullAnalysis(
   const progress = (phase: string, percent: number, message: string) =>
     callbacks.onProgress(phase, percent, message);
 
+  // Repository identity is a read-only gate and must run before metadata
+  // reconciliation, sidecar handling, DB open, or any generated-file write.
+  // Local-only repositories have no fleet-safe remote identity and remain
+  // path-scoped. registerRepo repeats the check at commit time for races and
+  // non-analyze callers.
+  const repoHasGit = hasGitDir(repoPath);
+  const repositoryRemoteUrl = repoHasGit ? getRemoteUrl(repoPath) : undefined;
+  await assertCanonicalRepositoryIdentity(repoPath, repositoryRemoteUrl);
+
   // Resolve + validate operator-provided FTS config once, before the expensive
   // parse/load phases. A typo fails here in ms; createSearchFTSIndexes reuses
   // the cached value via getSearchFTSStemmer.
@@ -621,7 +631,6 @@ export async function runFullAnalysis(
   // and are shared across branches (#2106 KTD7).
   const { storagePath } = getStoragePaths(repoPath);
 
-  const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
 
   // ── #2106/#2354: resolve which branch slot this run writes to ─────────
@@ -2073,7 +2082,7 @@ export async function runFullAnalysis(
           lastCommit: currentCommit,
           indexedAt: new Date().toISOString(),
           branch: branchLabel ?? existingMeta?.branch,
-          remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+          remoteUrl: repositoryRemoteUrl,
           stats: {
             files: pipelineResult.totalFileCount,
             nodes: stats.nodes,
@@ -2213,7 +2222,7 @@ export async function runFullAnalysis(
       // a second git shellout. `undefined` when the repo has no
       // origin remote, which is fine: paths-only repos behave as
       // before.
-      remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+      remoteUrl: repositoryRemoteUrl,
       stats: {
         files: pipelineResult.totalFileCount,
         nodes: stats.nodes,

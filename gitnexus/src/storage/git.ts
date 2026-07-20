@@ -100,6 +100,63 @@ export const getRemoteUrl = (repoPath: string): string | undefined => {
 };
 
 /**
+ * Normalize a Git remote for repository identity comparisons.
+ *
+ * GitHub repository coordinates are case-insensitive and the common SSH,
+ * HTTPS, and git transports all address the same logical repository. Collapse
+ * those forms to `github.com/<owner>/<repo>` after removing credentials,
+ * transport, trailing slashes, and a `.git` suffix. Other hosts keep their
+ * transport and path case because self-hosted forges may assign different
+ * semantics to either one.
+ *
+ * Local filesystem and `file:` remotes deliberately return `undefined`.
+ * They are machine-local identities and remain path-scoped rather than being
+ * treated as fleet-safe canonical repository identifiers.
+ */
+export const normalizeRepositoryRemote = (
+  remoteUrl: string | null | undefined,
+): string | undefined => {
+  const raw = remoteUrl?.trim();
+  if (!raw) return undefined;
+
+  let protocol: string;
+  let host: string;
+  let port = '';
+  let repoPath: string;
+
+  // SCP-like SSH syntax (`git@github.com:owner/repo.git`) is not accepted by
+  // WHATWG URL, so recognize it before the URL branch. A Windows drive path is
+  // excluded explicitly: `C:\repo` is a local identity, not an SSH host.
+  const scp = raw.match(/^(?:[^@/\\\s]+@)?([^:/\\\s]+):(.+)$/);
+  if (scp && !raw.includes('://') && !/^[a-zA-Z]:[\\/]/.test(raw)) {
+    protocol = 'ssh';
+    host = scp[1]!.toLowerCase();
+    repoPath = scp[2]!;
+  } else {
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      return undefined;
+    }
+    if (parsed.protocol === 'file:' || !parsed.hostname) return undefined;
+    protocol = parsed.protocol.replace(/:$/, '').toLowerCase();
+    host = parsed.hostname.toLowerCase();
+    port = parsed.port;
+    repoPath = parsed.pathname;
+  }
+
+  repoPath = repoPath.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '');
+  if (!repoPath) return undefined;
+
+  if (host === 'github.com') {
+    return `github.com/${repoPath.toLowerCase()}`;
+  }
+
+  return `${protocol}://${host}${port ? `:${port}` : ''}/${repoPath}`;
+};
+
+/**
  * Find the git repository root from any path inside the repo
  */
 export const getGitRoot = (fromPath: string): string | null => {

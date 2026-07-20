@@ -24,6 +24,11 @@ interface ResolvedRepository {
   pathKey: string;
 }
 
+/** Minimal read-only surface needed by the production policy resolver. */
+export interface RepositoryPolicyRegistryBackend {
+  listRepos(): Promise<RepoListing[]>;
+}
+
 export type McpRepositoryPolicyFailureReason =
   | 'invalid'
   | 'ambiguous'
@@ -77,7 +82,7 @@ function parseRepositoryPolicy(env: NodeJS.ProcessEnv): RawRepositoryPolicy {
       .map((entry) => entry.trim())
       .filter(Boolean);
     if (allowed.length === 0) {
-      throw new McpRepositoryPolicyConfigurationError(allowedRaw.key, 'blank');
+      throw new McpRepositoryPolicyConfigurationError(allowedRaw.key, 'blank', 1);
     }
   }
 
@@ -85,7 +90,7 @@ function parseRepositoryPolicy(env: NodeJS.ProcessEnv): RawRepositoryPolicy {
   if (defaultRaw) {
     defaultRepo = defaultRaw.value.trim();
     if (!defaultRepo) {
-      throw new McpRepositoryPolicyConfigurationError(defaultRaw.key, 'blank');
+      throw new McpRepositoryPolicyConfigurationError(defaultRaw.key, 'blank', 1);
     }
   }
 
@@ -382,7 +387,7 @@ export function mcpRepositoryPolicyConfigured(env: NodeJS.ProcessEnv = process.e
 }
 
 export async function createMcpRepositoryPolicy(
-  backend: LocalBackend,
+  backend: RepositoryPolicyRegistryBackend,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<McpRepositoryPolicy> {
   const raw = parseRepositoryPolicy(env);
@@ -420,6 +425,7 @@ export async function createMcpRepositoryPolicy(
       throw new McpRepositoryPolicyConfigurationError(
         raw.defaultKey ?? CANONICAL_DEFAULT,
         result.reason ?? 'invalid',
+        1,
       );
     }
     defaultRepo = result.repo;
@@ -430,8 +436,53 @@ export async function createMcpRepositoryPolicy(
     throw new McpRepositoryPolicyConfigurationError(
       raw.defaultKey ?? CANONICAL_DEFAULT,
       'default_outside_allowlist',
+      1,
     );
   }
 
   return new McpRepositoryPolicy(registry, allowed, defaultRepo);
+}
+
+export type McpRepositoryPolicyPreflightFailureClass =
+  | 'invalid'
+  | 'ambiguous'
+  | 'default-outside-allowlist';
+
+export type McpRepositoryPolicyPreflightResult =
+  | { valid: true }
+  | {
+      valid: false;
+      environmentKey: string;
+      entryPosition: number;
+      failureClass: McpRepositoryPolicyPreflightFailureClass;
+    };
+
+/**
+ * Validate MCP repository policy with the exact production parser/resolver,
+ * without constructing or binding an MCP server. The failure result contains
+ * only stable operator coordinates; configured values and registry candidates
+ * are deliberately excluded.
+ */
+export async function preflightMcpRepositoryPolicy(
+  backend: RepositoryPolicyRegistryBackend,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<McpRepositoryPolicyPreflightResult> {
+  try {
+    await createMcpRepositoryPolicy(backend, env);
+    return { valid: true };
+  } catch (error) {
+    if (!(error instanceof McpRepositoryPolicyConfigurationError)) throw error;
+    const failureClass: McpRepositoryPolicyPreflightFailureClass =
+      error.reason === 'ambiguous'
+        ? 'ambiguous'
+        : error.reason === 'default_outside_allowlist'
+          ? 'default-outside-allowlist'
+          : 'invalid';
+    return {
+      valid: false,
+      environmentKey: error.key,
+      entryPosition: error.entryPosition ?? 1,
+      failureClass,
+    };
+  }
 }
