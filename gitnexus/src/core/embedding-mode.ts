@@ -36,7 +36,7 @@ export const DEFAULT_EMBEDDING_NODE_LIMIT = 50_000;
 export interface EmbeddingCapDecision {
   /** True when the node-count cap blocks generation for this graph. */
   skipForCap: boolean;
-  /** True when the user explicitly disabled the cap (`--embeddings 0`). */
+  /** True when the cap is disabled explicitly or by the remote-provider default. */
   capDisabled: boolean;
   /** Effective node limit applied (`0` means disabled). */
   nodeLimit: number;
@@ -46,6 +46,7 @@ export interface EmbeddingCapDecision {
  * Decide whether the node-count safety cap blocks embedding generation.
  *
  * - `embeddingsNodeLimit === undefined` → use {@link DEFAULT_EMBEDDING_NODE_LIMIT}
+ *   for local models, but disable the cap for remote HTTP providers
  * - `embeddingsNodeLimit === 0` → cap disabled, generation always proceeds
  * - any positive integer → custom cap (skip if `nodeCount > limit`)
  *
@@ -55,8 +56,9 @@ export interface EmbeddingCapDecision {
 export function deriveEmbeddingCap(
   nodeCount: number,
   embeddingsNodeLimit: number | undefined,
+  remoteHttp = false,
 ): EmbeddingCapDecision {
-  const nodeLimit = embeddingsNodeLimit ?? DEFAULT_EMBEDDING_NODE_LIMIT;
+  const nodeLimit = embeddingsNodeLimit ?? (remoteHttp ? 0 : DEFAULT_EMBEDDING_NODE_LIMIT);
   const capDisabled = nodeLimit === 0;
   const skipForCap = !capDisabled && nodeCount > nodeLimit;
   return { skipForCap, capDisabled, nodeLimit };

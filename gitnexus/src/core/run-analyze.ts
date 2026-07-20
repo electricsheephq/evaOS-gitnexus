@@ -2120,21 +2120,34 @@ const runFullAnalysisImpl = async (
     const stats = await getLbugStats();
     let embeddingSkipped = true;
     let semanticMode: 'vector-index' | 'exact-scan' | undefined;
+    let httpMode = false;
 
     if (shouldGenerateEmbeddings) {
+      const { isHttpMode } = await import('./embeddings/http-client.js');
+      httpMode = isHttpMode();
       const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
         stats.nodes,
         resumeEmbeddingCheckpoint ? 0 : options.embeddingsNodeLimit,
+        httpMode,
       );
       if (!skipForCap) {
         embeddingSkipped = false;
         if (capDisabled && stats.nodes > DEFAULT_EMBEDDING_NODE_LIMIT) {
-          log(
-            `Embedding node-count cap disabled — generating embeddings for ` +
-              `${stats.nodes.toLocaleString()} nodes. Ensure sufficient memory; ` +
-              `the default ${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node ` +
-              `cap exists to prevent OOM.`,
-          );
+          if (httpMode && options.embeddingsNodeLimit === undefined) {
+            log(
+              `Remote embedding endpoint selected — generating embeddings for ` +
+                `${stats.nodes.toLocaleString()} nodes; the ` +
+                `${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node local-model cap ` +
+                `does not apply.`,
+            );
+          } else {
+            log(
+              `Embedding node-count cap disabled — generating embeddings for ` +
+                `${stats.nodes.toLocaleString()} nodes. Ensure sufficient memory; ` +
+                `the default ${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node ` +
+                `local-model cap exists to prevent OOM.`,
+            );
+          }
         }
       } else {
         log(
@@ -2182,8 +2195,6 @@ const runFullAnalysisImpl = async (
     }
 
     if (!embeddingSkipped) {
-      const { isHttpMode } = await import('./embeddings/http-client.js');
-      const httpMode = isHttpMode();
       progress(
         'embeddings',
         90,

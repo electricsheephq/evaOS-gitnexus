@@ -651,6 +651,20 @@ describe('deriveEmbeddingCap', () => {
     expect(d.nodeLimit).toBe(0);
   });
 
+  it('does not apply the local-model default cap to remote HTTP embeddings', () => {
+    const d = deriveEmbeddingCap(1_000_000, undefined, true);
+    expect(d.capDisabled).toBe(true);
+    expect(d.skipForCap).toBe(false);
+    expect(d.nodeLimit).toBe(0);
+  });
+
+  it('still honors an explicit custom cap for remote HTTP embeddings', () => {
+    const d = deriveEmbeddingCap(100_001, 100_000, true);
+    expect(d.capDisabled).toBe(false);
+    expect(d.skipForCap).toBe(true);
+    expect(d.nodeLimit).toBe(100_000);
+  });
+
   it('honors a custom positive cap', () => {
     expect(deriveEmbeddingCap(99_999, 100_000).skipForCap).toBe(false);
     expect(deriveEmbeddingCap(100_001, 100_000).skipForCap).toBe(true);
