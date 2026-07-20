@@ -67,9 +67,7 @@ export interface RegistryEntryDoctorReport {
   name: string;
   path?: string;
   storagePath?: string;
-  identity:
-    | { kind: 'remote'; normalizedRemote: string }
-    | { kind: 'local-path' };
+  identity: { kind: 'remote'; normalizedRemote: string } | { kind: 'local-path' };
   storage:
     | { status: 'safe' }
     | {
@@ -488,9 +486,7 @@ const inspectEntry = async (
   let capabilities = unavailableCapabilities();
   if (availableCounts) {
     try {
-      capabilities = liveCapabilities(
-        await (options.capabilityProbe ?? probeDoctorPool)(lbugPath),
-      );
+      capabilities = liveCapabilities(await (options.capabilityProbe ?? probeDoctorPool)(lbugPath));
     } catch {
       capabilities = unavailableCapabilities();
     }

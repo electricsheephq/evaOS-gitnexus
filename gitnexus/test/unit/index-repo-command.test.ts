@@ -185,9 +185,7 @@ describe('indexCommand', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     mockRegisterRepo.mockRejectedValueOnce(
       Object.assign(
-        new Error(
-          'repository_remote_collision: canonical top-level index is at "/canonical/repo"',
-        ),
+        new Error('repository_remote_collision: canonical top-level index is at "/canonical/repo"'),
         { code: 'repository_remote_collision', canonicalPath: '/canonical/repo' },
       ),
     );
