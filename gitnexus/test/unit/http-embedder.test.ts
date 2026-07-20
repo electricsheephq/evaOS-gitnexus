@@ -173,6 +173,29 @@ describe('HTTP embedding backend', () => {
       expect(result.length).toBe(2048);
     });
 
+    it('uses output_dimension for a fully qualified Voyage hostname', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'https://api.voyageai.com./v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'voyage-code-3';
+      process.env.GITNEXUS_EMBEDDING_API_KEY = 'test-key';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '2048';
+
+      const vec2048 = Array.from({ length: 2048 }, (_, i) => i / 2048);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          ok: true,
+          json: async () => ({ data: [{ embedding: vec2048 }] }),
+        }),
+      );
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      await embedText('test text');
+
+      const body = JSON.parse((fetch as any).mock.calls[0][1].body);
+      expect(body.output_dimension).toBe(2048);
+      expect(body.dimensions).toBeUndefined();
+    });
+
     it('does not treat a voyageai.com lookalike host as Voyage', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'https://voyageai.com.example/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';

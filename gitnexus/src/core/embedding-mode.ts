@@ -43,6 +43,18 @@ export interface EmbeddingCapDecision {
 }
 
 /**
+ * Preserve an explicit operator cap while letting an interrupted run resume
+ * when no cap was supplied. Provider-specific defaults are resolved later by
+ * {@link deriveEmbeddingCap}.
+ */
+export function resolveEmbeddingNodeLimit(
+  embeddingsNodeLimit: number | undefined,
+  resumeEmbeddingCheckpoint: boolean,
+): number | undefined {
+  return embeddingsNodeLimit ?? (resumeEmbeddingCheckpoint ? 0 : undefined);
+}
+
+/**
  * Decide whether the node-count safety cap blocks embedding generation.
  *
  * - `embeddingsNodeLimit === undefined` → use {@link DEFAULT_EMBEDDING_NODE_LIMIT}

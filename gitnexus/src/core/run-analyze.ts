@@ -372,6 +372,7 @@ export type { EmbeddingMode } from './embedding-mode.js';
 import {
   deriveEmbeddingMode as _deriveEmbeddingMode,
   deriveEmbeddingCap,
+  resolveEmbeddingNodeLimit,
   DEFAULT_EMBEDDING_NODE_LIMIT,
 } from './embedding-mode.js';
 
@@ -2127,7 +2128,7 @@ const runFullAnalysisImpl = async (
       httpMode = isHttpMode();
       const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
         stats.nodes,
-        resumeEmbeddingCheckpoint ? 0 : options.embeddingsNodeLimit,
+        resolveEmbeddingNodeLimit(options.embeddingsNodeLimit, resumeEmbeddingCheckpoint),
         httpMode,
       );
       if (!skipForCap) {

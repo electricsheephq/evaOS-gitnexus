@@ -5,6 +5,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   deriveEmbeddingMode,
   deriveEmbeddingCap,
+  resolveEmbeddingNodeLimit,
   DEFAULT_EMBEDDING_NODE_LIMIT,
 } from '../../src/core/embedding-mode.js';
 import {
@@ -626,6 +627,12 @@ describe('deriveEmbeddingMode', () => {
 });
 
 describe('deriveEmbeddingCap', () => {
+  it('preserves an explicit cap while resuming a checkpoint', () => {
+    expect(resolveEmbeddingNodeLimit(100_000, true)).toBe(100_000);
+    expect(resolveEmbeddingNodeLimit(undefined, true)).toBe(0);
+    expect(resolveEmbeddingNodeLimit(undefined, false)).toBeUndefined();
+  });
+
   it('uses the default 50K cap when limit is undefined', () => {
     const d = deriveEmbeddingCap(10_000, undefined);
     expect(d.nodeLimit).toBe(DEFAULT_EMBEDDING_NODE_LIMIT);

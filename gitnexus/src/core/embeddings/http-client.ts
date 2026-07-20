@@ -308,7 +308,7 @@ const httpEmbedBatch = async (
   if (dimensions !== undefined) {
     let hostname = '';
     try {
-      hostname = new URL(url).hostname.toLowerCase();
+      hostname = new URL(url).hostname.toLowerCase().replace(/\.$/, '');
     } catch {
       // Fetch below owns malformed-URL reporting.
     }
