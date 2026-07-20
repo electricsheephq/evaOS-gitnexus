@@ -51,13 +51,14 @@ interface SpawnedServer {
  * a valid header→body window is captured as "stray" so the test can
  * assert the stream is clean.
  */
-function spawnMcpServer(): SpawnedServer {
+function spawnMcpServer(envOverrides: NodeJS.ProcessEnv = {}): SpawnedServer {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     // Avoid adding indexed repos noise to the test.
     GITNEXUS_HOME: path.join(REPO_ROOT, 'test', 'integration', 'mcp', '.tmp-home'),
     // Be deterministic across machines.
     NODE_OPTIONS: '',
+    ...envOverrides,
   };
 
   const proc = spawn(process.execPath, [DIST_CLI, 'mcp'], {
@@ -315,6 +316,77 @@ describe('MCP server end-to-end startup', () => {
           `Stdout contained ${stray.length} bytes outside JSON-RPC framing — protocol corruption regression.\nStray bytes (utf8): ${JSON.stringify(stray.toString('utf8'))}\nStderr from server:\n${stderr}`,
         );
       }
+    } finally {
+      await server.close();
+    }
+  }, 60_000);
+
+  it('keeps stdio alive and reports a sanitized blocked mode when repository policy is invalid', async () => {
+    if (!fs.existsSync(DIST_CLI)) {
+      throw new Error(
+        `dist/cli/index.js missing — run \`npm run build\` first (or use \`npm run test:integration\` which builds via pretest:integration).`,
+      );
+    }
+
+    const configuredValue = 'sensitive-missing-repository';
+    const server = spawnMcpServer({
+      GITNEXUS_MCP_ALLOWED_REPOS: configuredValue,
+      GITNEXUS_MCP_DEFAULT_REPO: undefined,
+      OPENCLAW_CODE_INDEX_ALLOWED_REPOS: undefined,
+      OPENCLAW_CODE_INDEX_DEFAULT_REPO: undefined,
+    });
+
+    try {
+      server.send({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 'gitnexus-blocked-policy-test', version: '0.0.0' },
+        },
+      });
+      const initResponse = (await server.nextMessage()) as {
+        id: number;
+        result?: { serverInfo: { name: string } };
+        error?: unknown;
+      };
+      expect(initResponse.id).toBe(1);
+      expect(initResponse.error).toBeUndefined();
+      expect(initResponse.result?.serverInfo.name).toMatch(/gitnexus/i);
+
+      server.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+      server.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+      const toolsResponse = (await server.nextMessage()) as {
+        id: number;
+        result?: { tools: Array<{ name: string; description?: string }> };
+      };
+      expect(toolsResponse.id).toBe(2);
+      expect(toolsResponse.result?.tools.length).toBeGreaterThan(0);
+      for (const tool of toolsResponse.result?.tools ?? []) {
+        expect(tool.description).toMatch(/BLOCKED.*invalid.*GITNEXUS_MCP_ALLOWED_REPOS entry 1/is);
+        expect(tool.description).not.toContain(configuredValue);
+      }
+
+      server.send({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: { name: 'list_repos', arguments: {} },
+      });
+      const callResponse = (await server.nextMessage()) as {
+        id: number;
+        result?: { content?: Array<{ type: string; text: string }>; isError?: boolean };
+      };
+      expect(callResponse.id).toBe(3);
+      expect(callResponse.result?.isError).toBe(true);
+      expect(callResponse.result?.content?.[0]?.text).toMatch(
+        /invalid.*GITNEXUS_MCP_ALLOWED_REPOS entry 1/is,
+      );
+      expect(callResponse.result?.content?.[0]?.text).not.toContain(configuredValue);
+      expect(server.proc.exitCode).toBeNull();
+      expect(server.strayStdoutBytes()).toHaveLength(0);
     } finally {
       await server.close();
     }

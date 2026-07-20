@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { LocalBackend, RepoListing } from '../../src/mcp/local/local-backend.js';
-import { createMcpRepositoryPolicy } from '../../src/mcp/repository-policy.js';
+import {
+  createMcpRepositoryPolicy,
+  McpRepositoryPolicy,
+  McpRepositoryPolicyConfigurationError,
+} from '../../src/mcp/repository-policy.js';
 import { createMCPServer } from '../../src/mcp/server.js';
 import { createStreamableHttpHandler, startMcpHttpServer } from '../../src/mcp/http-transport.js';
 
@@ -150,6 +154,7 @@ describe('MCP repository policy', () => {
   it.each([
     [{ GITNEXUS_MCP_ALLOWED_REPOS: 'Missing' }, 'invalid'],
     [{ GITNEXUS_MCP_ALLOWED_REPOS: 'Duplicate' }, 'ambiguous'],
+    [{ GITNEXUS_MCP_DEFAULT_REPO: 'Missing' }, 'invalid'],
     [{ GITNEXUS_MCP_DEFAULT_REPO: 'Duplicate' }, 'ambiguous'],
   ])('fails startup with a sanitized %s configuration error', async (env, reason) => {
     const backend = createBackend();
@@ -163,6 +168,64 @@ describe('MCP repository policy', () => {
     expect(message).not.toContain('/repos/');
     expect(message).not.toContain('Alpha');
     expect(message).not.toContain('Beta');
+  });
+
+  it('keeps MCP discovery agent-visible while a failed policy remains fail-closed', async () => {
+    const backend = createBackend();
+    let configurationError: McpRepositoryPolicyConfigurationError | undefined;
+    try {
+      await createMcpRepositoryPolicy(backend, {
+        GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Duplicate',
+      });
+    } catch (error) {
+      if (error instanceof McpRepositoryPolicyConfigurationError) configurationError = error;
+    }
+
+    expect(configurationError).toMatchObject({
+      key: 'GITNEXUS_MCP_ALLOWED_REPOS',
+      reason: 'ambiguous',
+      entryPosition: 2,
+    });
+    vi.clearAllMocks();
+
+    const policy = McpRepositoryPolicy.blocked(configurationError!);
+    const server = createMCPServer(backend, { repositoryPolicy: policy });
+    const client = new Client({ name: 'blocked-policy-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const tools = await client.listTools();
+      expect(tools.tools.length).toBeGreaterThan(0);
+      for (const tool of tools.tools) {
+        expect(tool.description).toMatch(
+          /BLOCKED.*ambiguous.*GITNEXUS_MCP_ALLOWED_REPOS entry 2/is,
+        );
+        expect(tool.description).not.toContain('/repos/');
+        expect(tool.description).not.toContain('Duplicate');
+      }
+
+      const call = await client.callTool({ name: 'list_repos', arguments: {} });
+      expect(call.isError).toBe(true);
+      const callText = (call.content[0] as { text: string }).text;
+      expect(callText).toMatch(/ambiguous.*GITNEXUS_MCP_ALLOWED_REPOS entry 2/is);
+      expect(callText).not.toContain('/repos/');
+      expect(callText).not.toContain('Duplicate');
+
+      const resource = await client.readResource({ uri: 'gitnexus://repos' });
+      const resourceText = (resource.contents[0] as { text: string }).text;
+      expect(resourceText).toMatch(/ambiguous.*GITNEXUS_MCP_ALLOWED_REPOS entry 2/is);
+      expect(resourceText).not.toContain('/repos/');
+      expect(resourceText).not.toContain('Duplicate');
+
+      expect(backend.listRepos).not.toHaveBeenCalled();
+      expect(backend.callTool).not.toHaveBeenCalled();
+      expect(backend.resolveRepo).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 
   it('allows a duplicate-name repository when configured by its unique path', async () => {
