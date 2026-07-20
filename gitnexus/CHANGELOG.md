@@ -18,6 +18,7 @@ All notable changes to GitNexus will be documented in this file.
 - **Invalid stdio MCP repository policy is fail-closed and agent-visible** while tool discovery remains available; HTTP policy remains fail-fast and no malformed allowlist can fall back to unrestricted access (#129)
 - **GitHub SSH and HTTPS remotes share one canonical identity**, and concurrent or duplicate top-level registration is refused before index storage is created (#133, #140)
 - **Voyage 2,048-dimensional requests use the provider's `output_dimension` field** while OpenAI-compatible endpoints retain `dimensions` (#141, #142)
+- **Non-Git staged embedding checkpoints retain the current schema identity**, so restart resumes bounded pending work instead of forcing a pre-versioning rebuild (#143, #144)
 
 ### Changed
 
