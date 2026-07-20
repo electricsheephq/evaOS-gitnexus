@@ -1,0 +1,580 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { normalizeRepositoryRemote } from '../storage/git.js';
+import {
+  assertSafeStoragePath,
+  getStoragePaths,
+  loadMeta,
+  readRegistry,
+  type RegistryEntry,
+  type RepoMeta,
+} from '../storage/repo-manager.js';
+import {
+  EXPECTED_POOL_CONNECTIONS,
+  probeDoctorPool,
+  type DoctorPoolProbe,
+} from './doctor-pool-probe.js';
+
+export interface RegistryCounts {
+  nodes: number | null;
+  edges: number | null;
+  embeddings: number | null;
+}
+
+export interface RegistryDatabaseCounts {
+  nodes: number;
+  edges: number;
+  embeddings: number;
+}
+
+export type RegistryDatabaseProbe = (lbugPath: string) => Promise<RegistryDatabaseCounts>;
+
+export interface RegistryCapabilityReport {
+  source: 'active-probe' | 'unavailable';
+  graph: string | null;
+  fts: string | null;
+  vectorSearch: string | null;
+}
+
+/**
+ * Typed integration seam for the production non-recovering read-pool probe.
+ */
+export type RegistryCapabilityProbe = (lbugPath: string) => Promise<DoctorPoolProbe>;
+
+interface FileState {
+  status: 'absent' | 'present' | 'inaccessible';
+  bytes: number | null;
+  regularFile: boolean;
+  directory: boolean;
+  symbolicLink: boolean;
+}
+
+export interface RegistrySidecarReport {
+  state:
+    | 'clean'
+    | 'wal-with-shadow'
+    | 'orphan-wal'
+    | 'orphan-shadow'
+    | 'checkpoint-present'
+    | 'lock-present'
+    | 'inaccessible'
+    | 'not-inspected';
+  wal: FileState;
+  shadow: FileState;
+  checkpoint: FileState;
+  lock: FileState;
+  parkedCount: number;
+}
+
+export interface RegistryEntryDoctorReport {
+  entryPosition: number;
+  name: string;
+  path?: string;
+  storagePath?: string;
+  identity: { kind: 'remote'; normalizedRemote: string } | { kind: 'local-path' };
+  storage:
+    | { status: 'safe' }
+    | {
+        status: 'unsafe';
+        reason:
+          | 'path-mismatch'
+          | 'storage-symbolic-link'
+          | 'storage-not-directory'
+          | 'storage-inaccessible';
+      };
+  registry: { counts: RegistryCounts };
+  metadata: { status: 'available' | 'missing' | 'not-read'; counts: RegistryCounts };
+  database:
+    | { status: 'available'; counts: RegistryDatabaseCounts }
+    | {
+        status: 'skipped' | 'unavailable';
+        reason:
+          | 'unsafe-storage-path'
+          | 'database-missing'
+          | 'database-not-regular'
+          | 'recovery-state-present'
+          | 'dirty-metadata'
+          | 'database-locked'
+          | 'read-only-open-failed';
+      };
+  countComparison: {
+    status: 'match' | 'mismatch' | 'partial' | 'unavailable';
+    mismatched: Array<keyof RegistryCounts>;
+    registryVsMetadata: Array<keyof RegistryCounts>;
+    metadataVsDatabase: Array<keyof RegistryCounts>;
+    registryVsDatabase: Array<keyof RegistryCounts>;
+  };
+  sidecars: RegistrySidecarReport;
+  capabilities: RegistryCapabilityReport;
+}
+
+export interface RegistryDoctorReport {
+  mode: 'registry';
+  readOnly: true;
+  pathsShown: boolean;
+  summary: {
+    entries: number;
+    remoteIdentities: number;
+    localOnlyEntries: number;
+    remoteCollisionGroups: number;
+    aliasCollisionGroups: number;
+    countMismatches: number;
+    recoveryStateEntries: number;
+    lockedEntries: number;
+    unsafeStorageEntries: number;
+  };
+  collisions: {
+    remotes: Array<{
+      normalizedRemote: string;
+      canonicalEntryPosition: number;
+      entryPositions: number[];
+      paths?: string[];
+    }>;
+    aliases: Array<{
+      alias: string;
+      entryPositions: number[];
+      paths?: string[];
+    }>;
+  };
+  entries: RegistryEntryDoctorReport[];
+}
+
+export interface RegistryDoctorOptions {
+  showPaths?: boolean;
+  entries?: readonly RegistryEntry[];
+  databaseProbe?: RegistryDatabaseProbe;
+  capabilityProbe?: RegistryCapabilityProbe;
+}
+
+const emptyCounts = (): RegistryCounts => ({ nodes: null, edges: null, embeddings: null });
+
+const finiteCount = (value: unknown): number | null => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null;
+};
+
+const statsCounts = (stats: RepoMeta['stats'] | undefined): RegistryCounts => ({
+  nodes: finiteCount(stats?.nodes),
+  edges: finiteCount(stats?.edges),
+  embeddings: finiteCount(stats?.embeddings),
+});
+
+const metadataCounts = (meta: RepoMeta | null): RegistryCounts =>
+  meta ? statsCounts(meta.stats) : emptyCounts();
+
+const fileState = async (filePath: string): Promise<FileState> => {
+  try {
+    const stat = await fs.lstat(filePath);
+    return {
+      status: 'present',
+      bytes: stat.size,
+      regularFile: stat.isFile(),
+      directory: stat.isDirectory(),
+      symbolicLink: stat.isSymbolicLink(),
+    };
+  } catch (error) {
+    const missing = (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+    return {
+      status: missing ? 'absent' : 'inaccessible',
+      bytes: null,
+      regularFile: false,
+      directory: false,
+      symbolicLink: false,
+    };
+  }
+};
+
+const uninspectedSidecars = (): RegistrySidecarReport => {
+  const absent: FileState = {
+    status: 'absent',
+    bytes: null,
+    regularFile: false,
+    directory: false,
+    symbolicLink: false,
+  };
+  return {
+    state: 'not-inspected',
+    wal: { ...absent },
+    shadow: { ...absent },
+    checkpoint: { ...absent },
+    lock: { ...absent },
+    parkedCount: 0,
+  };
+};
+
+const inspectSidecars = async (lbugPath: string): Promise<RegistrySidecarReport> => {
+  const [wal, shadow, checkpoint, lock] = await Promise.all([
+    fileState(`${lbugPath}.wal`),
+    fileState(`${lbugPath}.shadow`),
+    fileState(`${lbugPath}.wal.checkpoint`),
+    fileState(`${lbugPath}.lock`),
+  ]);
+  let parkedCount = 0;
+  try {
+    const base = path.basename(lbugPath);
+    parkedCount = (await fs.readdir(path.dirname(lbugPath))).filter(
+      (name) =>
+        name.startsWith(`${base}.wal.missing-shadow.`) ||
+        name.startsWith(`${base}.wal.dirty-recovery`) ||
+        name.startsWith(`${base}.shadow.dirty-recovery`),
+    ).length;
+  } catch {
+    // The individual sidecar states already record inaccessible paths.
+  }
+
+  const inaccessible = [wal, shadow, checkpoint, lock].some(
+    (item) => item.status === 'inaccessible',
+  );
+  const walPresent = wal.status === 'present';
+  const shadowPresent = shadow.status === 'present';
+  const state: RegistrySidecarReport['state'] = inaccessible
+    ? 'inaccessible'
+    : lock.status === 'present'
+      ? 'lock-present'
+      : checkpoint.status === 'present'
+        ? 'checkpoint-present'
+        : walPresent && shadowPresent
+          ? 'wal-with-shadow'
+          : walPresent
+            ? 'orphan-wal'
+            : shadowPresent
+              ? 'orphan-shadow'
+              : 'clean';
+  return { state, wal, shadow, checkpoint, lock, parkedCount };
+};
+
+interface QueryResultLike {
+  getAll(): Promise<Array<Record<string, unknown> | unknown[]>>;
+  close(): void | Promise<void>;
+}
+
+interface QueryConnectionLike {
+  query(cypher: string): Promise<QueryResultLike | QueryResultLike[]>;
+}
+
+const queryCount = async (connection: QueryConnectionLike, cypher: string): Promise<number> => {
+  const raw = await connection.query(cypher);
+  const results = Array.isArray(raw) ? raw : [raw];
+  try {
+    const rows = results[0] ? await results[0].getAll() : [];
+    const first = rows[0];
+    const value = Array.isArray(first) ? first[0] : first?.cnt;
+    return finiteCount(value) ?? 0;
+  } finally {
+    await Promise.all(
+      results.map(async (result) => {
+        try {
+          await result.close();
+        } catch {
+          // Closing a completed read result is best-effort; the connection is
+          // still closed by the outer finally block.
+        }
+      }),
+    );
+  }
+};
+
+/** Open a clean index in LadybugDB's read-only mode and issue count queries. */
+export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPath) => {
+  const [{ default: lbug }, lbugConfig, schema] = await Promise.all([
+    import('@ladybugdb/core'),
+    import('../core/lbug/lbug-config.js'),
+    import('../core/lbug/schema.js'),
+  ]);
+  const handle = await lbugConfig.openLbugConnection(lbug, lbugPath, {
+    readOnly: true,
+    throwOnWalReplayFailure: true,
+  });
+  const connection = handle.conn as unknown as QueryConnectionLike;
+  const tableName = (name: string): string => `\`${name.replace(/`/g, '``')}\``;
+  try {
+    let nodes = 0;
+    for (const table of schema.NODE_TABLES) {
+      try {
+        nodes += await queryCount(
+          connection,
+          `MATCH (n:${tableName(table)}) RETURN count(n) AS cnt`,
+        );
+      } catch (error) {
+        if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
+      }
+    }
+    let edges = 0;
+    try {
+      edges = await queryCount(
+        connection,
+        `MATCH ()-[r:${tableName(schema.REL_TABLE_NAME)}]->() RETURN count(r) AS cnt`,
+      );
+    } catch (error) {
+      if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
+    }
+    let embeddings = 0;
+    try {
+      embeddings = await queryCount(
+        connection,
+        `MATCH (e:${tableName(schema.EMBEDDING_TABLE_NAME)}) RETURN count(e) AS cnt`,
+      );
+    } catch (error) {
+      if (lbugConfig.classifyDeleteAllError(error) !== 'benign-missing-table') throw error;
+    }
+    return { nodes, edges, embeddings };
+  } finally {
+    await lbugConfig.closeLbugConnection(handle);
+  }
+};
+
+const unavailableCapabilities = (): RegistryCapabilityReport => ({
+  source: 'unavailable',
+  graph: null,
+  fts: null,
+  vectorSearch: null,
+});
+
+const liveCapabilities = (probe: DoctorPoolProbe): RegistryCapabilityReport => {
+  if (
+    probe.reason ||
+    probe.connectionCount !== EXPECTED_POOL_CONNECTIONS ||
+    probe.exercisedConnections !== EXPECTED_POOL_CONNECTIONS
+  ) {
+    return unavailableCapabilities();
+  }
+  return {
+    source: 'active-probe',
+    graph: 'available',
+    fts: probe.fts ? 'available' : 'unavailable',
+    vectorSearch: probe.vector ? 'vector-index' : 'unavailable',
+  };
+};
+
+const differingCounts = (
+  left: RegistryCounts,
+  right: RegistryCounts,
+): { compared: number; mismatched: Array<keyof RegistryCounts> } => {
+  const comparable = (Object.keys(left) as Array<keyof RegistryCounts>).filter(
+    (key) => left[key] !== null && right[key] !== null,
+  );
+  return {
+    compared: comparable.length,
+    mismatched: comparable.filter((key) => left[key] !== right[key]),
+  };
+};
+
+const compareCounts = (
+  registry: RegistryCounts,
+  metadata: RegistryCounts,
+  database: RegistryDatabaseCounts | null,
+): RegistryEntryDoctorReport['countComparison'] => {
+  const databaseCounts: RegistryCounts = database ?? emptyCounts();
+  const registryVsMetadata = differingCounts(registry, metadata);
+  const metadataVsDatabase = differingCounts(metadata, databaseCounts);
+  const registryVsDatabase = differingCounts(registry, databaseCounts);
+  const mismatched = [
+    ...new Set<keyof RegistryCounts>([
+      ...registryVsMetadata.mismatched,
+      ...metadataVsDatabase.mismatched,
+      ...registryVsDatabase.mismatched,
+    ]),
+  ];
+  const compared =
+    registryVsMetadata.compared + metadataVsDatabase.compared + registryVsDatabase.compared;
+  const complete =
+    database !== null &&
+    [...Object.values(registry), ...Object.values(metadata)].every((value) => value !== null);
+  return {
+    status:
+      compared === 0
+        ? 'unavailable'
+        : mismatched.length > 0
+          ? 'mismatch'
+          : complete
+            ? 'match'
+            : 'partial',
+    mismatched,
+    registryVsMetadata: registryVsMetadata.mismatched,
+    metadataVsDatabase: metadataVsDatabase.mismatched,
+    registryVsDatabase: registryVsDatabase.mismatched,
+  };
+};
+
+const inspectEntry = async (
+  entry: RegistryEntry,
+  entryPosition: number,
+  options: RegistryDoctorOptions,
+): Promise<RegistryEntryDoctorReport> => {
+  const normalizedRemote = normalizeRepositoryRemote(entry.remoteUrl);
+  const identity: RegistryEntryDoctorReport['identity'] = normalizedRemote
+    ? { kind: 'remote', normalizedRemote }
+    : { kind: 'local-path' };
+  const base = {
+    entryPosition,
+    name:
+      !options.showPaths && (path.isAbsolute(entry.name) || path.win32.isAbsolute(entry.name))
+        ? '<path-like-alias>'
+        : entry.name,
+    ...(options.showPaths ? { path: entry.path, storagePath: entry.storagePath } : {}),
+    identity,
+    registry: { counts: statsCounts(entry.stats) },
+  };
+  const unavailableComparison = compareCounts(base.registry.counts, emptyCounts(), null);
+
+  try {
+    assertSafeStoragePath(entry);
+  } catch {
+    return {
+      ...base,
+      storage: { status: 'unsafe', reason: 'path-mismatch' },
+      metadata: { status: 'not-read', counts: emptyCounts() },
+      database: { status: 'skipped', reason: 'unsafe-storage-path' },
+      countComparison: unavailableComparison,
+      sidecars: uninspectedSidecars(),
+      capabilities: unavailableCapabilities(),
+    };
+  }
+
+  const storageState = await fileState(entry.storagePath);
+  if (
+    storageState.status === 'inaccessible' ||
+    (storageState.status === 'present' && (storageState.symbolicLink || !storageState.directory))
+  ) {
+    const reason =
+      storageState.status === 'inaccessible'
+        ? 'storage-inaccessible'
+        : storageState.symbolicLink
+          ? 'storage-symbolic-link'
+          : 'storage-not-directory';
+    return {
+      ...base,
+      storage: { status: 'unsafe', reason },
+      metadata: { status: 'not-read', counts: emptyCounts() },
+      database: { status: 'skipped', reason: 'unsafe-storage-path' },
+      countComparison: unavailableComparison,
+      sidecars: uninspectedSidecars(),
+      capabilities: unavailableCapabilities(),
+    };
+  }
+
+  const { lbugPath } = getStoragePaths(entry.path);
+  const [meta, databaseFile, sidecars] = await Promise.all([
+    loadMeta(entry.storagePath),
+    fileState(lbugPath),
+    inspectSidecars(lbugPath),
+  ]);
+  const counts = metadataCounts(meta);
+
+  let database: RegistryEntryDoctorReport['database'];
+  let availableCounts: RegistryDatabaseCounts | null = null;
+  if (databaseFile.status === 'absent') {
+    database = { status: 'skipped', reason: 'database-missing' };
+  } else if (databaseFile.status === 'inaccessible') {
+    database = { status: 'skipped', reason: 'read-only-open-failed' };
+  } else if (!databaseFile.regularFile || databaseFile.symbolicLink) {
+    database = { status: 'skipped', reason: 'database-not-regular' };
+  } else if (meta?.incrementalInProgress) {
+    database = { status: 'skipped', reason: 'dirty-metadata' };
+  } else if (sidecars.lock.status === 'present') {
+    database = { status: 'skipped', reason: 'database-locked' };
+  } else if (sidecars.state !== 'clean') {
+    database = { status: 'skipped', reason: 'recovery-state-present' };
+  } else {
+    try {
+      availableCounts = await (options.databaseProbe ?? probeRegistryDatabaseCounts)(lbugPath);
+      database = { status: 'available', counts: availableCounts };
+    } catch (error) {
+      const message = error instanceof Error ? error.message.toLowerCase() : String(error);
+      database = {
+        status: 'unavailable',
+        reason:
+          message.includes('lock') || message.includes('busy') || message.includes('already in use')
+            ? 'database-locked'
+            : 'read-only-open-failed',
+      };
+    }
+  }
+
+  let capabilities = unavailableCapabilities();
+  if (availableCounts) {
+    try {
+      capabilities = liveCapabilities(await (options.capabilityProbe ?? probeDoctorPool)(lbugPath));
+    } catch {
+      capabilities = unavailableCapabilities();
+    }
+  }
+
+  return {
+    ...base,
+    storage: { status: 'safe' },
+    metadata: { status: meta ? 'available' : 'missing', counts },
+    database,
+    countComparison: compareCounts(base.registry.counts, counts, availableCounts),
+    sidecars,
+    capabilities,
+  };
+};
+
+export async function buildRegistryDoctorReport(
+  options: RegistryDoctorOptions = {},
+): Promise<RegistryDoctorReport> {
+  const entries = options.entries ? [...options.entries] : await readRegistry();
+  const indexed = entries.map((entry, index) => ({ entry, entryPosition: index + 1 }));
+
+  const remoteGroups = new Map<string, typeof indexed>();
+  const aliasGroups = new Map<string, typeof indexed>();
+  for (const item of indexed) {
+    const remote = normalizeRepositoryRemote(item.entry.remoteUrl);
+    if (remote) remoteGroups.set(remote, [...(remoteGroups.get(remote) ?? []), item]);
+    const alias = item.entry.name.toLowerCase();
+    aliasGroups.set(alias, [...(aliasGroups.get(alias) ?? []), item]);
+  }
+
+  const remotes = [...remoteGroups.entries()]
+    .filter(([, items]) => items.length > 1)
+    .map(([normalizedRemote, items]) => ({
+      normalizedRemote,
+      canonicalEntryPosition: items[0]!.entryPosition,
+      entryPositions: items.map((item) => item.entryPosition),
+      ...(options.showPaths ? { paths: items.map((item) => item.entry.path) } : {}),
+    }));
+  const aliases = [...aliasGroups.entries()]
+    .filter(([, items]) => items.length > 1)
+    .map(([alias, items]) => ({
+      alias:
+        !options.showPaths && (path.isAbsolute(alias) || path.win32.isAbsolute(alias))
+          ? '<path-like-alias>'
+          : alias,
+      entryPositions: items.map((item) => item.entryPosition),
+      ...(options.showPaths ? { paths: items.map((item) => item.entry.path) } : {}),
+    }));
+
+  // Open at most one LadybugDB handle at a time. Registry diagnosis is an
+  // operator preflight, not a throughput path, and concurrent read-only opens
+  // across a large fleet would create avoidable native-runtime pressure.
+  const reports: RegistryEntryDoctorReport[] = [];
+  for (const { entry, entryPosition } of indexed) {
+    reports.push(await inspectEntry(entry, entryPosition, options));
+  }
+  const remoteIdentities = reports.filter((report) => report.identity.kind === 'remote').length;
+  return {
+    mode: 'registry',
+    readOnly: true,
+    pathsShown: options.showPaths === true,
+    summary: {
+      entries: reports.length,
+      remoteIdentities,
+      localOnlyEntries: reports.length - remoteIdentities,
+      remoteCollisionGroups: remotes.length,
+      aliasCollisionGroups: aliases.length,
+      countMismatches: reports.filter((report) => report.countComparison.status === 'mismatch')
+        .length,
+      recoveryStateEntries: reports.filter(
+        (report) =>
+          report.sidecars.state !== 'clean' &&
+          report.sidecars.state !== 'lock-present' &&
+          report.sidecars.state !== 'not-inspected',
+      ).length,
+      lockedEntries: reports.filter((report) => report.sidecars.lock.status === 'present').length,
+      unsafeStorageEntries: reports.filter((report) => report.storage.status === 'unsafe').length,
+    },
+    collisions: { remotes, aliases },
+    entries: reports,
+  };
+}

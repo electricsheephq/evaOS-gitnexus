@@ -247,6 +247,10 @@ program
   .command('doctor [path]')
   .description('Show runtime platform capabilities and embedding configuration')
   .option('--recovery-plan', 'Print a read-only interrupted-analysis recovery plan and exit')
+  .option('--mcp-config', 'Validate MCP repository policy without binding or opening an index')
+  .option('--registry', 'Inspect registry identities, metadata, sidecars, and database counts')
+  .option('--json', 'Print machine-readable output (only with --mcp-config or --registry)')
+  .option('--show-paths', 'Reveal absolute registry paths (only with --registry)')
   .action(createLazyAction(() => import('./doctor.js'), 'doctorCommand'));
 
 program

@@ -9,9 +9,9 @@ const poolMocks = vi.hoisted(() => ({
 
 vi.mock('../../src/core/lbug/pool-adapter.js', () => poolMocks);
 
-const { probeDoctorPool } = await import('../../src/cli/doctor.js');
+const { probeDoctorPool } = await import('../../src/cli/doctor-pool-probe.js');
 
-describe('doctor real read-pool probe', () => {
+describe('shared doctor read-pool probe', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     poolMocks.initLbugNonRecovering.mockResolvedValue(undefined);
@@ -41,7 +41,7 @@ describe('doctor real read-pool probe', () => {
     expect(poolMocks.closeLbug).toHaveBeenCalledOnce();
   });
 
-  it('reports aggregate optional-extension failure without losing graph-pool evidence', async () => {
+  it('preserves aggregate optional-extension failures from the complete pool', async () => {
     poolMocks.getPoolCapabilities.mockReturnValue({
       fts: true,
       vector: false,
@@ -53,7 +53,38 @@ describe('doctor real read-pool probe', () => {
       vector: false,
       exercisedConnections: 8,
       connectionCount: 8,
+      reason: null,
     });
+  });
+
+  it('fails closed and closes the pool when fewer than eight connections are exercised', async () => {
+    poolMocks.probePoolConnections.mockResolvedValue(7);
+
+    await expect(probeDoctorPool('/repo/.gitnexus/lbug')).resolves.toMatchObject({
+      fts: false,
+      vector: false,
+      exercisedConnections: 0,
+      connectionCount: 0,
+      reason: expect.stringMatching(/all eight connections/i),
+    });
+    expect(poolMocks.closeLbug).toHaveBeenCalledOnce();
+  });
+
+  it('does not initialize when cleanup support is unavailable', async () => {
+    const closeLbug = poolMocks.closeLbug;
+    Reflect.set(poolMocks, 'closeLbug', undefined);
+    try {
+      await expect(probeDoctorPool('/repo/.gitnexus/lbug')).resolves.toMatchObject({
+        fts: false,
+        vector: false,
+        exercisedConnections: 0,
+        connectionCount: 0,
+        reason: 'non-recovering read-pool capability probe is unavailable',
+      });
+      expect(poolMocks.initLbugNonRecovering).not.toHaveBeenCalled();
+    } finally {
+      Reflect.set(poolMocks, 'closeLbug', closeLbug);
+    }
   });
 
   it('closes the diagnostic pool when non-recovering initialization fails', async () => {
@@ -63,6 +94,7 @@ describe('doctor real read-pool probe', () => {
       fts: false,
       vector: false,
       exercisedConnections: 0,
+      connectionCount: 0,
       reason: 'WAL requires recovery',
     });
     expect(poolMocks.probePoolConnections).not.toHaveBeenCalled();

@@ -1636,6 +1636,23 @@ const analyzeCommandImpl = async (
 
     const msg = err instanceof Error ? err.message : String(err);
 
+    // Canonical remote identity preflight (#133). Key on the stable public
+    // code instead of importing the concrete class so CLI error rendering stays
+    // decoupled from the storage implementation and subprocess serialization.
+    if (
+      err &&
+      typeof err === 'object' &&
+      (err as { code?: unknown }).code === 'repository_remote_collision'
+    ) {
+      const canonicalPath = (err as { canonicalPath?: unknown }).canonicalPath;
+      cliError(`\n  ${msg}\n`, {
+        code: 'repository_remote_collision',
+        ...(typeof canonicalPath === 'string' ? { canonicalPath } : {}),
+      });
+      process.exitCode = 1;
+      return;
+    }
+
     // Registry name-collision from --name (#829) — surface as an
     // actionable error rather than a generic stack-trace.
     if (err instanceof RegistryNameCollisionError) {

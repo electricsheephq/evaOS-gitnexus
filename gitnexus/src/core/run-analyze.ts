@@ -61,6 +61,7 @@ import {
   loadMeta,
   ensureGitNexusIgnored,
   registerRepo,
+  assertCanonicalRepositoryIdentity,
   adoptFlatBranchLabel,
   isReadOnlyFilesystemError,
   isRepoRegistered,
@@ -609,10 +610,13 @@ const runFullAnalysisImpl = async (
   repoPath: string,
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
+  repositoryIdentity: { repoHasGit: boolean; remoteUrl: string | undefined },
 ): Promise<AnalyzeResult> => {
   const log = (msg: string) => callbacks.onLog?.(msg);
   const progress = (phase: string, percent: number, message: string) =>
     callbacks.onProgress(phase, percent, message);
+
+  const { repoHasGit, remoteUrl: repositoryRemoteUrl } = repositoryIdentity;
 
   // Resolve + validate operator-provided FTS config once, before the expensive
   // parse/load phases. A typo fails here in ms; createSearchFTSIndexes reuses
@@ -641,7 +645,6 @@ const runFullAnalysisImpl = async (
   // and are shared across branches (#2106 KTD7).
   const { storagePath } = getStoragePaths(repoPath);
 
-  const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
 
   // ── #2106/#2354: resolve which branch slot this run writes to ─────────
@@ -2207,7 +2210,7 @@ const runFullAnalysisImpl = async (
           lastCommit: currentCommit,
           indexedAt: new Date().toISOString(),
           branch: branchLabel ?? existingMeta?.branch,
-          remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+          remoteUrl: repositoryRemoteUrl,
           stats: {
             files: pipelineResult.totalFileCount,
             nodes: stats.nodes,
@@ -2349,7 +2352,7 @@ const runFullAnalysisImpl = async (
       // a second git shellout. `undefined` when the repo has no
       // origin remote, which is fine: paths-only repos behave as
       // before.
-      remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+      remoteUrl: repositoryRemoteUrl,
       stats: {
         files: pipelineResult.totalFileCount,
         nodes: stats.nodes,
@@ -2587,8 +2590,19 @@ export async function runFullAnalysis(
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
 ): Promise<AnalyzeResult> {
+  // Repository identity is the first gate. It must run before the analyzer
+  // ownership lock creates its storage directory, as well as before metadata,
+  // sidecar, or database mutation. registerRepo repeats the check at commit
+  // time for races and non-analyze callers.
+  const repoHasGit = hasGitDir(repoPath);
+  const repositoryRemoteUrl = repoHasGit ? getRemoteUrl(repoPath) : undefined;
+  await assertCanonicalRepositoryIdentity(repoPath, repositoryRemoteUrl);
+
   const { storagePath } = getStoragePaths(repoPath);
   return withAnalyzeOwnershipLock(storagePath, () =>
-    runFullAnalysisImpl(repoPath, options, callbacks),
+    runFullAnalysisImpl(repoPath, options, callbacks, {
+      repoHasGit,
+      remoteUrl: repositoryRemoteUrl,
+    }),
   );
 }

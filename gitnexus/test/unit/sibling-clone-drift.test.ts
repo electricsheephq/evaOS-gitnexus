@@ -16,6 +16,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import path from 'path';
+import fs from 'fs/promises';
 import { execSync, execFileSync } from 'child_process';
 
 // Wrap child_process exports in spies that pass through to the real
@@ -121,12 +122,27 @@ describe('findSiblingClones', () => {
         indexedAt: new Date().toISOString(),
       };
       await registerRepo(a.dbPath, { ...baseMeta, repoPath: a.dbPath, remoteUrl: remote });
-      await registerRepo(b.dbPath, { ...baseMeta, repoPath: b.dbPath, remoteUrl: remote });
       await registerRepo(c.dbPath, {
         ...baseMeta,
         repoPath: c.dbPath,
         remoteUrl: 'https://example.com/other/repo',
       });
+
+      // #133 prevents creating this duplicate now. Seed one legacy row directly
+      // so the read-only sibling diagnostic remains covered for pre-upgrade
+      // registries until operators explicitly repair them.
+      const legacy = await readRegistry();
+      legacy.push({
+        ...legacy[0]!,
+        name: path.basename(b.dbPath),
+        path: path.resolve(b.dbPath),
+        storagePath: path.join(path.resolve(b.dbPath), '.gitnexus'),
+      });
+      await fs.writeFile(
+        path.join(tmpHome.dbPath, 'registry.json'),
+        JSON.stringify(legacy, null, 2),
+        'utf-8',
+      );
 
       const siblings = await findSiblingClones(remote, a.dbPath);
       expect(siblings.map((s) => s.path).sort()).toEqual([path.resolve(b.dbPath)]);
