@@ -69,7 +69,6 @@ describe('shared doctor read-pool probe', () => {
     });
     expect(poolMocks.closeLbug).toHaveBeenCalledOnce();
   });
-
   it('closes the diagnostic pool when non-recovering initialization fails', async () => {
     poolMocks.initLbugNonRecovering.mockRejectedValue(new Error('WAL requires recovery'));
 

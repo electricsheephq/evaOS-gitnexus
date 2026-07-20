@@ -24,6 +24,7 @@ import { diagnoseExtensionLoad } from '../core/lbug/extension-load-error.js';
 import { getExtensionInstallPolicy } from '../core/lbug/extension-loader.js';
 import { getGitRoot } from '../storage/git.js';
 import { getStoragePaths, loadMeta, type RepoMeta } from '../storage/repo-manager.js';
+import { probeDoctorPool } from './doctor-pool-probe.js';
 import { t } from './i18n/index.js';
 
 export { probeDoctorPool, type DoctorPoolProbe } from './doctor-pool-probe.js';
@@ -276,6 +277,10 @@ export const doctorCommand = async (
   const fingerprint = getRuntimeFingerprint();
   const capabilities = getRuntimeCapabilities();
   const embeddingConfig = resolveEmbeddingConfig();
+  const requestedPath = inputPath ? path.resolve(inputPath) : process.cwd();
+  const repoRoot = getGitRoot(requestedPath) ?? requestedPath;
+  const storagePaths = getStoragePaths(repoRoot);
+  const repoMeta = await loadMeta(storagePaths.storagePath).catch(() => null);
 
   console.log(t('doctor.title') + '\n');
   console.log(t('doctor.runtime'));
@@ -303,8 +308,23 @@ export const doctorCommand = async (
   console.log(`  ${label('doctor.labels.graphStore', 18)}${capabilities.graph}`);
   // Live LOAD probe, not the static platform capability — the static value
   // said "available" while analyze failed to load the extension (#2374).
+  const poolProbe =
+    nativeCheck.ok && repoMeta ? await probeDoctorPool(storagePaths.lbugPath) : null;
+  // The aggregate pool verdict is authoritative, but its booleans intentionally
+  // contain no native error text. On failure, run the same bounded, offline LOAD
+  // diagnostic doctor historically used so remediation remains specific.
+  const ftsFailureProbe = poolProbe && !poolProbe.fts ? await probeFtsExtensionLoad() : null;
   const ftsProbe = nativeCheck.ok
-    ? await probeFtsExtensionLoad()
+    ? poolProbe
+      ? {
+          loaded: poolProbe.fts,
+          reason: poolProbe.fts
+            ? undefined
+            : ((!ftsFailureProbe?.loaded ? ftsFailureProbe?.reason : undefined) ??
+              poolProbe.reason ??
+              'FTS did not load on every read-pool connection'),
+        }
+      : await probeFtsExtensionLoad()
     : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
   console.log(
     `  ${label('doctor.labels.fullTextSearch', 18)}${ftsProbe.loaded ? 'available' : 'unavailable'}`,
@@ -321,14 +341,33 @@ export const doctorCommand = async (
       console.log(`  ${padDisplayEnd('', 18)}${remedy}`);
     }
   }
+  const vectorFailureProbe =
+    poolProbe && !poolProbe.vector ? await probeVectorExtensionLoad() : null;
   const vectorProbe = nativeCheck.ok
-    ? await probeVectorExtensionLoad()
+    ? poolProbe
+      ? {
+          loaded: poolProbe.vector,
+          reason: poolProbe.vector
+            ? undefined
+            : ((!vectorFailureProbe?.loaded ? vectorFailureProbe?.reason : undefined) ??
+              poolProbe.reason ??
+              'VECTOR did not load on every read-pool connection'),
+        }
+      : await probeVectorExtensionLoad()
     : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
   console.log(
     `  ${label('doctor.labels.vectorIndex', 18)}${vectorProbe.loaded ? 'available' : 'unavailable'}`,
   );
   if (!vectorProbe.loaded && vectorProbe.reason) {
     console.log(`  ${padDisplayEnd('', 18)}${vectorProbe.reason}`);
+  }
+  if (poolProbe) {
+    console.log(
+      `  ${padDisplayEnd('Pool connections:', 18)}` +
+        (poolProbe.connectionCount > 0
+          ? `${poolProbe.exercisedConnections}/${poolProbe.connectionCount} exercised`
+          : 'unavailable'),
+    );
   }
   console.log(`  ${label('doctor.labels.semanticMode', 18)}${capabilities.semanticMode}`);
   // Surface the optional-extension install policy so offline users can see
@@ -347,9 +386,6 @@ export const doctorCommand = async (
   );
   if (capabilities.reason)
     console.log(`  ${label('doctor.labels.note', 18)}${capabilities.reason}`);
-  const requestedPath = inputPath ? path.resolve(inputPath) : process.cwd();
-  const repoRoot = getGitRoot(requestedPath) ?? requestedPath;
-  const repoMeta = await loadMeta(getStoragePaths(repoRoot).storagePath).catch(() => null);
   const repoVector = repoVectorDoctorStatus(repoMeta);
   console.log(`  ${padDisplayEnd('Repo VECTOR:', 18)}${repoVector.status}`);
   if (repoVector.detail) {

@@ -36,6 +36,7 @@ vi.mock('@ladybugdb/core', () => ({
 vi.mock('../../src/core/lbug/lbug-adapter.js', () => ({
   isReadOnlyDbError: vi.fn(() => false),
   loadFTSExtension: loadFTSExtensionMock,
+  loadVectorExtension: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock('../../src/core/lbug/lbug-config.js', () => ({

@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { loadFTSExtensionMock } = vi.hoisted(() => ({
+const { connections, loadFTSExtensionMock, loadVectorExtensionMock } = vi.hoisted(() => ({
+  connections: [] as any[],
   loadFTSExtensionMock: vi.fn(),
+  loadVectorExtensionMock: vi.fn(),
 }));
 
 vi.mock('@ladybugdb/core', () => ({
@@ -9,6 +11,15 @@ vi.mock('@ladybugdb/core', () => ({
     Database: vi.fn(),
     Connection: vi.fn(function (this: any) {
       this.close = vi.fn().mockResolvedValue(undefined);
+      this.prepare = vi.fn().mockResolvedValue({
+        isSuccess: () => true,
+        getErrorMessage: vi.fn().mockResolvedValue(''),
+      });
+      this.execute = vi.fn().mockResolvedValue({
+        getAll: vi.fn().mockResolvedValue([{ ok: 1 }]),
+        close: vi.fn(),
+      });
+      connections.push(this);
     }),
   },
 }));
@@ -16,6 +27,7 @@ vi.mock('@ladybugdb/core', () => ({
 vi.mock('../../src/core/lbug/lbug-adapter.js', () => ({
   isReadOnlyDbError: vi.fn(() => false),
   loadFTSExtension: loadFTSExtensionMock,
+  loadVectorExtension: loadVectorExtensionMock,
 }));
 
 vi.mock('../../src/core/lbug/lbug-config.js', () => ({
@@ -25,38 +37,101 @@ vi.mock('../../src/core/lbug/lbug-config.js', () => ({
   WAL_RECOVERY_SUGGESTION: '',
 }));
 
-const { closeLbug, initLbugWithDb } = await import('../../src/core/lbug/pool-adapter.js');
+const { closeLbug, getPoolCapabilities, initLbugWithDb, isLbugReady, probePoolConnections } =
+  await import('../../src/core/lbug/pool-adapter.js');
 
-describe('read-pool FTS loading', () => {
+describe('read-pool optional extension loading', () => {
   afterEach(async () => {
     await closeLbug().catch(() => {});
     loadFTSExtensionMock.mockReset();
+    loadVectorExtensionMock.mockReset();
+    connections.length = 0;
   });
 
-  it('loads FTS with load-only policy and caches a successful load', async () => {
-    loadFTSExtensionMock.mockResolvedValue(true);
-    const db = {} as any;
-
-    await initLbugWithDb('repo-a', db, '/tmp/shared-fts-db');
-    await initLbugWithDb('repo-b', db, '/tmp/shared-fts-db');
-
-    expect(loadFTSExtensionMock).toHaveBeenCalledTimes(1);
-    expect(loadFTSExtensionMock).toHaveBeenCalledWith(expect.anything(), { policy: 'load-only' });
-  });
-
-  it('does not fake a successful load when FTS is unavailable', async () => {
-    loadFTSExtensionMock.mockResolvedValue(false);
-    const db = {} as any;
-
-    await initLbugWithDb('repo-a', db, '/tmp/shared-fts-db');
-    await initLbugWithDb('repo-b', db, '/tmp/shared-fts-db');
-
-    expect(loadFTSExtensionMock).toHaveBeenCalledTimes(2);
-    expect(loadFTSExtensionMock).toHaveBeenNthCalledWith(1, expect.anything(), {
-      policy: 'load-only',
+  it('loads FTS and VECTOR with load-only policy on all eight connections', async () => {
+    loadFTSExtensionMock.mockImplementation(async () => {
+      expect(isLbugReady('repo-a')).toBe(false);
+      return true;
     });
-    expect(loadFTSExtensionMock).toHaveBeenNthCalledWith(2, expect.anything(), {
+    loadVectorExtensionMock.mockImplementation(async () => {
+      expect(isLbugReady('repo-a')).toBe(false);
+      return true;
+    });
+    const db = {} as any;
+
+    await initLbugWithDb('repo-a', db, '/tmp/pool-extension-success-db');
+
+    expect(loadFTSExtensionMock).toHaveBeenCalledTimes(8);
+    expect(loadVectorExtensionMock).toHaveBeenCalledTimes(8);
+    expect(loadFTSExtensionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ policy: 'load-only', warn: expect.any(Function) }),
+    );
+    expect(loadVectorExtensionMock).toHaveBeenCalledWith(expect.anything(), {
       policy: 'load-only',
+      warn: expect.any(Function),
+    });
+    expect(getPoolCapabilities('repo-a')).toEqual({
+      fts: true,
+      vector: true,
+      connectionCount: 8,
+    });
+    await expect(probePoolConnections('repo-a')).resolves.toBe(8);
+    expect(connections).toHaveLength(8);
+    expect(connections.every((connection) => connection.prepare.mock.calls.length === 1)).toBe(
+      true,
+    );
+  });
+
+  it('keeps graph ready but disables a capability when one connection fails to load it', async () => {
+    loadFTSExtensionMock.mockResolvedValue(true);
+    loadFTSExtensionMock.mockResolvedValueOnce(false);
+    loadVectorExtensionMock.mockResolvedValue(true);
+    const db = {} as any;
+
+    await initLbugWithDb('repo-partial', db, '/tmp/pool-extension-partial-db');
+
+    expect(loadFTSExtensionMock).toHaveBeenCalledTimes(8);
+    expect(loadVectorExtensionMock).toHaveBeenCalledTimes(8);
+    expect(isLbugReady('repo-partial')).toBe(true);
+    expect(getPoolCapabilities('repo-partial')).toEqual({
+      fts: false,
+      vector: true,
+      connectionCount: 8,
+    });
+  });
+
+  it('disables VECTOR for the pool when only one connection lacks it', async () => {
+    loadFTSExtensionMock.mockResolvedValue(true);
+    loadVectorExtensionMock.mockResolvedValue(true);
+    loadVectorExtensionMock.mockResolvedValueOnce(false);
+
+    await initLbugWithDb('repo-vector-partial', {} as any, '/tmp/pool-vector-partial-db');
+
+    expect(loadFTSExtensionMock).toHaveBeenCalledTimes(8);
+    expect(loadVectorExtensionMock).toHaveBeenCalledTimes(8);
+    expect(isLbugReady('repo-vector-partial')).toBe(true);
+    expect(getPoolCapabilities('repo-vector-partial')).toEqual({
+      fts: true,
+      vector: false,
+      connectionCount: 8,
+    });
+  });
+
+  it('prepares every connection for each alias sharing a Database', async () => {
+    loadFTSExtensionMock.mockResolvedValue(true);
+    loadVectorExtensionMock.mockResolvedValue(true);
+    const db = {} as any;
+
+    await initLbugWithDb('repo-alias-a', db, '/tmp/pool-extension-alias-db');
+    await initLbugWithDb('repo-alias-b', db, '/tmp/pool-extension-alias-db');
+
+    expect(loadFTSExtensionMock).toHaveBeenCalledTimes(16);
+    expect(loadVectorExtensionMock).toHaveBeenCalledTimes(16);
+    expect(getPoolCapabilities('repo-alias-a')).toMatchObject({ fts: true, vector: true });
+    expect(getPoolCapabilities('repo-alias-b')).toMatchObject({
+      fts: true,
+      vector: true,
     });
   });
 });
