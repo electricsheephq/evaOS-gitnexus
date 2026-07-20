@@ -673,7 +673,7 @@ const runFullAnalysisImpl = async (
   const canonicalPaths = getStoragePaths(repoPath, placement.branch);
   const canonicalMetaDir = path.dirname(canonicalPaths.metaPath);
   const promotionPaths = getStagedAnalyzePaths(canonicalPaths.lbugPath, canonicalMetaDir);
-  let stagedPaths: StagedAnalyzePaths | undefined = options.staged ? promotionPaths : undefined;
+  const stagedPaths: StagedAnalyzePaths | undefined = options.staged ? promotionPaths : undefined;
 
   const commitStagedMetadataAndRegistry = async (meta: RepoMeta): Promise<string> => {
     await saveMeta(canonicalMetaDir, meta);

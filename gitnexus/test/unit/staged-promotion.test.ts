@@ -204,9 +204,7 @@ describe('staged promotion journal', () => {
       if (installedDbState === 'missing') {
         expect(await exists(canonicalLbugPath)).toBe(false);
       } else {
-        expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe(
-          'wrong-installed-generation',
-        );
+        expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe('wrong-installed-generation');
       }
     });
   }
