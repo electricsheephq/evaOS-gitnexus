@@ -107,7 +107,7 @@ describe('registry canonical remote enforcement (#133)', () => {
     expect(await readRegistry()).toHaveLength(1);
   });
 
-  it('keeps repositories without a fleet-safe remote path-based and local-only', async () => {
+  it('keeps repositories without a normalized remote path-based and local-only', async () => {
     await registerRepo(repoA.dbPath, meta(repoA.dbPath));
     await registerRepo(repoB.dbPath, meta(repoB.dbPath));
     expect(await readRegistry()).toHaveLength(2);

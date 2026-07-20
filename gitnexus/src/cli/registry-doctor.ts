@@ -9,6 +9,7 @@ import {
   type RegistryEntry,
   type RepoMeta,
 } from '../storage/repo-manager.js';
+import { probeDoctorPool, type DoctorPoolProbe } from './doctor-pool-probe.js';
 
 export interface RegistryCounts {
   nodes: number | null;
@@ -25,27 +26,16 @@ export interface RegistryDatabaseCounts {
 export type RegistryDatabaseProbe = (lbugPath: string) => Promise<RegistryDatabaseCounts>;
 
 export interface RegistryCapabilityReport {
-  source: 'metadata' | 'active-probe' | 'unavailable';
+  source: 'active-probe' | 'unavailable';
   graph: string | null;
   fts: string | null;
   vectorSearch: string | null;
 }
 
-export interface RegistryCapabilityProbeInput {
-  entry: RegistryEntry;
-  metadata: RepoMeta | null;
-  lbugPath: string;
-  databaseCounts: RegistryDatabaseCounts;
-}
-
 /**
- * Typed integration seam for #131's pooled live-capability work. This lane
- * deliberately does not instantiate a pool or probe VECTOR/FTS at runtime;
- * without an injected probe the report uses persisted metadata only.
+ * Typed integration seam for the production non-recovering read-pool probe.
  */
-export type RegistryCapabilityProbe = (
-  input: RegistryCapabilityProbeInput,
-) => Promise<RegistryCapabilityReport>;
+export type RegistryCapabilityProbe = (lbugPath: string) => Promise<DoctorPoolProbe>;
 
 interface FileState {
   status: 'absent' | 'present' | 'inaccessible';
@@ -78,8 +68,8 @@ export interface RegistryEntryDoctorReport {
   path?: string;
   storagePath?: string;
   identity:
-    | { kind: 'remote'; normalizedRemote: string; fleetApproved: true }
-    | { kind: 'local-path'; fleetApproved: false };
+    | { kind: 'remote'; normalizedRemote: string }
+    | { kind: 'local-path' };
   storage:
     | { status: 'safe' }
     | {
@@ -124,7 +114,6 @@ export interface RegistryDoctorReport {
     entries: number;
     remoteIdentities: number;
     localOnlyEntries: number;
-    fleetApprovedEntries: number;
     remoteCollisionGroups: number;
     aliasCollisionGroups: number;
     countMismatches: number;
@@ -332,12 +321,24 @@ export const probeRegistryDatabaseCounts: RegistryDatabaseProbe = async (lbugPat
   }
 };
 
-const recordedCapabilities = (meta: RepoMeta | null): RegistryCapabilityReport => ({
-  source: meta?.capabilities ? 'metadata' : 'unavailable',
-  graph: meta?.capabilities?.graph.status ?? null,
-  fts: meta?.capabilities?.fts.status ?? null,
-  vectorSearch: meta?.capabilities?.vectorSearch.status ?? null,
+const unavailableCapabilities = (): RegistryCapabilityReport => ({
+  source: 'unavailable',
+  graph: null,
+  fts: null,
+  vectorSearch: null,
 });
+
+const liveCapabilities = (probe: DoctorPoolProbe): RegistryCapabilityReport => {
+  if (probe.reason || probe.connectionCount !== 8 || probe.exercisedConnections !== 8) {
+    return unavailableCapabilities();
+  }
+  return {
+    source: 'active-probe',
+    graph: 'available',
+    fts: probe.fts ? 'available' : 'unavailable',
+    vectorSearch: probe.vector ? 'vector-index' : 'unavailable',
+  };
+};
 
 const differingCounts = (
   left: RegistryCounts,
@@ -396,8 +397,8 @@ const inspectEntry = async (
 ): Promise<RegistryEntryDoctorReport> => {
   const normalizedRemote = normalizeRepositoryRemote(entry.remoteUrl);
   const identity: RegistryEntryDoctorReport['identity'] = normalizedRemote
-    ? { kind: 'remote', normalizedRemote, fleetApproved: true }
-    : { kind: 'local-path', fleetApproved: false };
+    ? { kind: 'remote', normalizedRemote }
+    : { kind: 'local-path' };
   const base = {
     entryPosition,
     name:
@@ -420,7 +421,7 @@ const inspectEntry = async (
       database: { status: 'skipped', reason: 'unsafe-storage-path' },
       countComparison: unavailableComparison,
       sidecars: uninspectedSidecars(),
-      capabilities: recordedCapabilities(null),
+      capabilities: unavailableCapabilities(),
     };
   }
 
@@ -442,7 +443,7 @@ const inspectEntry = async (
       database: { status: 'skipped', reason: 'unsafe-storage-path' },
       countComparison: unavailableComparison,
       sidecars: uninspectedSidecars(),
-      capabilities: recordedCapabilities(null),
+      capabilities: unavailableCapabilities(),
     };
   }
 
@@ -484,17 +485,14 @@ const inspectEntry = async (
     }
   }
 
-  let capabilities = recordedCapabilities(meta);
-  if (options.capabilityProbe && availableCounts) {
+  let capabilities = unavailableCapabilities();
+  if (availableCounts) {
     try {
-      capabilities = await options.capabilityProbe({
-        entry,
-        metadata: meta,
-        lbugPath,
-        databaseCounts: availableCounts,
-      });
+      capabilities = liveCapabilities(
+        await (options.capabilityProbe ?? probeDoctorPool)(lbugPath),
+      );
     } catch {
-      capabilities = { source: 'unavailable', graph: null, fts: null, vectorSearch: null };
+      capabilities = unavailableCapabilities();
     }
   }
 
@@ -559,7 +557,6 @@ export async function buildRegistryDoctorReport(
       entries: reports.length,
       remoteIdentities,
       localOnlyEntries: reports.length - remoteIdentities,
-      fleetApprovedEntries: remoteIdentities,
       remoteCollisionGroups: remotes.length,
       aliasCollisionGroups: aliases.length,
       countMismatches: reports.filter((report) => report.countComparison.status === 'mismatch')

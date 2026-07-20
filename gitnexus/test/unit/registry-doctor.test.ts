@@ -1,6 +1,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const doctorPoolMocks = vi.hoisted(() => ({
+  probeDoctorPool: vi.fn(),
+}));
+
+vi.mock('../../src/cli/doctor-pool-probe.js', () => doctorPoolMocks);
+
 import {
   buildRegistryDoctorReport,
   probeRegistryDatabaseCounts,
@@ -87,6 +94,14 @@ describe('doctor --registry read-only report (#133)', () => {
 
   beforeEach(async () => {
     fixture = await createTempDir();
+    doctorPoolMocks.probeDoctorPool.mockReset();
+    doctorPoolMocks.probeDoctorPool.mockResolvedValue({
+      fts: true,
+      vector: true,
+      exercisedConnections: 8,
+      connectionCount: 8,
+      reason: null,
+    });
   });
 
   afterEach(async () => {
@@ -130,7 +145,6 @@ describe('doctor --registry read-only report (#133)', () => {
       entries: 3,
       remoteIdentities: 2,
       localOnlyEntries: 1,
-      fleetApprovedEntries: 2,
       remoteCollisionGroups: 1,
       aliasCollisionGroups: 1,
       countMismatches: 1,
@@ -154,10 +168,15 @@ describe('doctor --registry read-only report (#133)', () => {
       registryVsDatabase: ['nodes'],
     });
     expect(report.entries[0]?.countComparison.status).toBe('match');
-    expect(report.entries[2]?.identity).toEqual({ kind: 'local-path', fleetApproved: false });
+    expect(report.entries[2]?.identity).toEqual({ kind: 'local-path' });
     expect(report.entries[2]?.name).toBe('<path-like-alias>');
-    expect(report.entries[0]?.capabilities.source).toBe('metadata');
+    expect(report.entries[0]?.capabilities.source).toBe('active-probe');
     expect(databaseProbe.mock.calls.map(([lbugPath]) => lbugPath)).toEqual([
+      alpha.lbugPath,
+      duplicate.lbugPath,
+      local.lbugPath,
+    ]);
+    expect(doctorPoolMocks.probeDoctorPool.mock.calls.map(([lbugPath]) => lbugPath)).toEqual([
       alpha.lbugPath,
       duplicate.lbugPath,
       local.lbugPath,
@@ -246,10 +265,11 @@ describe('doctor --registry read-only report (#133)', () => {
     };
     const databaseProbe = vi.fn(async () => ({ nodes: 1, edges: 0, embeddings: 0 }));
     const capabilityProbe = vi.fn(async () => ({
-      source: 'active-probe' as const,
-      graph: 'available',
-      fts: 'available',
-      vectorSearch: 'vector-index',
+      fts: true,
+      vector: true,
+      exercisedConnections: 8,
+      connectionCount: 8,
+      reason: null,
     }));
 
     const report = await buildRegistryDoctorReport({
@@ -307,10 +327,11 @@ describe('doctor --registry read-only report (#133)', () => {
       { nodes: 1, edges: 0, embeddings: 1 },
     );
     const capabilityProbe = vi.fn(async () => ({
-      source: 'active-probe' as const,
-      graph: 'available',
-      fts: 'degraded',
-      vectorSearch: 'exact-scan',
+      fts: false,
+      vector: true,
+      exercisedConnections: 8,
+      connectionCount: 8,
+      reason: null,
     }));
 
     const report = await buildRegistryDoctorReport({
@@ -320,12 +341,69 @@ describe('doctor --registry read-only report (#133)', () => {
     });
 
     expect(capabilityProbe).toHaveBeenCalledOnce();
+    expect(capabilityProbe).toHaveBeenCalledWith(indexed.lbugPath);
     expect(report.entries[0]?.capabilities).toEqual({
       source: 'active-probe',
       graph: 'available',
-      fts: 'degraded',
-      vectorSearch: 'exact-scan',
+      fts: 'unavailable',
+      vectorSearch: 'vector-index',
     });
+  });
+
+  it('lets a failed default live probe override optimistic recorded metadata', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'live-failure',
+      'LiveFailure',
+      'https://github.com/owner/live-failure.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    doctorPoolMocks.probeDoctorPool.mockResolvedValue({
+      fts: false,
+      vector: false,
+      exercisedConnections: 0,
+      connectionCount: 0,
+      reason: `native load failed at ${indexed.lbugPath}`,
+    });
+
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({ nodes: 1, edges: 0, embeddings: 1 }),
+    });
+
+    expect(doctorPoolMocks.probeDoctorPool).toHaveBeenCalledWith(indexed.lbugPath);
+    expect(report.entries[0]?.metadata.status).toBe('available');
+    expect(report.entries[0]?.capabilities).toEqual({
+      source: 'unavailable',
+      graph: null,
+      fts: null,
+      vectorSearch: null,
+    });
+    expect(JSON.stringify(report)).not.toContain(indexed.lbugPath);
+  });
+
+  it('fails closed when the live probe does not exercise the complete pool', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'partial-pool',
+      'PartialPool',
+      'https://github.com/owner/partial-pool.git',
+      { nodes: 1, edges: 0, embeddings: 1 },
+    );
+    doctorPoolMocks.probeDoctorPool.mockResolvedValue({
+      fts: true,
+      vector: true,
+      exercisedConnections: 7,
+      connectionCount: 8,
+      reason: null,
+    });
+
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({ nodes: 1, edges: 0, embeddings: 1 }),
+    });
+
+    expect(report.entries[0]?.capabilities.source).toBe('unavailable');
   });
 
   it('counts a real clean LadybugDB index through a read-only handle', async () => {

@@ -39,6 +39,18 @@ describe('doctor --mcp-config preflight (#127)', () => {
       2,
       'invalid',
     ],
+    [
+      { GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,,MissingConfiguredSecret' },
+      'GITNEXUS_MCP_ALLOWED_REPOS',
+      2,
+      'invalid',
+    ],
+    [
+      { GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Alpha,MissingConfiguredSecret' },
+      'GITNEXUS_MCP_ALLOWED_REPOS',
+      3,
+      'invalid',
+    ],
     [{ GITNEXUS_MCP_ALLOWED_REPOS: 'Duplicate' }, 'GITNEXUS_MCP_ALLOWED_REPOS', 1, 'ambiguous'],
     [
       { GITNEXUS_MCP_DEFAULT_REPO: 'MissingConfiguredSecret' },

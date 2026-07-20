@@ -995,7 +995,7 @@ const assertRemoteIdentityAvailable = (
 
 /**
  * Read-only preflight used before analysis opens or mutates an index. Remotes
- * that cannot form a fleet-safe identity (no origin, filesystem path, file:)
+ * that cannot form a normalized remote identity (no origin, filesystem path, file:)
  * return immediately and retain the legacy path-based local-only behavior.
  */
 export const assertCanonicalRepositoryIdentity = async (

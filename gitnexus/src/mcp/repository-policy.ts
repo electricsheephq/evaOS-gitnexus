@@ -12,7 +12,7 @@ const OPENCLAW_ALLOWED = 'OPENCLAW_CODE_INDEX_ALLOWED_REPOS';
 const OPENCLAW_DEFAULT = 'OPENCLAW_CODE_INDEX_DEFAULT_REPO';
 
 interface RawRepositoryPolicy {
-  allowed?: string[];
+  allowed?: Array<{ value: string; entryPosition: number }>;
   allowedKey?: string;
   defaultRepo?: string;
   defaultKey?: string;
@@ -75,15 +75,16 @@ function parseRepositoryPolicy(env: NodeJS.ProcessEnv): RawRepositoryPolicy {
   const allowedRaw = configuredValue(env, CANONICAL_ALLOWED, OPENCLAW_ALLOWED);
   const defaultRaw = configuredValue(env, CANONICAL_DEFAULT, OPENCLAW_DEFAULT);
 
-  let allowed: string[] | undefined;
+  let allowed: RawRepositoryPolicy['allowed'];
   if (allowedRaw) {
-    allowed = allowedRaw.value
-      .split(',')
-      .map((entry) => entry.trim())
-      .filter(Boolean);
-    if (allowed.length === 0) {
-      throw new McpRepositoryPolicyConfigurationError(allowedRaw.key, 'blank', 1);
-    }
+    allowed = allowedRaw.value.split(',').map((entry, index) => {
+      const value = entry.trim();
+      const entryPosition = index + 1;
+      if (!value) {
+        throw new McpRepositoryPolicyConfigurationError(allowedRaw.key, 'blank', entryPosition);
+      }
+      return { value, entryPosition };
+    });
   }
 
   let defaultRepo: string | undefined;
@@ -404,13 +405,13 @@ export async function createMcpRepositoryPolicy(
   let allowed: ResolvedRepository[] | undefined;
   if (raw.allowed) {
     const byPath = new Map<string, ResolvedRepository>();
-    for (const [index, specifier] of raw.allowed.entries()) {
-      const result = resolveSpecifier(specifier, registry);
+    for (const specifier of raw.allowed) {
+      const result = resolveSpecifier(specifier.value, registry);
       if (!result.repo) {
         throw new McpRepositoryPolicyConfigurationError(
           raw.allowedKey ?? CANONICAL_ALLOWED,
           result.reason ?? 'invalid',
-          index + 1,
+          specifier.entryPosition,
         );
       }
       byPath.set(result.repo.pathKey, result.repo);

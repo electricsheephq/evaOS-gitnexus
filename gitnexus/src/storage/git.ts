@@ -111,7 +111,7 @@ export const getRemoteUrl = (repoPath: string): string | undefined => {
  *
  * Local filesystem and `file:` remotes deliberately return `undefined`.
  * They are machine-local identities and remain path-scoped rather than being
- * treated as fleet-safe canonical repository identifiers.
+ * treated as normalized canonical repository identifiers.
  */
 export const normalizeRepositoryRemote = (
   remoteUrl: string | null | undefined,

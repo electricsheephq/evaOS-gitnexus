@@ -318,7 +318,7 @@ One normalized GitHub remote has one canonical top-level index. GitHub SSH,
 HTTPS, and Git remotes are compared without transport, case, a trailing slash,
 or the `.git` suffix; analyzing a second clone fails with
 `repository_remote_collision` and names the existing canonical path. Re-run
-analysis from that path instead. Repositories without a fleet-safe remote
+analysis from that path instead. Repositories without a normalized remote identity
 (including local filesystem and `file:` remotes) stay path-scoped and are
 reported as local-only.
 
@@ -326,7 +326,7 @@ Before starting MCP, `gitnexus doctor --mcp-config --json` checks the configured
 allowlist/default with the production resolver but does not bind a transport or
 open an index. `gitnexus doctor --registry --json` reports remote/alias
 collisions, registry/metadata/database count agreement, recovery sidecars,
-locks, and recorded capabilities through read-only handles. Absolute paths are
+locks, and live read-pool capabilities through read-only handles. Absolute paths are
 omitted unless `--show-paths` is supplied explicitly.
 
 ## Supported Languages

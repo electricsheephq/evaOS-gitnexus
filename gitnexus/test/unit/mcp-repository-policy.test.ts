@@ -297,6 +297,21 @@ describe('MCP repository policy', () => {
     );
   });
 
+  it.each([
+    ['Alpha,,Beta', 2],
+    ['Alpha,,Missing', 2],
+    ['Alpha,Beta,Missing', 3],
+  ])('preserves raw allowlist coordinates for %s', async (configured, entryPosition) => {
+    await expect(
+      createMcpRepositoryPolicy(createBackend(), {
+        GITNEXUS_MCP_ALLOWED_REPOS: configured,
+      }),
+    ).rejects.toMatchObject({
+      key: 'GITNEXUS_MCP_ALLOWED_REPOS',
+      entryPosition,
+    });
+  });
+
   it('is transparent when no repository policy is configured', async () => {
     const backend = createBackend();
     const policy = await createMcpRepositoryPolicy(backend, {});

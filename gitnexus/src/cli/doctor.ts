@@ -26,6 +26,8 @@ import { getGitRoot } from '../storage/git.js';
 import { getStoragePaths, loadMeta, type RepoMeta } from '../storage/repo-manager.js';
 import { t } from './i18n/index.js';
 
+export { probeDoctorPool, type DoctorPoolProbe } from './doctor-pool-probe.js';
+
 function isCombiningMark(codePoint: number): boolean {
   return (
     (codePoint >= 0x0300 && codePoint <= 0x036f) ||

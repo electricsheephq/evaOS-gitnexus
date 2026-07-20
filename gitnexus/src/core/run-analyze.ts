@@ -597,7 +597,7 @@ export async function runFullAnalysis(
 
   // Repository identity is a read-only gate and must run before metadata
   // reconciliation, sidecar handling, DB open, or any generated-file write.
-  // Local-only repositories have no fleet-safe remote identity and remain
+  // Local-only repositories have no normalized remote identity and remain
   // path-scoped. registerRepo repeats the check at commit time for races and
   // non-analyze callers.
   const repoHasGit = hasGitDir(repoPath);
