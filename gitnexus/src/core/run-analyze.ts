@@ -610,19 +610,13 @@ const runFullAnalysisImpl = async (
   repoPath: string,
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
+  repositoryIdentity: { repoHasGit: boolean; remoteUrl: string | undefined },
 ): Promise<AnalyzeResult> => {
   const log = (msg: string) => callbacks.onLog?.(msg);
   const progress = (phase: string, percent: number, message: string) =>
     callbacks.onProgress(phase, percent, message);
 
-  // Repository identity is a read-only gate and must run before metadata
-  // reconciliation, sidecar handling, DB open, or any generated-file write.
-  // Local-only repositories have no normalized remote identity and remain
-  // path-scoped. registerRepo repeats the check at commit time for races and
-  // non-analyze callers.
-  const repoHasGit = hasGitDir(repoPath);
-  const repositoryRemoteUrl = repoHasGit ? getRemoteUrl(repoPath) : undefined;
-  await assertCanonicalRepositoryIdentity(repoPath, repositoryRemoteUrl);
+  const { repoHasGit, remoteUrl: repositoryRemoteUrl } = repositoryIdentity;
 
   // Resolve + validate operator-provided FTS config once, before the expensive
   // parse/load phases. A typo fails here in ms; createSearchFTSIndexes reuses
@@ -2596,8 +2590,19 @@ export async function runFullAnalysis(
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
 ): Promise<AnalyzeResult> {
+  // Repository identity is the first gate. It must run before the analyzer
+  // ownership lock creates its storage directory, as well as before metadata,
+  // sidecar, or database mutation. registerRepo repeats the check at commit
+  // time for races and non-analyze callers.
+  const repoHasGit = hasGitDir(repoPath);
+  const repositoryRemoteUrl = repoHasGit ? getRemoteUrl(repoPath) : undefined;
+  await assertCanonicalRepositoryIdentity(repoPath, repositoryRemoteUrl);
+
   const { storagePath } = getStoragePaths(repoPath);
   return withAnalyzeOwnershipLock(storagePath, () =>
-    runFullAnalysisImpl(repoPath, options, callbacks),
+    runFullAnalysisImpl(repoPath, options, callbacks, {
+      repoHasGit,
+      remoteUrl: repositoryRemoteUrl,
+    }),
   );
 }
