@@ -1106,12 +1106,10 @@ const runFullAnalysisImpl = async (
   // otherwise early-return without ever reaching the `isIncremental` gate
   // that consults `schemaVersion`, defeating the bump's whole point.
   //
-  // `schemaVersion === undefined` covers two cases that should still trip
-  // this guard: a non-git repo (which never stamps the field) and very old
-  // meta from before the field existed. Non-git repos take the
-  // `currentCommit === ''` rebuild branch below regardless, so the redundant
-  // force here is harmless; the friendlier `'pre-versioning'` log avoids a
-  // user-visible "stamped vundefined" line in that edge case.
+  // `schemaVersion === undefined` now means legacy metadata from before the
+  // field existed. New indexes always stamp their schema identity, including
+  // non-Git and `--skip-git` repositories, because staged embedding recovery
+  // must not misclassify a current checkpoint as pre-versioning.
   if (existingMeta && existingMeta.schemaVersion !== INCREMENTAL_SCHEMA_VERSION) {
     if (options.incrementalOnly) {
       incrementalOnlyStop('the index schema requires a full rebuild');
@@ -2219,7 +2217,9 @@ const runFullAnalysisImpl = async (
             processes: pipelineResult.processResult?.stats.totalProcesses,
             embeddings,
           },
-          schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
+          // Schema identity belongs to the index, not Git history. Non-Git
+          // staged checkpoints need the same stamp to resume safely.
+          schemaVersion: INCREMENTAL_SCHEMA_VERSION,
           cjkSegmentation: getSearchFTSCjkSegmentation(),
           fileHashes: hasGitDir(repoPath) ? fileHashes : undefined,
           cacheKeys: [...parseCache.usedKeys],
@@ -2378,11 +2378,10 @@ const runFullAnalysisImpl = async (
           reason: runtimeCapabilities.reason,
         },
       },
-      // Incremental-indexing fields. Populated for git repos so the next
-      // analyze run can take the incremental DB-writeback path. Setting
-      // incrementalInProgress to undefined explicitly clears any prior
-      // dirty flag (full and incremental success paths converge here).
-      schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
+      // Schema identity is always stamped. Git-only fields below remain
+      // conditional, so non-Git repositories still rebuild their graph while
+      // staged embedding checkpoints remain distinguishable from legacy data.
+      schemaVersion: INCREMENTAL_SCHEMA_VERSION,
       // Always stamped with the live resolved mode (#2331/#2339) — unlike
       // `pdg` below, 'none' is a meaningful value to compare, not an
       // absence, so this is never conditionally omitted.
