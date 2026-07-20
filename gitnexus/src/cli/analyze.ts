@@ -1261,13 +1261,20 @@ const analyzeCommandImpl = async (
 
   bar.start(100, 0, { phase: 'Initializing...' });
 
-  const resourceLog = await createAnalyzeResourceLogger();
   let resourceLogFailureReported = false;
   const reportResourceLogFailure = (): void => {
     if (resourceLogFailureReported) return;
     resourceLogFailureReported = true;
     realStderrWrite('\n  Warning: analyze resource logging failed; analysis will continue.\n');
   };
+  let resourceLog: Awaited<ReturnType<typeof createAnalyzeResourceLogger>> = undefined;
+  try {
+    resourceLog = await createAnalyzeResourceLogger();
+  } catch {
+    // Observability is optional. An invalid/unwritable target must not prevent
+    // the analyzer from preserving or updating its canonical generation.
+    reportResourceLogFailure();
+  }
   const emitResourceEvent = async (
     event: Parameters<NonNullable<typeof resourceLog>['emit']>[0],
     phase?: string,

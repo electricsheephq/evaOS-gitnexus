@@ -77,4 +77,29 @@ describe('analyze resource JSONL', () => {
       Array.from({ length: 20 }, (_, index) => index),
     );
   });
+
+  it('tightens an existing regular log file to mode 0600', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-resource-log-'));
+    tempDirs.push(dir);
+    const logPath = path.join(dir, 'resource.jsonl');
+    await fs.writeFile(logPath, '');
+    await fs.chmod(logPath, 0o644);
+
+    const logger = await createAnalyzeResourceLogger(logPath);
+    await logger?.close();
+
+    expect((await fs.stat(logPath)).mode & 0o777).toBe(0o600);
+  });
+
+  it.runIf(process.platform !== 'win32')('refuses a symlink log target', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-resource-log-'));
+    tempDirs.push(dir);
+    const target = path.join(dir, 'target.jsonl');
+    const link = path.join(dir, 'resource.jsonl');
+    await fs.writeFile(target, '');
+    await fs.symlink(target, link);
+
+    await expect(createAnalyzeResourceLogger(link)).rejects.toThrow('non-symlink');
+    expect(await fs.readFile(target, 'utf8')).toBe('');
+  });
 });

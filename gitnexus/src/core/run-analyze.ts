@@ -132,7 +132,8 @@ import {
   prepareStagedWorkspace,
   promoteStagedGeneration,
   validateStagedGeneration,
-  withStagedAnalyzeLock,
+  withAnalyzeOwnershipLock,
+  type RepositorySourceIdentity,
   type StagedAnalyzePaths,
 } from './staged-promotion.js';
 
@@ -657,14 +658,22 @@ const runFullAnalysisImpl = async (
   // `~ ^ : ? *`, leading `-`, `..`) becomes `null` → the flat slot, matching
   // that a later `--branch <that-ref>` query would also be rejected. A normal
   // ref passes through unchanged so index-time and query-time labels round-trip.
-  const checkedOutBranch = repoHasGit
-    ? (sanitizeDetectedBranch(getCurrentBranch(repoPath)) ?? null)
-    : null;
+  const rawCheckedOutBranch = repoHasGit ? getCurrentBranch(repoPath) : null;
+  const checkedOutBranch = sanitizeDetectedBranch(rawCheckedOutBranch) ?? null;
+  const repositorySource: RepositorySourceIdentity = {
+    head: currentCommit,
+    branch: rawCheckedOutBranch,
+  };
+  const readRepositoryIdentity = (): RepositorySourceIdentity => ({
+    head: repoHasGit ? getCurrentCommit(repoPath) : '',
+    branch: repoHasGit ? getCurrentBranch(repoPath) : null,
+  });
   const branchLabel = options.branch ?? checkedOutBranch;
   const placement = options.branch ? await resolveBranchPlacement(repoPath, branchLabel) : {};
   const canonicalPaths = getStoragePaths(repoPath, placement.branch);
   const canonicalMetaDir = path.dirname(canonicalPaths.metaPath);
-  let stagedPaths: StagedAnalyzePaths | undefined;
+  const promotionPaths = getStagedAnalyzePaths(canonicalPaths.lbugPath, canonicalMetaDir);
+  let stagedPaths: StagedAnalyzePaths | undefined = options.staged ? promotionPaths : undefined;
 
   const commitStagedMetadataAndRegistry = async (meta: RepoMeta): Promise<string> => {
     await saveMeta(canonicalMetaDir, meta);
@@ -675,10 +684,9 @@ const runFullAnalysisImpl = async (
     });
   };
 
-  const promoteValidatedStage = async (): Promise<string | undefined> => {
-    if (!stagedPaths) throw new Error('Cannot promote without staged-analyze paths');
-    const stagedMeta = await validateStagedGeneration(stagedPaths);
-    const stagedStats = await withLbugDb(stagedPaths.stagedLbugPath, getLbugStats, {
+  const promoteValidatedStage = async (paths: StagedAnalyzePaths): Promise<string | undefined> => {
+    const stagedMeta = await validateStagedGeneration(paths);
+    const stagedStats = await withLbugDb(paths.stagedLbugPath, getLbugStats, {
       readOnly: true,
     });
     if (
@@ -691,17 +699,28 @@ const runFullAnalysisImpl = async (
           `but the readable DB contains ${stagedStats.nodes} nodes/${stagedStats.edges} edges.`,
       );
     }
-    return (await promoteStagedGeneration(stagedPaths, commitStagedMetadataAndRegistry))
-      .projectName;
+    return (
+      await promoteStagedGeneration(paths, commitStagedMetadataAndRegistry, {
+        readRepositoryIdentity,
+      })
+    ).projectName;
   };
 
-  if (options.staged) {
-    stagedPaths = getStagedAnalyzePaths(canonicalPaths.lbugPath, canonicalMetaDir);
-    if (await hasPendingPromotion(stagedPaths)) {
-      progress('lbug', 1, 'Recovering staged promotion...');
-      await promoteStagedGeneration(stagedPaths, commitStagedMetadataAndRegistry);
-      log('Recovered and completed the previous staged promotion.');
+  // Every analyze mode owns the same canonical slot and must resolve its
+  // promotion journal before any fast path can report success. In particular,
+  // a crash at old-backed-up may leave the canonical pathname temporarily
+  // absent even when metadata still looks current.
+  if (await hasPendingPromotion(promotionPaths)) {
+    if (options.incrementalOnly) {
+      throw new Error(
+        'Incremental-only safety stop: a staged-promotion journal requires recovery before this index can be read as current. No recovery mutation was started.',
+      );
     }
+    progress('lbug', 1, 'Recovering staged promotion...');
+    await promoteStagedGeneration(promotionPaths, commitStagedMetadataAndRegistry, {
+      readRepositoryIdentity,
+    });
+    log('Recovered and completed the previous staged promotion.');
   }
 
   // Analyze indexes the working tree, not an arbitrary ref. Recover a pending
@@ -721,7 +740,7 @@ const runFullAnalysisImpl = async (
 
   if (stagedPaths) {
     const canonicalMeta = await loadMeta(canonicalMetaDir);
-    const prepared = await prepareStagedWorkspace(stagedPaths, canonicalMeta);
+    const prepared = await prepareStagedWorkspace(stagedPaths, canonicalMeta, repositorySource);
     log(
       prepared.resumed
         ? 'Resuming the existing staged generation; the canonical index remains untouched.'
@@ -1237,7 +1256,7 @@ const runFullAnalysisImpl = async (
             // this same-commit fast path. Promote that validated generation
             // instead of silently discarding completed work.
             progress('lbug', 99, 'Promoting completed staged generation...');
-            promotedProjectName = await promoteValidatedStage();
+            promotedProjectName = await promoteValidatedStage(stagedPaths);
           } else {
             await discardStagedWorkspace(stagedPaths);
           }
@@ -2459,7 +2478,7 @@ const runFullAnalysisImpl = async (
     if (stagedPaths) {
       progress('lbug', 97, 'Validating staged generation...');
       progress('lbug', 99, 'Promoting staged generation...');
-      const promotedProjectName = await promoteValidatedStage();
+      const promotedProjectName = await promoteValidatedStage(stagedPaths);
       projectName =
         promotedProjectName ??
         options.registryName ??
@@ -2568,9 +2587,8 @@ export async function runFullAnalysis(
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
 ): Promise<AnalyzeResult> {
-  if (!options.staged) return runFullAnalysisImpl(repoPath, options, callbacks);
   const { storagePath } = getStoragePaths(repoPath);
-  return withStagedAnalyzeLock(storagePath, () =>
+  return withAnalyzeOwnershipLock(storagePath, () =>
     runFullAnalysisImpl(repoPath, options, callbacks),
   );
 }

@@ -1,4 +1,5 @@
 import path from 'path';
+import { constants as fsConstants } from 'fs';
 import fs from 'fs/promises';
 import os from 'os';
 
@@ -44,7 +45,33 @@ export const createAnalyzeResourceLogger = async (
 
   const resolvedPath = path.resolve(filePath.trim());
   await fs.mkdir(path.dirname(resolvedPath), { recursive: true });
-  const handle = await fs.open(resolvedPath, 'a', 0o600);
+  try {
+    const target = await fs.lstat(resolvedPath);
+    if (target.isSymbolicLink() || !target.isFile()) {
+      throw new Error('Analyze resource log target must be a regular, non-symlink file');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  const openFlags =
+    fsConstants.O_APPEND |
+    fsConstants.O_CREAT |
+    fsConstants.O_WRONLY |
+    fsConstants.O_NOFOLLOW |
+    fsConstants.O_NONBLOCK;
+  const handle = await fs.open(resolvedPath, openFlags, 0o600);
+  try {
+    const openedTarget = await handle.stat();
+    if (!openedTarget.isFile()) {
+      throw new Error('Analyze resource log target must be a regular file');
+    }
+    // The mode argument only applies on create; tighten pre-existing files too.
+    await handle.chmod(0o600);
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
   let pending = Promise.resolve();
   let closed = false;
   let closing = false;

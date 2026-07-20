@@ -6,10 +6,12 @@ import {
   isMissingFilesystemError,
   loadMeta,
   saveMeta,
+  INDEX_METADATA_FILE,
   type RepoMeta,
 } from '../storage/repo-manager.js';
 
 const STAGE_MANIFEST_SCHEMA = 'gitnexus.staged-analyze/v1';
+const STAGE_INTENT_SCHEMA = 'gitnexus.staged-analyze-intent/v1';
 const PROMOTION_JOURNAL_SCHEMA = 'gitnexus.staged-promotion/v1';
 const DB_SIDECARS = ['.wal', '.shadow', '.wal.checkpoint'] as const;
 
@@ -33,12 +35,30 @@ interface MetaIdentity {
   indexedAt: string;
 }
 
+interface MetaFilesIdentity {
+  primary?: FileIdentity;
+  legacy?: FileIdentity;
+}
+
+export interface RepositorySourceIdentity {
+  head: string;
+  branch: string | null;
+}
+
 interface StageManifest {
   schema: typeof STAGE_MANIFEST_SCHEMA;
   generationId: string;
   createdAt: string;
   sourceMeta?: MetaIdentity;
+  sourceMetaFiles?: MetaFilesIdentity;
   sourceDb?: FileIdentity;
+  sourceRepo?: RepositorySourceIdentity;
+}
+
+interface StageIntent extends Omit<StageManifest, 'schema' | 'sourceMetaFiles' | 'sourceRepo'> {
+  schema: typeof STAGE_INTENT_SCHEMA;
+  sourceMetaFiles: MetaFilesIdentity;
+  sourceRepo: RepositorySourceIdentity;
 }
 
 interface PromotionJournal {
@@ -50,6 +70,10 @@ interface PromotionJournal {
   stagedMeta: MetaIdentity;
   stagedDb: FileIdentity;
   oldDb?: FileIdentity;
+  sourceMeta?: MetaIdentity;
+  sourceMetaFiles?: MetaFilesIdentity;
+  sourceDb?: FileIdentity;
+  sourceRepo?: RepositorySourceIdentity;
   projectName?: string;
 }
 
@@ -57,6 +81,7 @@ export interface StagedAnalyzePaths {
   canonicalLbugPath: string;
   canonicalMetaDir: string;
   stageRoot: string;
+  stageIntentPath: string;
   stagedLbugPath: string;
   stagedMetaDir: string;
   stageManifestPath: string;
@@ -67,6 +92,13 @@ export interface StagedAnalyzePaths {
 export interface PromotionHooks {
   /** Test-only crash-injection seam after a durable state transition. */
   afterBoundary?: (boundary: PromotionBoundary) => void | Promise<void>;
+  /** Fresh repository identity, read immediately before promotion transitions. */
+  readRepositoryIdentity?: () => RepositorySourceIdentity | Promise<RepositorySourceIdentity>;
+}
+
+export interface PrepareStagedHooks {
+  /** Test-only crash seam after mutable stage files exist but before the manifest. */
+  afterStagePrepared?: () => void | Promise<void>;
 }
 
 export interface PromotionResult {
@@ -89,6 +121,35 @@ const metaIdentity = (meta: RepoMeta): MetaIdentity => ({
 const identitiesEqual = <T>(a?: T, b?: T): boolean =>
   a === undefined ? b === undefined : b !== undefined && JSON.stringify(a) === JSON.stringify(b);
 
+const validRepositoryIdentity = (value: unknown): value is RepositorySourceIdentity => {
+  const candidate = value as Partial<RepositorySourceIdentity> | null;
+  return (
+    !!candidate &&
+    typeof candidate.head === 'string' &&
+    (candidate.branch === null || typeof candidate.branch === 'string')
+  );
+};
+
+const validFileIdentity = (value: unknown): value is FileIdentity => {
+  const candidate = value as Partial<FileIdentity> | null;
+  return (
+    !!candidate &&
+    Number.isFinite(candidate.dev) &&
+    Number.isFinite(candidate.ino) &&
+    Number.isFinite(candidate.size) &&
+    Number.isFinite(candidate.mtimeMs)
+  );
+};
+
+const validMetaFilesIdentity = (value: unknown): value is MetaFilesIdentity => {
+  const candidate = value as MetaFilesIdentity | null;
+  return (
+    !!candidate &&
+    (candidate.primary === undefined || validFileIdentity(candidate.primary)) &&
+    (candidate.legacy === undefined || validFileIdentity(candidate.legacy))
+  );
+};
+
 const statRegularFile = async (filePath: string): Promise<FileIdentity | undefined> => {
   try {
     const stat = await fs.lstat(filePath);
@@ -99,6 +160,11 @@ const statRegularFile = async (filePath: string): Promise<FileIdentity | undefin
     throw error;
   }
 };
+
+const statMetadataFiles = async (metaDir: string): Promise<MetaFilesIdentity> => ({
+  primary: await statRegularFile(path.join(metaDir, INDEX_METADATA_FILE)),
+  legacy: await statRegularFile(path.join(metaDir, 'meta.json')),
+});
 
 const assertNoDbSidecars = async (lbugPath: string, label: string): Promise<void> => {
   const present: string[] = [];
@@ -171,11 +237,28 @@ const readManifest = async (paths: StagedAnalyzePaths): Promise<StageManifest | 
   if (
     manifest.schema !== STAGE_MANIFEST_SCHEMA ||
     typeof manifest.generationId !== 'string' ||
-    manifest.generationId.length < 8
+    manifest.generationId.length < 8 ||
+    (manifest.sourceMetaFiles !== undefined && !validMetaFilesIdentity(manifest.sourceMetaFiles)) ||
+    (manifest.sourceRepo !== undefined && !validRepositoryIdentity(manifest.sourceRepo))
   ) {
     throw new Error('Staged-analyze manifest is corrupt or from an unsupported version');
   }
   return manifest;
+};
+
+const readIntent = async (paths: StagedAnalyzePaths): Promise<StageIntent | undefined> => {
+  const intent = await readJson<StageIntent>(paths.stageIntentPath);
+  if (!intent) return undefined;
+  if (
+    intent.schema !== STAGE_INTENT_SCHEMA ||
+    typeof intent.generationId !== 'string' ||
+    intent.generationId.length < 8 ||
+    !validMetaFilesIdentity(intent.sourceMetaFiles) ||
+    !validRepositoryIdentity(intent.sourceRepo)
+  ) {
+    throw new Error('Staged-analyze intent is corrupt or from an unsupported version');
+  }
+  return intent;
 };
 
 const readJournal = async (paths: StagedAnalyzePaths): Promise<PromotionJournal | undefined> => {
@@ -189,7 +272,9 @@ const readJournal = async (paths: StagedAnalyzePaths): Promise<PromotionJournal 
     !journal.stagedMeta ||
     !journal.stagedDb ||
     typeof journal.stagedMeta.lastCommit !== 'string' ||
-    typeof journal.stagedMeta.indexedAt !== 'string'
+    typeof journal.stagedMeta.indexedAt !== 'string' ||
+    (journal.sourceMetaFiles !== undefined && !validMetaFilesIdentity(journal.sourceMetaFiles)) ||
+    (journal.sourceRepo !== undefined && !validRepositoryIdentity(journal.sourceRepo))
   ) {
     throw new Error('Staged-promotion journal is corrupt or from an unsupported version');
   }
@@ -226,6 +311,7 @@ export const getStagedAnalyzePaths = (
     canonicalLbugPath,
     canonicalMetaDir,
     stageRoot,
+    stageIntentPath: `${stageRoot}.intent.json`,
     stagedLbugPath: path.join(stageRoot, 'lbug'),
     stagedMetaDir: path.join(stageRoot, 'meta'),
     stageManifestPath: path.join(stageRoot, 'manifest.json'),
@@ -244,12 +330,14 @@ const processIsAlive = (pid: number): boolean => {
   }
 };
 
-/** Serialize staged builders; a dead owner's lock is reclaimed on the next run. */
-export const withStagedAnalyzeLock = async <T>(
+/** Serialize every analyzer writer; a dead owner's lock is reclaimed on the next run. */
+export const withAnalyzeOwnershipLock = async <T>(
   storagePath: string,
   operation: () => Promise<T>,
 ): Promise<T> => {
   await fs.mkdir(storagePath, { recursive: true });
+  // Keep the existing filename so an older staged writer and a newer ordinary
+  // writer still contend during an in-place upgrade.
   const lockPath = path.join(storagePath, 'analyze-staged.lock');
   const record: StageLockRecord = {
     schema: 'gitnexus.staged-analyze-lock/v1',
@@ -267,14 +355,14 @@ export const withStagedAnalyzeLock = async <T>(
       const owner = await readJson<StageLockRecord>(lockPath);
       if (owner?.schema === record.schema && processIsAlive(owner.pid)) {
         throw new Error(
-          `Another staged analyze is active (pid ${owner.pid}, started ${owner.startedAt}).`,
+          `Another analyze is active (pid ${owner.pid}, started ${owner.startedAt}).`,
         );
       }
-      if (attempt === 1) throw new Error('Could not reclaim the stale staged-analyze lock');
+      if (attempt === 1) throw new Error('Could not reclaim the stale analyze lock');
       await fs.rm(lockPath, { force: true });
     }
   }
-  if (!handle) throw new Error('Could not acquire the staged-analyze lock');
+  if (!handle) throw new Error('Could not acquire the analyze lock');
   try {
     await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
     await handle.sync();
@@ -286,13 +374,19 @@ export const withStagedAnalyzeLock = async <T>(
   }
 };
 
+/** @deprecated Use the common ownership lock so plain and staged writers cannot overlap. */
+export const withStagedAnalyzeLock = withAnalyzeOwnershipLock;
+
 /**
- * Create or resume the isolated build workspace. Only the stage tree may be
- * removed here, and only while a complete canonical generation is present.
+ * Create or resume the isolated build workspace. A stage tree is removed only
+ * when a complete canonical generation or a durable stage intent/manifest
+ * proves that the tree is disposable derived state.
  */
 export const prepareStagedWorkspace = async (
   paths: StagedAnalyzePaths,
   canonicalMeta: RepoMeta | null,
+  sourceRepo: RepositorySourceIdentity = { head: '', branch: null },
+  hooks: PrepareStagedHooks = {},
 ): Promise<{ resumed: boolean; generationId: string }> => {
   if (await readJournal(paths)) {
     throw new Error('A staged-promotion journal must be recovered before preparing another build');
@@ -312,12 +406,18 @@ export const prepareStagedWorkspace = async (
   if (canonicalDb) await assertNoDbSidecars(paths.canonicalLbugPath, 'Canonical index');
 
   const sourceMeta = canonicalMeta ? metaIdentity(canonicalMeta) : undefined;
+  const sourceMetaFiles = await statMetadataFiles(paths.canonicalMetaDir);
   const manifest = await readManifest(paths);
+  const intent = await readIntent(paths);
+  const sameSource = (candidate: StageManifest | StageIntent): boolean =>
+    identitiesEqual(candidate.sourceMeta, sourceMeta) &&
+    identitiesEqual(candidate.sourceMetaFiles, sourceMetaFiles) &&
+    identitiesEqual(candidate.sourceDb, canonicalDb) &&
+    identitiesEqual(candidate.sourceRepo, sourceRepo);
+
   if (manifest) {
-    const sameSource =
-      identitiesEqual(manifest.sourceMeta, sourceMeta) &&
-      identitiesEqual(manifest.sourceDb, canonicalDb);
-    if (sameSource) {
+    if (sameSource(manifest)) {
+      await fs.rm(paths.stageIntentPath, { force: true });
       const stagedDb = await statRegularFile(paths.stagedLbugPath);
       const stagedMeta = await loadMeta(paths.stagedMetaDir);
       if (canonicalDb && (!stagedDb || !stagedMeta)) {
@@ -327,26 +427,48 @@ export const prepareStagedWorkspace = async (
       }
       return { resumed: true, generationId: manifest.generationId };
     }
-    if (!canonicalDb || !canonicalMeta) {
-      throw new Error(
-        'A stale staged workspace exists but no complete canonical generation is available to replace it safely.',
-      );
-    }
+    // A valid manifest proves this is disposable derived state even for a
+    // first-generation index where no canonical DB exists yet.
     await fs.rm(paths.stageRoot, { recursive: true, force: true });
+    await fs.rm(paths.stageIntentPath, { force: true });
   } else {
+    let stageExists = false;
     try {
       await fs.lstat(paths.stageRoot);
-      if (!canonicalDb || !canonicalMeta) {
-        throw new Error(
-          'An incomplete staged workspace exists and no complete canonical generation is available for safe cleanup.',
-        );
-      }
-      await fs.rm(paths.stageRoot, { recursive: true, force: true });
+      stageExists = true;
     } catch (error) {
       if (!isMissingFilesystemError(error)) throw error;
     }
+    if (stageExists) {
+      if (!intent && (!canonicalDb || !canonicalMeta)) {
+        throw new Error(
+          'An unowned incomplete staged workspace exists and no complete canonical generation is available for safe cleanup.',
+        );
+      }
+      // A durable intent proves the incomplete tree belongs to staged analyze;
+      // removing it is safe even on the first generation. A complete canonical
+      // generation remains the fallback for legacy trees without an intent.
+      await fs.rm(paths.stageRoot, { recursive: true, force: true });
+    }
+    if (intent && !sameSource(intent)) await fs.rm(paths.stageIntentPath, { force: true });
   }
 
+  const durableIntent: StageIntent =
+    intent && sameSource(intent)
+      ? intent
+      : {
+          schema: STAGE_INTENT_SCHEMA,
+          generationId: randomBytes(16).toString('hex'),
+          createdAt: new Date().toISOString(),
+          sourceMeta,
+          sourceMetaFiles,
+          sourceDb: canonicalDb,
+          sourceRepo,
+        };
+  // This sibling intent is durable before stageRoot is created. If the process
+  // dies after mkdir/copy but before the manifest, the next run can prove the
+  // partial tree is ours and rebuild it automatically.
+  await writeDurableJson(paths.stageIntentPath, durableIntent);
   await fs.mkdir(paths.stagedMetaDir, { recursive: true });
   if (canonicalDb && canonicalMeta) {
     const tempDb = `${paths.stagedLbugPath}.copy-${randomBytes(8).toString('hex')}`;
@@ -360,15 +482,20 @@ export const prepareStagedWorkspace = async (
     await moveAndSync(tempDb, paths.stagedLbugPath);
     await saveMeta(paths.stagedMetaDir, canonicalMeta);
   }
+  await hooks.afterStagePrepared?.();
 
   const next: StageManifest = {
     schema: STAGE_MANIFEST_SCHEMA,
-    generationId: randomBytes(16).toString('hex'),
-    createdAt: new Date().toISOString(),
+    generationId: durableIntent.generationId,
+    createdAt: durableIntent.createdAt,
     sourceMeta,
+    sourceMetaFiles,
     sourceDb: canonicalDb,
+    sourceRepo,
   };
   await writeDurableJson(paths.stageManifestPath, next);
+  await fs.rm(paths.stageIntentPath, { force: true });
+  await syncDirectory(path.dirname(paths.stageIntentPath));
   return { resumed: false, generationId: next.generationId };
 };
 
@@ -377,6 +504,7 @@ export const discardStagedWorkspace = async (paths: StagedAnalyzePaths): Promise
     throw new Error('Cannot discard a staged workspace while promotion recovery is pending');
   }
   await fs.rm(paths.stageRoot, { recursive: true, force: true });
+  await fs.rm(paths.stageIntentPath, { force: true });
 };
 
 /** Validate the staged DB/meta pair before the first canonical rename. */
@@ -392,6 +520,113 @@ export const validateStagedGeneration = async (paths: StagedAnalyzePaths): Promi
     throw new Error('Staged generation still carries an incomplete write/checkpoint marker');
   }
   return meta;
+};
+
+interface CapturedPromotionSource {
+  sourceMeta?: MetaIdentity;
+  sourceMetaFiles: MetaFilesIdentity;
+  sourceDb?: FileIdentity;
+  sourceRepo: RepositorySourceIdentity;
+  hadCanonical: boolean;
+  stagedDb?: FileIdentity;
+}
+
+class PromotionSourceChangedError extends Error {
+  constructor(
+    readonly kind: 'metadata' | 'database' | 'repository',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'PromotionSourceChangedError';
+  }
+}
+
+const assertPromotionSourceUnchanged = async (
+  paths: StagedAnalyzePaths,
+  source: CapturedPromotionSource,
+  hooks: PromotionHooks,
+  allowOldDbInBackup: boolean,
+): Promise<void> => {
+  const canonicalMeta = await loadMeta(paths.canonicalMetaDir);
+  const currentMeta = canonicalMeta ? metaIdentity(canonicalMeta) : undefined;
+  if (!identitiesEqual(currentMeta, source.sourceMeta)) {
+    throw new PromotionSourceChangedError(
+      'metadata',
+      'Staged promotion refused: canonical metadata changed after the stage source was captured.',
+    );
+  }
+  const currentMetaFiles = await statMetadataFiles(paths.canonicalMetaDir);
+  if (!identitiesEqual(currentMetaFiles, source.sourceMetaFiles)) {
+    throw new PromotionSourceChangedError(
+      'metadata',
+      'Staged promotion refused: canonical metadata file identity changed after the stage source was captured.',
+    );
+  }
+
+  const canonicalDb = await statRegularFile(paths.canonicalLbugPath);
+  const backupDb = allowOldDbInBackup ? await statRegularFile(paths.backupLbugPath) : undefined;
+  const dbMatches = source.hadCanonical
+    ? identitiesEqual(canonicalDb, source.sourceDb) || identitiesEqual(backupDb, source.sourceDb)
+    : source.sourceDb === undefined &&
+      (canonicalDb === undefined ||
+        (allowOldDbInBackup && identitiesEqual(canonicalDb, source.stagedDb)));
+  if (!dbMatches) {
+    throw new PromotionSourceChangedError(
+      'database',
+      'Staged promotion refused: canonical database identity changed after the stage source was captured.',
+    );
+  }
+
+  if (hooks.readRepositoryIdentity) {
+    const currentRepo = await hooks.readRepositoryIdentity();
+    if (!identitiesEqual(currentRepo, source.sourceRepo)) {
+      throw new PromotionSourceChangedError(
+        'repository',
+        'Staged promotion refused: repository HEAD or branch changed while the staged generation was building.',
+      );
+    }
+  }
+};
+
+const rollbackPromotionForRepositoryChange = async (
+  paths: StagedAnalyzePaths,
+  journal: PromotionJournal,
+): Promise<void> => {
+  let canonical = await statRegularFile(paths.canonicalLbugPath);
+  const staged = await statRegularFile(paths.stagedLbugPath);
+  const backup = await statRegularFile(paths.backupLbugPath);
+
+  if (canonical && identitiesEqual(canonical, journal.stagedDb)) {
+    if (staged) {
+      throw new Error('Cannot roll back stale promotion because both new DB copies exist');
+    }
+    await moveAndSync(paths.canonicalLbugPath, paths.stagedLbugPath);
+    canonical = undefined;
+  }
+
+  if (journal.hadCanonical) {
+    if (canonical && identitiesEqual(canonical, journal.oldDb)) {
+      if (backup) {
+        throw new Error('Cannot roll back stale promotion because the old DB exists twice');
+      }
+    } else if (!canonical && backup && identitiesEqual(backup, journal.oldDb)) {
+      await moveAndSync(paths.backupLbugPath, paths.canonicalLbugPath);
+    } else {
+      throw new Error(
+        'Cannot roll back stale promotion because the canonical backup identity is ambiguous',
+      );
+    }
+  } else if (canonical) {
+    throw new Error(
+      'Cannot roll back stale first-generation promotion with an unknown canonical DB',
+    );
+  }
+
+  await fs.rm(paths.backupLbugPath, { force: true });
+  await fs.rm(paths.stageRoot, { recursive: true, force: true });
+  await fs.rm(paths.stageIntentPath, { force: true });
+  await fs.rm(paths.journalPath, { force: true });
+  await syncDirectory(paths.canonicalMetaDir);
 };
 
 /**
@@ -410,11 +645,28 @@ export const promoteStagedGeneration = async (
     const meta = await validateStagedGeneration(paths);
     const manifest = await readManifest(paths);
     if (!manifest) throw new Error('Staged generation manifest disappeared during validation');
+    if (!manifest.sourceMetaFiles || !manifest.sourceRepo) {
+      throw new Error(
+        'Legacy staged generation lacks source identity; rerun staged analyze to rebuild it safely.',
+      );
+    }
     const canonicalDb = await statRegularFile(paths.canonicalLbugPath);
     if (await statRegularFile(paths.backupLbugPath)) {
       throw new Error('Cannot begin promotion while an unjournaled backup generation exists');
     }
     if (canonicalDb) await assertNoDbSidecars(paths.canonicalLbugPath, 'Canonical index');
+    await assertPromotionSourceUnchanged(
+      paths,
+      {
+        sourceMeta: manifest.sourceMeta,
+        sourceMetaFiles: manifest.sourceMetaFiles,
+        sourceDb: manifest.sourceDb,
+        sourceRepo: manifest.sourceRepo,
+        hadCanonical: manifest.sourceDb !== undefined,
+      },
+      hooks,
+      false,
+    );
     journal = {
       schema: PROMOTION_JOURNAL_SCHEMA,
       generationId: manifest.generationId,
@@ -424,10 +676,44 @@ export const promoteStagedGeneration = async (
       stagedMeta: metaIdentity(meta),
       stagedDb: (await statRegularFile(paths.stagedLbugPath))!,
       oldDb: canonicalDb,
+      sourceMeta: manifest.sourceMeta,
+      sourceMetaFiles: manifest.sourceMetaFiles,
+      sourceDb: manifest.sourceDb,
+      sourceRepo: manifest.sourceRepo,
     };
     await writeDurableJson(paths.journalPath, journal);
     await hooks.afterBoundary?.('prepared');
   }
+
+  const ensureJournalSourceCurrent = async (): Promise<void> => {
+    if (journal.state === 'metadata/registry-committed') return;
+    // Journals written by the previous exact head did not capture these two
+    // guards. Preserve their artifact-identity recovery semantics; every new
+    // journal records and enforces the stronger source identity below.
+    if (!journal.sourceMetaFiles || !journal.sourceRepo) return;
+    try {
+      await assertPromotionSourceUnchanged(
+        paths,
+        {
+          sourceMeta: journal.sourceMeta,
+          sourceMetaFiles: journal.sourceMetaFiles,
+          sourceDb: journal.sourceDb,
+          sourceRepo: journal.sourceRepo,
+          hadCanonical: journal.hadCanonical,
+          stagedDb: journal.stagedDb,
+        },
+        hooks,
+        true,
+      );
+    } catch (error) {
+      if (error instanceof PromotionSourceChangedError && error.kind === 'repository') {
+        await rollbackPromotionForRepositoryChange(paths, journal);
+      }
+      throw error;
+    }
+  };
+
+  await ensureJournalSourceCurrent();
 
   if (journal.state === 'prepared') {
     const canonical = await statRegularFile(paths.canonicalLbugPath);
@@ -475,6 +761,7 @@ export const promoteStagedGeneration = async (
   }
 
   if (journal.state === 'old-backed-up') {
+    await ensureJournalSourceCurrent();
     const canonical = await statRegularFile(paths.canonicalLbugPath);
     const staged = await statRegularFile(paths.stagedLbugPath);
     const backup = await statRegularFile(paths.backupLbugPath);
@@ -506,6 +793,7 @@ export const promoteStagedGeneration = async (
   }
 
   if (journal.state === 'new-installed') {
+    await ensureJournalSourceCurrent();
     const canonical = await statRegularFile(paths.canonicalLbugPath);
     const staged = await statRegularFile(paths.stagedLbugPath);
     if (!canonical || !identitiesEqual(canonical, journal.stagedDb)) {
@@ -538,6 +826,7 @@ export const promoteStagedGeneration = async (
   }
   await fs.rm(paths.backupLbugPath, { force: true });
   await fs.rm(paths.stageRoot, { recursive: true, force: true });
+  await fs.rm(paths.stageIntentPath, { force: true });
   await fs.rm(paths.journalPath, { force: true });
   await syncDirectory(paths.canonicalMetaDir);
   return { projectName: journal.projectName, recovered };

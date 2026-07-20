@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'child_process';
 import fsSync from 'fs';
 import fs from 'fs/promises';
@@ -10,9 +10,18 @@ import {
   getStagedAnalyzePaths,
   prepareStagedWorkspace,
   promoteStagedGeneration,
+  withAnalyzeOwnershipLock,
+  type RepositorySourceIdentity,
 } from '../../src/core/staged-promotion.js';
 
 const tempDirs: string[] = [];
+
+const repositoryIdentity = (repo: string): RepositorySourceIdentity => ({
+  head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim(),
+  branch:
+    execFileSync('git', ['branch', '--show-current'], { cwd: repo, encoding: 'utf8' }).trim() ||
+    null,
+});
 
 describe('runFullAnalysis --staged', () => {
   let priorHome: string | undefined;
@@ -89,7 +98,7 @@ describe('runFullAnalysis --staged', () => {
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('recovers a missing canonical pathname before rejecting a branch mismatch', async () => {
+  it('rolls back a missing canonical pathname before refusing a changed branch', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-recover-'));
     tempDirs.push(repo);
     process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
@@ -111,7 +120,7 @@ describe('runFullAnalysis --staged', () => {
     const canonicalMeta = await loadMeta(canonical.storagePath);
     if (!canonicalMeta) throw new Error('expected canonical metadata');
     const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
-    await prepareStagedWorkspace(staged, canonicalMeta);
+    await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
     await saveMeta(staged.stagedMetaDir, {
       ...canonicalMeta,
       indexedAt: '2026-07-20T12:00:00.000Z',
@@ -132,7 +141,7 @@ describe('runFullAnalysis --staged', () => {
         { staged: true, branch: originalBranch, skipAgentsMd: true, skipSkills: true },
         { onProgress: () => {} },
       ),
-    ).rejects.toThrow('does not match the checked-out branch');
+    ).rejects.toThrow('repository HEAD or branch changed');
     await expect(fs.access(canonical.lbugPath)).resolves.toBeUndefined();
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
@@ -158,7 +167,7 @@ describe('runFullAnalysis --staged', () => {
     if (!canonicalMeta) throw new Error('expected canonical metadata');
     const before = await fs.stat(canonical.lbugPath);
     const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
-    await prepareStagedWorkspace(staged, canonicalMeta);
+    await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
     await saveMeta(staged.stagedMetaDir, {
       ...canonicalMeta,
       indexedAt: '2026-07-20T12:00:00.000Z',
@@ -176,5 +185,85 @@ describe('runFullAnalysis --staged', () => {
     await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.access(staged.backupLbugPath)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('recovers an old-backed-up journal during plain analyze before its fast path', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-plain-recover-'));
+    const registryHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-plain-registry-'));
+    tempDirs.push(repo, registryHome);
+    process.env.GITNEXUS_HOME = registryHome;
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+
+    const canonical = getStoragePaths(repo);
+    const canonicalMeta = await loadMeta(canonical.storagePath);
+    if (!canonicalMeta) throw new Error('expected canonical metadata');
+    const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
+    await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
+    await saveMeta(staged.stagedMetaDir, {
+      ...canonicalMeta,
+      indexedAt: '2026-07-20T12:00:00.000Z',
+    });
+    await expect(
+      promoteStagedGeneration(staged, async () => 'repo', {
+        afterBoundary: (boundary) => {
+          if (boundary === 'old-backed-up') throw new Error('simulated crash');
+        },
+      }),
+    ).rejects.toThrow('simulated crash');
+    await expect(fs.access(canonical.lbugPath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await expect(
+      runFullAnalysis(
+        repo,
+        { incrementalOnly: true, skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      ),
+    ).rejects.toThrow('staged-promotion journal requires recovery');
+    await expect(fs.access(canonical.lbugPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(staged.journalPath)).resolves.toBeUndefined();
+
+    const result = await runFullAnalysis(
+      repo,
+      { skipAgentsMd: true, skipSkills: true },
+      { onProgress: () => {} },
+    );
+
+    expect(result.alreadyUpToDate).toBe(true);
+    await expect(fs.access(canonical.lbugPath)).resolves.toBeUndefined();
+    await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('uses the same ownership lock for ordinary and staged analyze', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-common-lock-'));
+    tempDirs.push(repo);
+    const storage = getStoragePaths(repo).storagePath;
+    let release!: () => void;
+    const owner = withAnalyzeOwnershipLock(
+      storage,
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await vi.waitFor(async () => {
+      await expect(fs.access(path.join(storage, 'analyze-staged.lock'))).resolves.toBeUndefined();
+    });
+
+    await expect(runFullAnalysis(repo, {}, { onProgress: () => {} })).rejects.toThrow(
+      'Another analyze is active',
+    );
+    await expect(runFullAnalysis(repo, { staged: true }, { onProgress: () => {} })).rejects.toThrow(
+      'Another analyze is active',
+    );
+    release();
+    await owner;
   });
 });

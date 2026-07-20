@@ -6,12 +6,14 @@ import {
   getStagedAnalyzePaths,
   prepareStagedWorkspace,
   promoteStagedGeneration,
-  withStagedAnalyzeLock,
+  withAnalyzeOwnershipLock,
   type PromotionBoundary,
+  type RepositorySourceIdentity,
 } from '../../src/core/staged-promotion.js';
 import { loadMeta, saveMeta, type RepoMeta } from '../../src/storage/repo-manager.js';
 
 const tempDirs: string[] = [];
+const sourceRepo: RepositorySourceIdentity = { head: 'source-head', branch: 'main' };
 
 const makeMeta = (generation: string): RepoMeta => ({
   repoPath: '/repo',
@@ -32,11 +34,11 @@ const setup = async (withCanonical = true) => {
     await saveMeta(canonicalMetaDir, oldMeta);
   }
   const paths = getStagedAnalyzePaths(canonicalLbugPath, canonicalMetaDir);
-  await prepareStagedWorkspace(paths, oldMeta);
+  await prepareStagedWorkspace(paths, oldMeta, sourceRepo);
   await fs.writeFile(paths.stagedLbugPath, 'new-generation');
   const newMeta = makeMeta('new');
   await saveMeta(paths.stagedMetaDir, newMeta);
-  return { paths, canonicalLbugPath, canonicalMetaDir, newMeta };
+  return { paths, canonicalLbugPath, canonicalMetaDir, newMeta, sourceRepo };
 };
 
 const exists = async (filePath: string): Promise<boolean> =>
@@ -122,6 +124,31 @@ describe('staged promotion journal', () => {
     expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe('new-generation');
   });
 
+  it('preserves recovery for a journal written before source guards were added', async () => {
+    const { paths, canonicalLbugPath, canonicalMetaDir } = await setup();
+    const commit = async (meta: RepoMeta) => {
+      await saveMeta(canonicalMetaDir, meta);
+      return 'repo';
+    };
+    await expect(
+      promoteStagedGeneration(paths, commit, {
+        afterBoundary: (boundary) => {
+          if (boundary === 'old-backed-up') throw new Error('crash');
+        },
+      }),
+    ).rejects.toThrow('crash');
+    const legacyJournal = JSON.parse(await fs.readFile(paths.journalPath, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    delete legacyJournal.sourceMetaFiles;
+    delete legacyJournal.sourceRepo;
+    await fs.writeFile(paths.journalPath, `${JSON.stringify(legacyJournal)}\n`);
+
+    await promoteStagedGeneration(paths, commit);
+    expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe('new-generation');
+  });
+
   it('restores the old generation when the staged DB disappears after backup', async () => {
     const { paths, canonicalLbugPath, canonicalMetaDir } = await setup();
     await expect(
@@ -161,12 +188,16 @@ describe('staged promotion journal', () => {
     const { paths, canonicalLbugPath } = await setup();
     await fs.writeFile(paths.stagedLbugPath, 'partial-new-generation');
     const oldMeta = makeMeta('old');
-    await expect(prepareStagedWorkspace(paths, oldMeta)).resolves.toMatchObject({ resumed: true });
+    await expect(prepareStagedWorkspace(paths, oldMeta, sourceRepo)).resolves.toMatchObject({
+      resumed: true,
+    });
     expect(await fs.readFile(paths.stagedLbugPath, 'utf8')).toBe('partial-new-generation');
 
     await new Promise((resolve) => setTimeout(resolve, 5));
     await fs.writeFile(canonicalLbugPath, 'externally-changed-canonical');
-    await expect(prepareStagedWorkspace(paths, oldMeta)).resolves.toMatchObject({ resumed: false });
+    await expect(prepareStagedWorkspace(paths, oldMeta, sourceRepo)).resolves.toMatchObject({
+      resumed: false,
+    });
     expect(await fs.readFile(paths.stagedLbugPath, 'utf8')).toBe('externally-changed-canonical');
   });
 
@@ -186,14 +217,82 @@ describe('staged promotion journal', () => {
     ).rejects.toThrow('unresolved LadybugDB sidecars');
     expect(await fs.readFile(lbugPath, 'utf8')).toBe('canonical');
   });
+
+  it('refuses promotion when canonical DB or metadata changed after prepare', async () => {
+    const { paths, canonicalLbugPath, canonicalMetaDir } = await setup();
+    await fs.writeFile(canonicalLbugPath, 'newer-canonical-generation');
+    await saveMeta(canonicalMetaDir, {
+      ...makeMeta('old'),
+      indexedAt: '2026-07-20T00:00:09.000Z',
+    });
+
+    await expect(promoteStagedGeneration(paths, async () => 'repo')).rejects.toThrow(
+      'canonical metadata changed',
+    );
+    expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe('newer-canonical-generation');
+    expect((await loadMeta(canonicalMetaDir))?.indexedAt).toBe('2026-07-20T00:00:09.000Z');
+  });
+
+  it('refuses promotion when only the canonical DB identity changed after prepare', async () => {
+    const { paths, canonicalLbugPath } = await setup();
+    await fs.writeFile(canonicalLbugPath, 'newer-canonical-generation');
+
+    await expect(promoteStagedGeneration(paths, async () => 'repo')).rejects.toThrow(
+      'canonical database identity changed',
+    );
+    expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe('newer-canonical-generation');
+  });
+
+  it('refuses promotion when metadata files were replaced with the same semantic values', async () => {
+    const { paths, canonicalMetaDir } = await setup();
+    await saveMeta(canonicalMetaDir, makeMeta('old'));
+
+    await expect(promoteStagedGeneration(paths, async () => 'repo')).rejects.toThrow(
+      'metadata file identity changed',
+    );
+  });
+
+  it('refuses promotion when repository HEAD or branch changed after prepare', async () => {
+    const { paths, canonicalLbugPath } = await setup();
+
+    await expect(
+      promoteStagedGeneration(paths, async () => 'repo', {
+        readRepositoryIdentity: () => ({ head: 'new-head', branch: 'other' }),
+      }),
+    ).rejects.toThrow('repository HEAD or branch changed');
+    expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe('old-generation');
+  });
+
+  it('recovers a first-generation crash after stage creation but before its manifest', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-first-intent-'));
+    tempDirs.push(root);
+    const metaDir = path.join(root, '.gitnexus');
+    const paths = getStagedAnalyzePaths(path.join(metaDir, 'lbug'), metaDir);
+
+    await expect(
+      prepareStagedWorkspace(paths, null, sourceRepo, {
+        afterStagePrepared: () => {
+          throw new Error('crash-before-manifest');
+        },
+      }),
+    ).rejects.toThrow('crash-before-manifest');
+    expect(await exists(paths.stageIntentPath)).toBe(true);
+    expect(await exists(paths.stageManifestPath)).toBe(false);
+
+    await expect(prepareStagedWorkspace(paths, null, sourceRepo)).resolves.toMatchObject({
+      resumed: false,
+    });
+    expect(await exists(paths.stageManifestPath)).toBe(true);
+    expect(await exists(paths.stageIntentPath)).toBe(false);
+  });
 });
 
-describe('staged analyze lock', () => {
-  it('refuses a concurrent staged builder', async () => {
+describe('common analyze ownership lock', () => {
+  it('refuses a concurrent ordinary or staged writer', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-stage-lock-'));
     tempDirs.push(root);
     let release!: () => void;
-    const first = withStagedAnalyzeLock(
+    const first = withAnalyzeOwnershipLock(
       root,
       () =>
         new Promise<void>((resolve) => {
@@ -204,8 +303,8 @@ describe('staged analyze lock', () => {
       await expect(fs.access(path.join(root, 'analyze-staged.lock'))).resolves.toBeUndefined();
     });
 
-    await expect(withStagedAnalyzeLock(root, async () => undefined)).rejects.toThrow(
-      'Another staged analyze is active',
+    await expect(withAnalyzeOwnershipLock(root, async () => undefined)).rejects.toThrow(
+      'Another analyze is active',
     );
     release();
     await first;
@@ -224,7 +323,7 @@ describe('staged analyze lock', () => {
       })}\n`,
     );
 
-    await expect(withStagedAnalyzeLock(root, async () => 'ok')).resolves.toBe('ok');
+    await expect(withAnalyzeOwnershipLock(root, async () => 'ok')).resolves.toBe('ok');
     await expect(fs.access(path.join(root, 'analyze-staged.lock'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
