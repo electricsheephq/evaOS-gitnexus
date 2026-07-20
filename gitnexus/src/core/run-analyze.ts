@@ -2133,7 +2133,7 @@ const runFullAnalysisImpl = async (
       if (!skipForCap) {
         embeddingSkipped = false;
         if (capDisabled && stats.nodes > DEFAULT_EMBEDDING_NODE_LIMIT) {
-          if (httpMode && options.embeddingsNodeLimit === undefined) {
+          if (httpMode) {
             log(
               `Remote embedding endpoint selected — generating embeddings for ` +
                 `${stats.nodes.toLocaleString()} nodes; the ` +
