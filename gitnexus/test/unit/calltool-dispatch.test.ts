@@ -24,6 +24,11 @@ const { lbugMocks, platformMocks } = vi.hoisted(() => ({
     executeParameterized: vi.fn().mockResolvedValue([]),
     closeLbug: vi.fn().mockResolvedValue(undefined),
     isLbugReady: vi.fn().mockReturnValue(true),
+    getPoolCapabilities: vi.fn().mockReturnValue({
+      fts: true,
+      vector: true,
+      connectionCount: 8,
+    }),
   },
   platformMocks: {
     isVectorExtensionSupportedByPlatform: vi.fn().mockReturnValue(true),
@@ -302,6 +307,11 @@ describe('LocalBackend.callTool', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    lbugMocks.getPoolCapabilities.mockReturnValue({
+      fts: true,
+      vector: true,
+      connectionCount: 8,
+    });
     backend = new LocalBackend();
     setupSingleRepo();
     await backend.init();
@@ -649,6 +659,27 @@ describe('LocalBackend.callTool', () => {
     expect(result).not.toHaveProperty('warning');
   });
 
+  it('does not enter BM25 when FTS failed on one pool connection', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockClear();
+    lbugMocks.getPoolCapabilities.mockReturnValue({
+      fts: false,
+      vector: true,
+      connectionCount: 8,
+    });
+    vi.mocked(executeQuery).mockResolvedValue([]);
+    vi.mocked(executeParameterized).mockResolvedValue([]);
+
+    const result = await backend.callTool('query', { query: 'auth' });
+
+    expect(searchFTSFromLbug).not.toHaveBeenCalled();
+    expect(result.retrieval).toMatchObject({
+      keyword_mode: 'unavailable',
+      semantic_mode: 'not-indexed',
+    });
+    expect(result.warning).toMatch(/repair-fts/i);
+  });
+
   it('does not crash when searchFTSFromLbug throws (#1489)', async () => {
     const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
     vi.mocked(searchFTSFromLbug).mockRejectedValueOnce(new Error('bm25Results is not iterable'));
@@ -684,7 +715,7 @@ describe('LocalBackend.callTool', () => {
     (executeParameterized as any).mockResolvedValue([]);
 
     try {
-      await backend.callTool('query', { query: 'auth' });
+      const result = await backend.callTool('query', { query: 'auth' });
 
       const queries = (executeQuery as any).mock.calls.map(
         ([, cypher]: [string, string]) => cypher,
@@ -706,6 +737,12 @@ describe('LocalBackend.callTool', () => {
             ),
           ),
       ).toBe(true);
+      expect(result.retrieval).toMatchObject({
+        keyword_mode: 'bm25',
+        semantic_mode: 'exact-scan',
+        embedding_count: 1,
+        semantic_reason: 'vector-extension-unsupported',
+      });
     } finally {
       cap.restore();
     }
@@ -719,13 +756,48 @@ describe('LocalBackend.callTool', () => {
     });
     (executeParameterized as any).mockResolvedValue([]);
 
-    await backend.callTool('query', { query: 'auth' });
+    const result = await backend.callTool('query', { query: 'auth' });
 
     const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
     expect(queries.some((cypher: string) => cypher.includes('QUERY_VECTOR_INDEX'))).toBe(true);
+    expect(
+      queries.some(
+        (cypher: string) =>
+          cypher.includes('RETURN e.nodeId AS nodeId') &&
+          cypher.includes('e.embedding AS embedding'),
+      ),
+    ).toBe(false);
     // The configured threshold must reach the WHERE clause (MCP default 0.6), guarding
     // against a regression that drops the filter or re-hardcodes a different value.
     expect(queries.some((cypher: string) => cypher.includes('distance < 0.6'))).toBe(true);
+    expect(result.retrieval).toMatchObject({
+      semantic_mode: 'vector-index',
+      embedding_count: 1,
+      semantic_reason: 'vector-index-query-succeeded',
+    });
+    expect(result).not.toHaveProperty('partial');
+  });
+
+  it('skips HNSW when VECTOR did not load on every pool connection', async () => {
+    lbugMocks.getPoolCapabilities.mockReturnValue({
+      fts: true,
+      vector: false,
+      connectionCount: 8,
+    });
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 1 }];
+      return [];
+    });
+    (executeParameterized as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('query', { query: 'auth' });
+    const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
+
+    expect(queries.some((cypher: string) => cypher.includes('QUERY_VECTOR_INDEX'))).toBe(false);
+    expect(result.retrieval).toMatchObject({
+      semantic_mode: 'exact-scan',
+      semantic_reason: 'vector-extension-unavailable',
+    });
   });
 
   it('warns once when VECTOR query failure falls back to exact scan', async () => {
@@ -739,13 +811,20 @@ describe('LocalBackend.callTool', () => {
     const cap = _captureLogger();
 
     try {
-      await backend.callTool('query', { query: 'auth' });
+      const first = await backend.callTool('query', { query: 'auth' });
       await backend.callTool('query', { query: 'auth' });
 
       const warnings = cap
         .records()
         .filter((record) => String(record.msg).includes('using exact scan fallback'));
       expect(warnings).toHaveLength(1);
+      expect(first.retrieval).toMatchObject({
+        semantic_mode: 'exact-scan',
+        embedding_count: 1,
+        semantic_reason: 'vector-index-query-failed',
+      });
+      expect(first).not.toHaveProperty('partial');
+      expect(JSON.stringify(first)).not.toContain('HNSW index unavailable');
     } finally {
       cap.restore();
     }
@@ -764,7 +843,7 @@ describe('LocalBackend.callTool', () => {
     const cap = _captureLogger();
 
     try {
-      await backend.callTool('query', { query: 'auth' });
+      const result = await backend.callTool('query', { query: 'auth' });
 
       expect(
         cap
@@ -779,6 +858,17 @@ describe('LocalBackend.callTool', () => {
       expect(queries.some((cypher: string) => cypher.includes('e.embedding AS embedding'))).toBe(
         false,
       );
+      expect(result).toMatchObject({
+        partial: true,
+        retrieval: {
+          semantic_mode: 'unavailable',
+          embedding_count: 2,
+          semantic_reason: 'exact-scan-limit-exceeded',
+          exact_scan_limit: 1,
+        },
+      });
+      expect(result.warning).toMatch(/BM25-only/);
+      expect(JSON.stringify(result)).not.toContain('HNSW index unavailable');
     } finally {
       cap.restore();
       if (previous === undefined) delete process.env.GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT;

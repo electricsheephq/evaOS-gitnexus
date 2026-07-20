@@ -69,7 +69,14 @@ function makeBackend(ftsUsed = true): LocalBackend {
     endLine: 2,
   };
   (backend as any).bm25Search = vi.fn().mockResolvedValue({ results: [sym], ftsUsed });
-  (backend as any).semanticSearch = vi.fn().mockResolvedValue([]);
+  (backend as any).semanticSearch = vi.fn().mockResolvedValue({
+    results: [],
+    mode: 'not-indexed',
+    embeddingCount: 0,
+    reason: 'no-embeddings-indexed',
+    exactScanLimit: 10_000,
+    omitted: false,
+  });
   return { backend, repoHandle } as any;
 }
 

@@ -200,6 +200,50 @@ export function repoVectorDoctorStatus(meta: RepoMeta | null | undefined): {
   };
 }
 
+export interface DoctorPoolProbe {
+  fts: boolean;
+  vector: boolean;
+  exercisedConnections: number;
+  connectionCount: number;
+  reason: string | null;
+}
+
+/**
+ * Probe the actual indexed read pool without invoking any recovery path.
+ * Optional extensions are aggregated across every pre-warmed connection.
+ */
+export async function probeDoctorPool(dbPath: string): Promise<DoctorPoolProbe> {
+  const repoId = `doctor:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  let closePool: ((repoId?: string) => Promise<void>) | undefined;
+  try {
+    // Keep the native pool out of doctor.ts's static import graph so `doctor`
+    // can still report a missing/broken lbugjs.node via checkLbugNative().
+    const pool = await import('../core/lbug/pool-adapter.js');
+    closePool = pool.closeLbug;
+    await pool.initLbugNonRecovering(repoId, dbPath);
+    const capabilities = pool.getPoolCapabilities(repoId);
+    if (!capabilities) throw new Error('read pool did not publish capability state');
+    const exercisedConnections = await pool.probePoolConnections(repoId);
+    return {
+      fts: capabilities.fts,
+      vector: capabilities.vector,
+      exercisedConnections,
+      connectionCount: capabilities.connectionCount,
+      reason: null,
+    };
+  } catch (err) {
+    return {
+      fts: false,
+      vector: false,
+      exercisedConnections: 0,
+      connectionCount: 0,
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    if (closePool) await closePool(repoId).catch(() => {});
+  }
+}
+
 export const doctorCommand = async (
   inputPath?: string,
   options: { recoveryPlan?: boolean } = {},
@@ -215,6 +259,10 @@ export const doctorCommand = async (
   const fingerprint = getRuntimeFingerprint();
   const capabilities = getRuntimeCapabilities();
   const embeddingConfig = resolveEmbeddingConfig();
+  const requestedPath = inputPath ? path.resolve(inputPath) : process.cwd();
+  const repoRoot = getGitRoot(requestedPath) ?? requestedPath;
+  const storagePaths = getStoragePaths(repoRoot);
+  const repoMeta = await loadMeta(storagePaths.storagePath).catch(() => null);
 
   console.log(t('doctor.title') + '\n');
   console.log(t('doctor.runtime'));
@@ -242,8 +290,16 @@ export const doctorCommand = async (
   console.log(`  ${label('doctor.labels.graphStore', 18)}${capabilities.graph}`);
   // Live LOAD probe, not the static platform capability — the static value
   // said "available" while analyze failed to load the extension (#2374).
+  const poolProbe = nativeCheck.ok && repoMeta ? await probeDoctorPool(storagePaths.lbugPath) : null;
   const ftsProbe = nativeCheck.ok
-    ? await probeFtsExtensionLoad()
+    ? poolProbe
+      ? {
+          loaded: poolProbe.fts,
+          reason: poolProbe.fts
+            ? undefined
+            : (poolProbe.reason ?? 'FTS did not load on every read-pool connection'),
+        }
+      : await probeFtsExtensionLoad()
     : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
   console.log(
     `  ${label('doctor.labels.fullTextSearch', 18)}${ftsProbe.loaded ? 'available' : 'unavailable'}`,
@@ -261,13 +317,28 @@ export const doctorCommand = async (
     }
   }
   const vectorProbe = nativeCheck.ok
-    ? await probeVectorExtensionLoad()
+    ? poolProbe
+      ? {
+          loaded: poolProbe.vector,
+          reason: poolProbe.vector
+            ? undefined
+            : (poolProbe.reason ?? 'VECTOR did not load on every read-pool connection'),
+        }
+      : await probeVectorExtensionLoad()
     : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
   console.log(
     `  ${label('doctor.labels.vectorIndex', 18)}${vectorProbe.loaded ? 'available' : 'unavailable'}`,
   );
   if (!vectorProbe.loaded && vectorProbe.reason) {
     console.log(`  ${padDisplayEnd('', 18)}${vectorProbe.reason}`);
+  }
+  if (poolProbe) {
+    console.log(
+      `  ${padDisplayEnd('Pool connections:', 18)}` +
+        (poolProbe.connectionCount > 0
+          ? `${poolProbe.exercisedConnections}/${poolProbe.connectionCount} exercised`
+          : 'unavailable'),
+    );
   }
   console.log(`  ${label('doctor.labels.semanticMode', 18)}${capabilities.semanticMode}`);
   // Surface the optional-extension install policy so offline users can see
@@ -286,9 +357,6 @@ export const doctorCommand = async (
   );
   if (capabilities.reason)
     console.log(`  ${label('doctor.labels.note', 18)}${capabilities.reason}`);
-  const requestedPath = inputPath ? path.resolve(inputPath) : process.cwd();
-  const repoRoot = getGitRoot(requestedPath) ?? requestedPath;
-  const repoMeta = await loadMeta(getStoragePaths(repoRoot).storagePath).catch(() => null);
   const repoVector = repoVectorDoctorStatus(repoMeta);
   console.log(`  ${padDisplayEnd('Repo VECTOR:', 18)}${repoVector.status}`);
   if (repoVector.detail) {

@@ -17,7 +17,11 @@
 
 import fs from 'fs/promises';
 import lbug from '@ladybugdb/core';
-import { isReadOnlyDbError, loadFTSExtension } from './lbug-adapter.js';
+import {
+  isReadOnlyDbError,
+  loadFTSExtension,
+  loadVectorExtension,
+} from './lbug-adapter.js';
 import { closeQueryResults } from './query-result-utils.js';
 import {
   createLbugDatabase,
@@ -55,6 +59,17 @@ interface PoolEntry {
   dbPath: string;
   /** Set to true when the pool entry is closed — checkin will close orphaned connections */
   closed: boolean;
+  /** Optional search capabilities available on every connection in this pool. */
+  capabilities: PoolCapabilities;
+}
+
+export interface PoolCapabilities {
+  /** True only when FTS loaded successfully on every pre-warmed connection. */
+  fts: boolean;
+  /** True only when VECTOR loaded successfully on every pre-warmed connection. */
+  vector: boolean;
+  /** Number of connections prepared before the pool was published. */
+  connectionCount: number;
 }
 
 const pool = new Map<string, PoolEntry>();
@@ -562,6 +577,35 @@ async function openReadOnlyDatabase(dbPath: string): Promise<lbug.Database> {
 }
 
 /**
+ * Open a read-only Database without any sidecar quarantine or writable replay.
+ * Used by `doctor`, whose capability probe must observe the real index without
+ * repairing or otherwise mutating it.
+ */
+async function openReadOnlyDatabaseNonRecovering(dbPath: string): Promise<lbug.Database> {
+  let db: lbug.Database | undefined;
+  silenceStdout();
+  try {
+    await preflightLbugSidecars(dbPath, {
+      mode: 'read-only',
+      logger: poolSidecarLogger,
+      allowQuarantine: false,
+    });
+    db = createLbugDatabase(lbug, toNativeSafePath(dbPath), {
+      readOnly: true,
+      throwOnWalReplayFailure: false,
+    });
+    await db.init();
+    await probeDatabaseForShadowReplay(db);
+    return db;
+  } catch (err) {
+    if (db) await db.close().catch(() => {});
+    throw err;
+  } finally {
+    restoreStdout();
+  }
+}
+
+/**
  * Quarantine the .wal file and retry opening the database.
  * Used when the initial open fails with a WAL corruption error.
  */
@@ -616,11 +660,68 @@ export const initLbug = async (repoId: string, dbPath: string): Promise<void> =>
 };
 
 /**
- * Internal init — creates DB, pre-warms connections, loads FTS, then registers pool.
+ * Initialize the real read pool without invoking WAL quarantine or writable
+ * shadow replay. This is deliberately separate from normal MCP initialization:
+ * diagnostic callers may inspect capability but must never repair the index.
+ */
+export const initLbugNonRecovering = async (repoId: string, dbPath: string): Promise<void> => {
+  const existing = pool.get(repoId);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    return;
+  }
+
+  const pending = initPromises.get(repoId);
+  if (pending) return pending;
+
+  const promise = doInitLbug(repoId, dbPath, { allowRecovery: false });
+  initPromises.set(repoId, promise);
+  try {
+    await promise;
+  } finally {
+    initPromises.delete(repoId);
+  }
+};
+
+/**
+ * Prepare optional extensions on every connection before publishing the pool.
+ * A partial load disables that capability for the whole pool while preserving
+ * graph queries; callers must never assume a capability from one lucky slot.
+ */
+async function preparePoolConnections(
+  connections: lbug.Connection[],
+): Promise<PoolCapabilities> {
+  let fts = true;
+  let vector = true;
+
+  // Keep native LOAD calls sequential. They target independent connections,
+  // but some LadybugDB builds are not safe to initialize extensions in parallel.
+  for (const connection of connections) {
+    try {
+      if (!(await loadFTSExtension(connection, { policy: 'load-only' }))) fts = false;
+    } catch {
+      fts = false;
+    }
+    try {
+      if (!(await loadVectorExtension(connection, { policy: 'load-only' }))) vector = false;
+    } catch {
+      vector = false;
+    }
+  }
+
+  return { fts, vector, connectionCount: connections.length };
+}
+
+/**
+ * Internal init — creates DB, pre-warms connections, loads optional extensions, then registers pool.
  * Pool entry is registered LAST so concurrent executeQuery calls see either
  * "not initialized" (and throw) or a fully ready pool — never a half-built one.
  */
-async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
+async function doInitLbug(
+  repoId: string,
+  dbPath: string,
+  options: { allowRecovery?: boolean } = {},
+): Promise<void> {
   // Check if database exists
   try {
     await fs.stat(dbPath);
@@ -640,7 +741,9 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= LOCK_RETRY_ATTEMPTS; attempt++) {
       try {
-        const db = await openReadOnlyDatabase(dbPath);
+        const db = options.allowRecovery === false
+          ? await openReadOnlyDatabaseNonRecovering(dbPath)
+          : await openReadOnlyDatabase(dbPath);
         shared = { db, refCount: 0, ftsLoaded: false };
         dbCache.set(dbPath, shared);
         break;
@@ -648,6 +751,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
         lastError = err instanceof Error ? err : new Error(String(err));
 
         if (isWalCorruptionError(lastError)) {
+          if (options.allowRecovery === false) throw lastError;
           try {
             const db = await tryQuarantineAndReopen(dbPath, repoId);
             shared = { db, refCount: 0, ftsLoaded: false };
@@ -702,18 +806,11 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     preWarmActive = false;
   }
 
-  // Load FTS extension once per shared Database.
-  // Done BEFORE pool registration so no concurrent checkout can grab
-  // the connection while the async FTS load is in progress.
-  // policy: 'load-only' — the read pool must never trigger a network
-  // install; analyze owns extension installation. If LOAD fails, search
-  // features degrade gracefully and the user-facing query path proceeds.
-  if (!shared.ftsLoaded) {
-    shared.ftsLoaded = await loadFTSExtension(available[0], { policy: 'load-only' });
-  }
+  const capabilities = await preparePoolConnections(available);
+  shared.ftsLoaded = capabilities.fts;
 
-  // Register pool entry only after all connections are pre-warmed and FTS is
-  // loaded.  Concurrent executeQuery calls see either "not initialized"
+  // Register pool entry only after all connections are pre-warmed and optional
+  // extensions are prepared. Concurrent executeQuery calls see either "not initialized"
   // (and throw cleanly) or a fully ready pool — never a half-built one.
   pool.set(repoId, {
     db,
@@ -723,6 +820,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     lastUsed: Date.now(),
     dbPath,
     closed: false,
+    capabilities,
   });
   ensureIdleTimer();
   traceRss('init', repoId);
@@ -771,12 +869,8 @@ export async function initLbugWithDb(
     preWarmActive = false;
   }
 
-  // Load FTS extension if not already loaded on this Database.
-  // policy: 'load-only' — same contract as initLbug above; the read pool
-  // must not block on a network install during query execution.
-  if (!shared.ftsLoaded) {
-    shared.ftsLoaded = await loadFTSExtension(available[0], { policy: 'load-only' });
-  }
+  const capabilities = await preparePoolConnections(available);
+  shared.ftsLoaded = capabilities.fts;
 
   pool.set(repoId, {
     db: existingDb,
@@ -786,6 +880,7 @@ export async function initLbugWithDb(
     lastUsed: Date.now(),
     dbPath,
     closed: false,
+    capabilities,
   });
   ensureIdleTimer();
   traceRss('init', repoId);
@@ -878,6 +973,34 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 export const executeQuery = async (repoId: string, cypher: string): Promise<any[]> => {
   return await executeParameterized(repoId, cypher, {});
+};
+
+/** Return the aggregate, all-connections capability state for a ready pool. */
+export const getPoolCapabilities = (repoId: string): PoolCapabilities | null => {
+  const capabilities = pool.get(repoId)?.capabilities;
+  return capabilities ? { ...capabilities } : null;
+};
+
+/**
+ * Exercise every pre-warmed connection concurrently. Since checkout occurs
+ * before each query yields, the fan-out reserves all eight distinct pool
+ * connections before any can be returned.
+ */
+export const probePoolConnections = async (repoId: string): Promise<number> => {
+  const entry = pool.get(repoId);
+  if (!entry) {
+    throw new Error(`LadybugDB not initialized for repo "${repoId}". Call initLbug first.`);
+  }
+
+  const probes = await Promise.all(
+    Array.from({ length: entry.capabilities.connectionCount }, () =>
+      executeQuery(repoId, 'RETURN 1 AS ok'),
+    ),
+  );
+  if (probes.some((rows) => rows.length === 0)) {
+    throw new Error('LadybugDB pool probe returned no rows.');
+  }
+  return probes.length;
 };
 
 /**

@@ -31,6 +31,7 @@ vi.mock('@ladybugdb/core', () => ({
 
 vi.mock('../../src/core/lbug/lbug-adapter.js', () => ({
   loadFTSExtension: vi.fn().mockResolvedValue(true),
+  loadVectorExtension: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock('../../src/core/lbug/lbug-config.js', () => ({
@@ -135,6 +136,43 @@ describe('WAL corruption recovery in doInitLbug (#1402)', () => {
     expect(stderrWriteMock).toHaveBeenCalledWith(
       expect.stringContaining('WAL quarantined for test-repo-init'),
     );
+  });
+
+  it('does not quarantine or retry WAL corruption during a diagnostic init', async () => {
+    const { initLbugNonRecovering } = await import('../../src/core/lbug/pool-adapter.js');
+    const badDb = makeMockDb();
+    badDb.init = vi.fn().mockRejectedValueOnce(new Error('Corrupted wal file'));
+    (createLbugDatabase as any).mockReturnValueOnce(badDb);
+
+    await expect(
+      initLbugNonRecovering('doctor-nonrecovering', '/tmp/test-wal-recovery/doctor-lbug'),
+    ).rejects.toThrow(/corrupted wal/i);
+
+    expect(createLbugDatabase).toHaveBeenCalledTimes(1);
+    expect(fs.rename).not.toHaveBeenCalled();
+  });
+
+  it('does not open writable to replay shadow pages during a diagnostic init', async () => {
+    const { initLbugNonRecovering } = await import('../../src/core/lbug/pool-adapter.js');
+    const readOnlyDb = makeMockDb();
+    connectionQueryMock.mockRejectedValueOnce(
+      new Error(
+        "Runtime exception: Couldn't replay shadow pages under read-only mode. Please re-open the database with read-write mode to replay shadow pages.",
+      ),
+    );
+    (createLbugDatabase as any).mockReturnValueOnce(readOnlyDb);
+
+    await expect(
+      initLbugNonRecovering('doctor-no-replay', '/tmp/test-shadow-replay/doctor-lbug'),
+    ).rejects.toThrow(/replay shadow pages/i);
+
+    expect(createLbugDatabase).toHaveBeenCalledTimes(1);
+    expect(createLbugDatabase).toHaveBeenCalledWith(
+      expect.anything(),
+      '/tmp/test-shadow-replay/doctor-lbug',
+      expect.objectContaining({ readOnly: true }),
+    );
+    expect(fs.rename).not.toHaveBeenCalled();
   });
 
   it('replays shadow pages with a temporary writable open before pooling read-only DBs', async () => {
