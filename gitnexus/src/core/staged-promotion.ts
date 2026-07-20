@@ -535,6 +535,7 @@ class PromotionSourceChangedError extends Error {
   constructor(
     readonly kind: 'metadata' | 'database' | 'repository',
     message: string,
+    readonly metadataState?: 'source' | 'staged',
   ) {
     super(message);
     this.name = 'PromotionSourceChangedError';
@@ -546,21 +547,30 @@ const assertPromotionSourceUnchanged = async (
   source: CapturedPromotionSource,
   hooks: PromotionHooks,
   allowOldDbInBackup: boolean,
-): Promise<void> => {
+  allowedStagedMeta?: RepoMeta,
+): Promise<'source' | 'staged'> => {
   const canonicalMeta = await loadMeta(paths.canonicalMetaDir);
   const currentMeta = canonicalMeta ? metaIdentity(canonicalMeta) : undefined;
-  if (!identitiesEqual(currentMeta, source.sourceMeta)) {
+  const metadataState =
+    allowedStagedMeta && identitiesEqual(canonicalMeta, allowedStagedMeta)
+      ? 'staged'
+      : identitiesEqual(currentMeta, source.sourceMeta)
+        ? 'source'
+        : undefined;
+  if (!metadataState) {
     throw new PromotionSourceChangedError(
       'metadata',
       'Staged promotion refused: canonical metadata changed after the stage source was captured.',
     );
   }
-  const currentMetaFiles = await statMetadataFiles(paths.canonicalMetaDir);
-  if (!identitiesEqual(currentMetaFiles, source.sourceMetaFiles)) {
-    throw new PromotionSourceChangedError(
-      'metadata',
-      'Staged promotion refused: canonical metadata file identity changed after the stage source was captured.',
-    );
+  if (metadataState === 'source') {
+    const currentMetaFiles = await statMetadataFiles(paths.canonicalMetaDir);
+    if (!identitiesEqual(currentMetaFiles, source.sourceMetaFiles)) {
+      throw new PromotionSourceChangedError(
+        'metadata',
+        'Staged promotion refused: canonical metadata file identity changed after the stage source was captured.',
+      );
+    }
   }
 
   const canonicalDb = await statRegularFile(paths.canonicalLbugPath);
@@ -583,9 +593,11 @@ const assertPromotionSourceUnchanged = async (
       throw new PromotionSourceChangedError(
         'repository',
         'Staged promotion refused: repository HEAD or branch changed while the staged generation was building.',
+        metadataState,
       );
     }
   }
+  return metadataState;
 };
 
 const rollbackPromotionForRepositoryChange = async (
@@ -691,6 +703,16 @@ export const promoteStagedGeneration = async (
     // guards. Preserve their artifact-identity recovery semantics; every new
     // journal records and enforces the stronger source identity below.
     if (!journal.sourceMetaFiles || !journal.sourceRepo) return;
+    let allowedStagedMeta: RepoMeta | undefined;
+    if (journal.state === 'new-installed') {
+      allowedStagedMeta = await loadMeta(paths.stagedMetaDir);
+      if (
+        !allowedStagedMeta ||
+        !identitiesEqual(metaIdentity(allowedStagedMeta), journal.stagedMeta)
+      ) {
+        throw new Error('Staged metadata identity changed after promotion was prepared');
+      }
+    }
     try {
       await assertPromotionSourceUnchanged(
         paths,
@@ -704,9 +726,14 @@ export const promoteStagedGeneration = async (
         },
         hooks,
         true,
+        allowedStagedMeta,
       );
     } catch (error) {
-      if (error instanceof PromotionSourceChangedError && error.kind === 'repository') {
+      if (
+        error instanceof PromotionSourceChangedError &&
+        error.kind === 'repository' &&
+        error.metadataState !== 'staged'
+      ) {
         await rollbackPromotionForRepositoryChange(paths, journal);
       }
       throw error;
