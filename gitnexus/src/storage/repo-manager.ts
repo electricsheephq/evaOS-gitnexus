@@ -19,7 +19,12 @@ import { realpathSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { randomBytes } from 'crypto';
-import { getInferredRepoName, resolveRepoIdentityRoot } from './git.js';
+import {
+  getInferredRepoName,
+  getRemoteUrl,
+  normalizeRepositoryRemote,
+  resolveRepoIdentityRoot,
+} from './git.js';
 import { retryRename } from './fs-atomic.js';
 import { logger } from '../core/logger.js';
 import {
@@ -878,6 +883,104 @@ const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
   await fs.rename(tmp, target);
 };
 
+interface RegistryLockRecord {
+  schema: 'gitnexus.registry-lock/v1';
+  pid: number;
+  nonce: string;
+  startedAt: string;
+}
+
+const REGISTRY_LOCK_RETRY_DELAY_MS = 25;
+const REGISTRY_LOCK_MAX_ATTEMPTS = 200;
+const REGISTRY_LOCK_UNINITIALIZED_GRACE_MS = 5_000;
+
+const registryProcessIsAlive = (pid: number): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+};
+
+const readRegistryLock = async (lockPath: string): Promise<RegistryLockRecord | null> => {
+  try {
+    const parsed = JSON.parse(await fs.readFile(lockPath, 'utf8')) as Partial<RegistryLockRecord>;
+    if (
+      parsed.schema !== 'gitnexus.registry-lock/v1' ||
+      !Number.isSafeInteger(parsed.pid) ||
+      typeof parsed.nonce !== 'string' ||
+      !parsed.nonce ||
+      typeof parsed.startedAt !== 'string'
+    ) {
+      return null;
+    }
+    return parsed as RegistryLockRecord;
+  } catch {
+    return null;
+  }
+};
+
+const waitForRegistryLock = async (): Promise<void> => {
+  await new Promise((resolve) => setTimeout(resolve, REGISTRY_LOCK_RETRY_DELAY_MS));
+};
+
+const withRegistryMutationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
+  const lockPath = `${getGlobalRegistryPath()}.lock`;
+  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  const record: RegistryLockRecord = {
+    schema: 'gitnexus.registry-lock/v1',
+    pid: process.pid,
+    nonce: randomBytes(16).toString('hex'),
+    startedAt: new Date().toISOString(),
+  };
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+
+  for (let attempt = 0; attempt < REGISTRY_LOCK_MAX_ATTEMPTS; attempt++) {
+    try {
+      handle = await fs.open(lockPath, 'wx', 0o600);
+      await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
+      await handle.sync();
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        const acquired = handle;
+        handle = undefined;
+        await acquired?.close().catch(() => {});
+        if (acquired) await fs.rm(lockPath, { force: true });
+        throw error;
+      }
+
+      const owner = await readRegistryLock(lockPath);
+      if (owner && !registryProcessIsAlive(owner.pid)) {
+        const current = await readRegistryLock(lockPath);
+        if (current?.nonce === owner.nonce) await fs.rm(lockPath, { force: true });
+        continue;
+      }
+      if (!owner) {
+        const state = await fs.stat(lockPath).catch(() => null);
+        if (state && Date.now() - state.mtimeMs > REGISTRY_LOCK_UNINITIALIZED_GRACE_MS) {
+          await fs.rm(lockPath, { force: true });
+          continue;
+        }
+      }
+      await waitForRegistryLock();
+    }
+  }
+
+  if (!handle) {
+    throw new Error('GitNexus: unable to acquire the registry mutation lock');
+  }
+  try {
+    return await operation();
+  } finally {
+    await handle.close().catch(() => {});
+    const current = await readRegistryLock(lockPath);
+    if (current?.nonce === record.nonce) await fs.rm(lockPath, { force: true });
+  }
+};
+
 /**
  * Options for {@link registerRepo}. All optional — callers without any
  * disambiguation requirement can keep calling `registerRepo(path, meta)`
@@ -944,6 +1047,62 @@ export class RegistryNameCollisionError extends Error {
     this.name = 'RegistryNameCollisionError';
   }
 }
+
+/**
+ * Stable local-CLI failure for a second top-level index of the same logical
+ * remote. Registry insertion order defines the current canonical record: the
+ * first registered normalized remote remains canonical until an operator
+ * explicitly repairs the registry.
+ */
+export class RepositoryRemoteCollisionError extends Error {
+  readonly kind = 'RepositoryRemoteCollisionError' as const;
+  readonly code = 'repository_remote_collision' as const;
+
+  constructor(
+    public readonly canonicalPath: string,
+    public readonly requestedPath: string,
+    public readonly remoteIdentity: string,
+  ) {
+    super(
+      `repository_remote_collision: this Git remote already has a canonical top-level index at "${canonicalPath}". ` +
+        `Refusing to register a second index at "${requestedPath}". Use the canonical path or repair the registry explicitly.`,
+    );
+    this.name = 'RepositoryRemoteCollisionError';
+  }
+}
+
+const assertRemoteIdentityAvailable = (
+  entries: readonly RegistryEntry[],
+  repoPath: string,
+  remoteUrl: string | undefined,
+): void => {
+  const remoteIdentity = normalizeRepositoryRemote(remoteUrl);
+  if (!remoteIdentity) return;
+
+  const canonical = entries.find(
+    (entry) => normalizeRepositoryRemote(entry.remoteUrl) === remoteIdentity,
+  );
+  if (!canonical) return;
+
+  const requestedPath = canonicalizePath(repoPath);
+  const canonicalPath = canonicalizePath(canonical.path);
+  if (registryPathEquals(canonicalPath, requestedPath)) return;
+
+  throw new RepositoryRemoteCollisionError(canonical.path, path.resolve(repoPath), remoteIdentity);
+};
+
+/**
+ * Read-only preflight used before analysis opens or mutates an index. Remotes
+ * that cannot form a normalized remote identity (no origin, filesystem path, file:)
+ * return immediately and retain the legacy path-based local-only behavior.
+ */
+export const assertCanonicalRepositoryIdentity = async (
+  repoPath: string,
+  remoteUrl: string | undefined,
+): Promise<void> => {
+  if (!normalizeRepositoryRemote(remoteUrl)) return;
+  assertRemoteIdentityAvailable(await readRegistry(), repoPath, remoteUrl);
+};
 
 /** Returns true when a previously-registered entry's `name` differs from
  *  both `path.basename(entry.path)` and the git-remote-derived name —
@@ -1018,7 +1177,13 @@ export const registerRepo = async (
   // falling back to `path.resolve` when the path doesn't exist.
   const canonicalInput = canonicalizePath(repoPath);
 
+  // Capture a current origin when callers provide older metadata without the
+  // remote fingerprint (`gitnexus index` and direct API callers). No origin
+  // leaves the repository path-scoped and local-only.
+  const remoteUrl = meta.remoteUrl?.trim() || getRemoteUrl(resolved);
+
   const entries = await readRegistry();
+  assertRemoteIdentityAvailable(entries, resolved, remoteUrl);
   const existingIdx = entries.findIndex((e) => {
     // Canonicalise the STORED entry too so pre-canonicalisation
     // registries (written by older versions, or paths passed in a
@@ -1106,7 +1271,7 @@ export const registerRepo = async (
       storagePath,
       indexedAt: flatMeta?.indexedAt ?? meta.indexedAt,
       lastCommit: flatMeta?.lastCommit ?? meta.lastCommit,
-      remoteUrl: flatMeta?.remoteUrl ?? meta.remoteUrl,
+      remoteUrl: flatMeta?.remoteUrl ?? remoteUrl,
       stats: flatMeta?.stats ?? meta.stats,
       ...(flatMeta?.branch ? { branch: flatMeta.branch } : {}),
     };
@@ -1122,7 +1287,7 @@ export const registerRepo = async (
       storagePath,
       indexedAt: meta.indexedAt,
       lastCommit: meta.lastCommit,
-      remoteUrl: meta.remoteUrl,
+      remoteUrl,
       stats: meta.stats,
       ...(meta.branch ? { branch: meta.branch } : {}),
       ...(existing?.branches ? { branches: existing.branches } : {}),
@@ -1133,33 +1298,38 @@ export const registerRepo = async (
   // R9): re-derive THIS run's delta against the FRESHEST snapshot so a
   // concurrent change to the OTHER axis (a branch upsert vs a primary refresh)
   // survives instead of being clobbered by a stale entry-time view.
-  const fresh = await readRegistry();
-  const freshIdx = fresh.findIndex((e) => {
-    const a = canonicalizePath(e.path);
-    return registryPathEquals(a, canonicalInput);
-  });
-  const freshExisting = freshIdx >= 0 ? fresh[freshIdx] : null;
-  let merged: RegistryEntry;
-  if (summary) {
-    // Branch run: keep the FRESH top-level + branches, just upsert our summary.
-    const base = freshExisting ?? entry;
-    const branches = (base.branches ?? []).filter((b) => b.branch !== summary.branch);
-    branches.push(summary);
-    merged = { ...base, name, branches };
-  } else {
-    // Primary run: apply our refreshed top-level, but defer to the FRESH
-    // branches[] (a concurrent branch upsert or `clean --branch` wins).
-    merged = { ...entry };
-    if (freshExisting?.branches) merged.branches = freshExisting.branches;
-    else delete merged.branches;
-  }
-  if (freshIdx >= 0) {
-    fresh[freshIdx] = merged;
-  } else {
-    fresh.push(merged);
-  }
+  await withRegistryMutationLock(async () => {
+    const fresh = await readRegistry();
+    // Close the analyze/index TOCTOU window: another process may have registered
+    // this remote after the initial read but before our atomic registry write.
+    assertRemoteIdentityAvailable(fresh, resolved, remoteUrl);
+    const freshIdx = fresh.findIndex((e) => {
+      const a = canonicalizePath(e.path);
+      return registryPathEquals(a, canonicalInput);
+    });
+    const freshExisting = freshIdx >= 0 ? fresh[freshIdx] : null;
+    let merged: RegistryEntry;
+    if (summary) {
+      // Branch run: keep the FRESH top-level + branches, just upsert our summary.
+      const base = freshExisting ?? entry;
+      const branches = (base.branches ?? []).filter((b) => b.branch !== summary.branch);
+      branches.push(summary);
+      merged = { ...base, name, branches };
+    } else {
+      // Primary run: apply our refreshed top-level, but defer to the FRESH
+      // branches[] (a concurrent branch upsert or `clean --branch` wins).
+      merged = { ...entry };
+      if (freshExisting?.branches) merged.branches = freshExisting.branches;
+      else delete merged.branches;
+    }
+    if (freshIdx >= 0) {
+      fresh[freshIdx] = merged;
+    } else {
+      fresh.push(merged);
+    }
 
-  await writeRegistry(fresh);
+    await writeRegistry(fresh);
+  });
   return name;
 };
 
@@ -1720,12 +1890,15 @@ export const findSiblingClones = async (
   remoteUrl: string | undefined,
   selfPath: string,
 ): Promise<RegistryEntry[]> => {
-  if (!remoteUrl) return [];
+  const remoteIdentity = normalizeRepositoryRemote(remoteUrl);
+  if (!remoteIdentity) return [];
   const entries = await readRegistry();
   const isWin = process.platform === 'win32';
   const norm = (p: string) => (isWin ? path.resolve(p).toLowerCase() : path.resolve(p));
   const self = norm(selfPath);
-  return entries.filter((e) => e.remoteUrl === remoteUrl && norm(e.path) !== self);
+  return entries.filter(
+    (e) => normalizeRepositoryRemote(e.remoteUrl) === remoteIdentity && norm(e.path) !== self,
+  );
 };
 
 /**

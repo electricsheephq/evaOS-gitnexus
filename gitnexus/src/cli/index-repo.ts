@@ -135,7 +135,20 @@ export const indexCommand = async (inputPathParts?: string[], options?: IndexOpt
   if (!meta.remoteUrl && isGitRepo(repoPath)) {
     meta.remoteUrl = getRemoteUrl(repoPath);
   }
-  await registerRepo(repoPath, meta);
+  try {
+    await registerRepo(repoPath, meta);
+  } catch (error) {
+    if (
+      error &&
+      typeof error === 'object' &&
+      (error as { code?: unknown }).code === 'repository_remote_collision'
+    ) {
+      console.log(`  ${(error as Error).message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
   await ensureGitNexusIgnored(repoPath);
 
   const projectName = path.basename(repoPath);

@@ -24,7 +24,10 @@ import { diagnoseExtensionLoad } from '../core/lbug/extension-load-error.js';
 import { getExtensionInstallPolicy } from '../core/lbug/extension-loader.js';
 import { getGitRoot } from '../storage/git.js';
 import { getStoragePaths, loadMeta, type RepoMeta } from '../storage/repo-manager.js';
+import { probeDoctorPool } from './doctor-pool-probe.js';
 import { t } from './i18n/index.js';
+
+export { probeDoctorPool, type DoctorPoolProbe } from './doctor-pool-probe.js';
 
 function isCombiningMark(codePoint: number): boolean {
   return (
@@ -200,59 +203,74 @@ export function repoVectorDoctorStatus(meta: RepoMeta | null | undefined): {
   };
 }
 
-export interface DoctorPoolProbe {
-  fts: boolean;
-  vector: boolean;
-  exercisedConnections: number;
-  connectionCount: number;
-  reason: string | null;
-}
-
-/**
- * Probe the actual indexed read pool without invoking any recovery path.
- * Optional extensions are aggregated across every pre-warmed connection.
- */
-export async function probeDoctorPool(dbPath: string): Promise<DoctorPoolProbe> {
-  const repoId = `doctor:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  let closePool: ((repoId?: string) => Promise<void>) | undefined;
-  try {
-    // Keep the native pool out of doctor.ts's static import graph so `doctor`
-    // can still report a missing/broken lbugjs.node via checkLbugNative().
-    const pool = await import('../core/lbug/pool-adapter.js');
-    closePool = pool.closeLbug;
-    await pool.initLbugNonRecovering(repoId, dbPath);
-    const capabilities = pool.getPoolCapabilities(repoId);
-    if (!capabilities) throw new Error('read pool did not publish capability state');
-    const exercisedConnections = await pool.probePoolConnections(repoId);
-    return {
-      fts: capabilities.fts,
-      vector: capabilities.vector,
-      exercisedConnections,
-      connectionCount: capabilities.connectionCount,
-      reason: null,
-    };
-  } catch (err) {
-    return {
-      fts: false,
-      vector: false,
-      exercisedConnections: 0,
-      connectionCount: 0,
-      reason: err instanceof Error ? err.message : String(err),
-    };
-  } finally {
-    if (closePool) await closePool(repoId).catch(() => {});
-  }
-}
-
 export const doctorCommand = async (
   inputPath?: string,
-  options: { recoveryPlan?: boolean } = {},
+  options: {
+    recoveryPlan?: boolean;
+    mcpConfig?: boolean;
+    registry?: boolean;
+    json?: boolean;
+    showPaths?: boolean;
+  } = {},
 ) => {
+  const selectedModes = [options.recoveryPlan, options.mcpConfig, options.registry].filter(
+    Boolean,
+  ).length;
+  if (selectedModes > 1) {
+    throw new Error('--recovery-plan, --mcp-config, and --registry are mutually exclusive');
+  }
+  if (options.showPaths && !options.registry) {
+    throw new Error('--show-paths may only be used with --registry');
+  }
+  if (options.json && !options.mcpConfig && !options.registry) {
+    throw new Error('--json may only be used with --mcp-config or --registry');
+  }
+
   if (options.recoveryPlan) {
     const repoPath = inputPath
       ? path.resolve(inputPath)
       : (getGitRoot(process.cwd()) ?? process.cwd());
     console.log(formatRecoveryPlan(await buildRecoveryPlan(repoPath)));
+    return;
+  }
+
+  if (options.mcpConfig) {
+    const { buildMcpConfigDoctorReport } = await import('./mcp-config-doctor.js');
+    const report = await buildMcpConfigDoctorReport();
+    if (options.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else if (report.valid) {
+      console.log('MCP repository policy: valid (read-only preflight)');
+    } else if ('failureClass' in report) {
+      console.log('MCP repository policy: invalid (read-only preflight)');
+      console.log(`  environment: ${report.environmentKey}`);
+      console.log(`  entry:       ${report.entryPosition}`);
+      console.log(`  failure:     ${report.failureClass}`);
+    }
+    if (!report.valid) process.exitCode = 1;
+    return;
+  }
+
+  if (options.registry) {
+    const { buildRegistryDoctorReport } = await import('./registry-doctor.js');
+    const report = await buildRegistryDoctorReport({ showPaths: options.showPaths });
+    if (options.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log('GitNexus registry doctor (read-only)');
+      console.log(`  entries:                 ${report.summary.entries}`);
+      console.log(`  remote identities:       ${report.summary.remoteIdentities}`);
+      console.log(`  local-only entries:      ${report.summary.localOnlyEntries}`);
+      console.log(`  remote collision groups: ${report.summary.remoteCollisionGroups}`);
+      console.log(`  alias collision groups:  ${report.summary.aliasCollisionGroups}`);
+      console.log(`  count mismatches:         ${report.summary.countMismatches}`);
+      console.log(`  recovery states:         ${report.summary.recoveryStateEntries}`);
+      console.log(`  database locks:          ${report.summary.lockedEntries}`);
+      console.log(`  unsafe storage entries:  ${report.summary.unsafeStorageEntries}`);
+      if (!options.showPaths) {
+        console.log('  paths:                   hidden (use --show-paths to reveal)');
+      }
+    }
     return;
   }
 

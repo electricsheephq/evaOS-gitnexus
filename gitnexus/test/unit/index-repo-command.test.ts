@@ -181,6 +181,25 @@ describe('indexCommand', () => {
     expect(process.exitCode).toBeUndefined();
   });
 
+  it('reports a canonical remote collision before mutating git ignore state', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    mockRegisterRepo.mockRejectedValueOnce(
+      Object.assign(
+        new Error('repository_remote_collision: canonical top-level index is at "/canonical/repo"'),
+        { code: 'repository_remote_collision', canonicalPath: '/canonical/repo' },
+      ),
+    );
+
+    const { indexCommand } = await import('../../src/cli/index-repo.js');
+    await indexCommand(['/repo']);
+
+    expect(process.exitCode).toBe(1);
+    expect(mockEnsureGitNexusIgnored).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      '  repository_remote_collision: canonical top-level index is at "/canonical/repo"\n',
+    );
+  });
+
   it('registers non-git path when --allow-non-git is set', async () => {
     mockIsGitRepo.mockReturnValue(false);
 

@@ -209,6 +209,12 @@ export const en = {
   'help.option.analyze.embeddingDevice': 'Embedding device: auto, cpu, dml, cuda, or wasm',
   'help.option.doctor.recoveryPlan':
     'Print a read-only interrupted-analysis recovery plan and exit',
+  'help.option.doctor.mcpConfig':
+    'Validate MCP repository policy without binding or opening an index',
+  'help.option.doctor.registry':
+    'Inspect registry identities, metadata, sidecars, and database counts',
+  'help.option.doctor.json': 'Print machine-readable output (only with --mcp-config or --registry)',
+  'help.option.doctor.showPaths': 'Reveal absolute registry paths (only with --registry)',
   'help.option.index.force': 'Register even if index metadata is missing (stats will be empty)',
   'help.option.index.allowNonGit': 'Allow registering folders that are not Git repositories',
   'help.option.port': 'Port number',
