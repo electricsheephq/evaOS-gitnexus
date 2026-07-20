@@ -47,6 +47,7 @@ const unavailableEmbeddingQuery = {
   mode: 'unavailable',
   embeddingCount: 5,
   reason: 'embedding-query-failed',
+  exactScanLimit: expect.any(Number),
   omitted: true,
 };
 
