@@ -70,6 +70,7 @@ import {
   resolveEmbeddingRuntime,
 } from '../core/embeddings/runtime-install.js';
 import { warnIfNpm11NpxRisk } from './resolve-invocation.js';
+import { createAnalyzeResourceLogger } from './analyze-resource-log.js';
 
 // Capture stderr.write at module load BEFORE anything (LadybugDB native
 // init, progress bar, console redirection) can monkey-patch it. The
@@ -126,17 +127,17 @@ const installFatalHandlers = (): void => {
   });
 };
 
-/** Historical floor for the re-exec heap cap — the auto-sizer never goes below
- *  this, so small boxes / CI never regress. */
-const DEFAULT_HEAP_MB = 16384;
+const MIN_HEAP_MB = 2048;
+const MAX_HEAP_MB = 6144;
 
 /**
- * RAM-aware re-exec heap cap (MB): `0.75 × effective RAM`, clamped to
- * `>= DEFAULT_HEAP_MB`. Kept BELOW physical RAM on purpose — a cap `>=` RAM makes
- * V8 collect lazily and inflate the heap into swap-thrash (observed analyzing the
- * Linux kernel at a 30GB cap on a 31GB box). `constrainedBytes` is the cgroup
- * limit or `null`; it is honored only as a real, smaller-than-physical cap, because
- * `process.constrainedMemory()` returns a huge sentinel when UNCONSTRAINED.
+ * RAM-aware re-exec heap cap (MB): `0.5 × effective RAM`, clamped to
+ * `[2048, 6144]`. Keeping the cap materially below physical RAM leaves room for
+ * LadybugDB, worker processes, native embedding buffers, and the OS instead of
+ * allowing V8 to turn a large analysis into swap-thrash. `constrainedBytes` is
+ * the cgroup limit or `null`; it is honored only as a real, smaller-than-physical
+ * cap because `process.constrainedMemory()` returns a huge sentinel when
+ * unconstrained.
  */
 export function computeHeapCapMb(totalBytes: number, constrainedBytes: number | null): number {
   const effectiveBytes =
@@ -144,7 +145,7 @@ export function computeHeapCapMb(totalBytes: number, constrainedBytes: number | 
       ? constrainedBytes
       : totalBytes;
   const effectiveMb = Math.floor(effectiveBytes / (1024 * 1024));
-  return Math.max(DEFAULT_HEAP_MB, Math.floor(0.75 * effectiveMb));
+  return Math.max(MIN_HEAP_MB, Math.min(MAX_HEAP_MB, Math.floor(0.5 * effectiveMb)));
 }
 
 function readConstrainedBytes(): number | null {
@@ -518,7 +519,7 @@ const RECOMMENDED_WAL_CHECKPOINT_THRESHOLD = 64 * 1024 * 1024;
  *  if we're currently below that. A user-supplied NODE_OPTIONS heap wins (no re-exec). */
 async function ensureHeap(): Promise<boolean> {
   const nodeOpts = process.env.NODE_OPTIONS || '';
-  if (nodeOpts.includes('--max-old-space-size')) return false;
+  if (/--max[-_]old[-_]space[-_]size(?:=|\s|$)/u.test(nodeOpts)) return false;
 
   const v8Heap = v8.getHeapStatistics().heap_size_limit;
   if (v8Heap >= HEAP_MB * 1024 * 1024 * 0.9) return false;
@@ -538,7 +539,7 @@ async function ensureHeap(): Promise<boolean> {
   if (childExit.status !== 0 || childExit.signal) {
     if (childProcessLikelyOom(childExit)) {
       cliError(
-        `  Analysis likely ran out of memory (heap cap auto-sized to ${RESPAWN_HEAP_MB}MB ≈ 0.75x RAM).\n` +
+        `  Analysis likely ran out of memory (heap cap auto-sized to ${RESPAWN_HEAP_MB}MB; 50% of effective RAM, clamped to 2048–6144MB).\n` +
           `  This repository's working set exceeds available RAM. Use a machine with more RAM,\n` +
           `  or override the cap (a cap above physical RAM causes swap-thrash — use with care):\n` +
           `    NODE_OPTIONS="--max-old-space-size=<MB>" gitnexus analyze [your-args]\n` +
@@ -609,6 +610,8 @@ const restoreAnalyzeEnv = (snap: AnalyzeEnvSnapshot): void => {
 
 export interface AnalyzeOptions {
   force?: boolean;
+  /** Build an isolated generation and journal its promotion into the canonical slot. */
+  staged?: boolean;
   /** Refuse any analyze path that would require a full DB rebuild. */
   incrementalOnly?: boolean;
   repairFts?: boolean;
@@ -1258,29 +1261,65 @@ const analyzeCommandImpl = async (
 
   bar.start(100, 0, { phase: 'Initializing...' });
 
-  // Graceful SIGINT handling. Pino's default destination is `sync: false`
+  const resourceLog = await createAnalyzeResourceLogger();
+  let resourceLogFailureReported = false;
+  const reportResourceLogFailure = (): void => {
+    if (resourceLogFailureReported) return;
+    resourceLogFailureReported = true;
+    realStderrWrite('\n  Warning: analyze resource logging failed; analysis will continue.\n');
+  };
+  const emitResourceEvent = async (
+    event: Parameters<NonNullable<typeof resourceLog>['emit']>[0],
+    phase?: string,
+    percent?: number,
+  ): Promise<void> => {
+    try {
+      await resourceLog?.emit(event, phase, percent);
+    } catch {
+      reportResourceLogFailure();
+    }
+  };
+  const closeResourceLog = async (): Promise<void> => {
+    try {
+      await resourceLog?.close();
+    } catch {
+      reportResourceLogFailure();
+    }
+  };
+  await emitResourceEvent('start', 'initializing', 0);
+
+  // Graceful SIGINT/SIGTERM handling. Pino's default destination is `sync: false`
   // (buffered) — flush before exit so in-flight records reach stderr.
   // See `gitnexus/src/core/logger.ts:flushLoggerSync`.
   let aborted = false;
-  const sigintHandler = () => {
+  const signalHandler = (signal: 'SIGINT' | 'SIGTERM') => {
     if (aborted) process.exit(1);
     aborted = true;
     bar.stop();
-    console.log('\n  Interrupted — cleaning up...');
+    console.log(
+      signal === 'SIGINT'
+        ? '\n  Interrupted — checkpointing before exit...'
+        : '\n  Termination requested — checkpointing before exit...',
+    );
     // Bounded CHECKPOINT-then-exit (#2264 review P3): skip the native close (the
     // LadybugDB destructor can double-free after --pdg writes), but don't hang
     // behind a long --pdg COPY holding the connection lock — bound it so a single
     // Ctrl-C stays responsive; the WAL replays on the next analyze. A second
     // Ctrl-C (`if (aborted) process.exit(1)` above) remains the escape hatch.
     void boundedCheckpointBeforeExit({
-      exitCode: 130,
+      exitCode: signal === 'SIGINT' ? 130 : 143,
       beforeExit: async () => {
+        await emitResourceEvent('signal', signal.toLowerCase(), undefined);
+        await closeResourceLog();
         const { flushLoggerSync } = await import('../core/logger.js');
         flushLoggerSync();
       },
     });
   };
+  const sigintHandler = () => signalHandler('SIGINT');
+  const sigtermHandler = () => signalHandler('SIGTERM');
   process.on('SIGINT', sigintHandler);
+  process.on('SIGTERM', sigtermHandler);
 
   // Route console output through bar.log() to prevent progress bar corruption.
   // This is a deliberate UI pattern (not a logging concern): analyze runs a
@@ -1341,6 +1380,7 @@ const analyzeCommandImpl = async (
         // needs a fresh pipelineResult. Has no bearing on the registry
         // collision guard (see allowDuplicateName below).
         force: options.force || options.skills,
+        staged: options.staged,
         incrementalOnly: options.incrementalOnly,
         repairFts: options.repairFts,
         embeddings: embeddingsEnabled,
@@ -1388,6 +1428,7 @@ const analyzeCommandImpl = async (
       {
         onProgress: (_phase, percent, message) => {
           updateBar(percent, message);
+          void emitResourceEvent('progress', _phase, percent);
         },
         onLog: barLog,
       },
@@ -1423,6 +1464,9 @@ const analyzeCommandImpl = async (
       }
       clearInterval(elapsedTimer);
       process.removeListener('SIGINT', sigintHandler);
+      process.removeListener('SIGTERM', sigtermHandler);
+      await emitResourceEvent('complete', 'already-up-to-date', 100);
+      await closeResourceLog();
       console.log = origLog;
       // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
       console.warn = origWarn;
@@ -1443,6 +1487,9 @@ const analyzeCommandImpl = async (
     if (result.ftsRepairedOnly) {
       clearInterval(elapsedTimer);
       process.removeListener('SIGINT', sigintHandler);
+      process.removeListener('SIGTERM', sigtermHandler);
+      await emitResourceEvent('complete', 'fts-repair', 100);
+      await closeResourceLog();
       console.log = origLog;
       // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
       console.warn = origWarn;
@@ -1528,6 +1575,9 @@ const analyzeCommandImpl = async (
 
     clearInterval(elapsedTimer);
     process.removeListener('SIGINT', sigintHandler);
+    process.removeListener('SIGTERM', sigtermHandler);
+    await emitResourceEvent('complete', 'done', 100);
+    await closeResourceLog();
 
     console.log = origLog;
     // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
@@ -1567,6 +1617,9 @@ const analyzeCommandImpl = async (
   } catch (err: unknown) {
     clearInterval(elapsedTimer);
     process.removeListener('SIGINT', sigintHandler);
+    process.removeListener('SIGTERM', sigtermHandler);
+    await emitResourceEvent('error', 'failed', undefined);
+    await closeResourceLog();
     console.log = origLog;
     // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
     console.warn = origWarn;

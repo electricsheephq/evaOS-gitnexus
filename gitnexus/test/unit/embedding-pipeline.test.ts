@@ -779,6 +779,68 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(checkpoints).toEqual([2, 3]);
   });
 
+  it('pages 5,001 nodes by 512, checkpoints exactly 5,000, and caps embed calls at 8', async () => {
+    mockEmbedderSetup();
+    const nodes = Array.from({ length: 5_001 }, (_, index) =>
+      makeNode({
+        id: `Function:node-${String(index).padStart(5, '0')}:src/main.ts`,
+        name: `node${index}`,
+        content: `function node${index}() { return ${index}; }`,
+      }),
+    );
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const executeQuery = vi.fn(async (cypher: string) => {
+      queryCalls.push(cypher);
+      if (!cypher.includes('MATCH (n:`Function`)')) return [];
+      const inMatch = cypher.match(/WHERE n\.id IN \[(.*?)\] RETURN/s);
+      if (inMatch) {
+        const ids = [...inMatch[1].matchAll(/'([^']+)'/g)].map((match) => match[1]);
+        return ids.map((id) => byId.get(id)).filter(Boolean);
+      }
+      const afterId = cypher.match(/WHERE n\.id > '([^']+)'/)?.[1];
+      const start = afterId ? nodes.findIndex((node) => node.id > afterId) : 0;
+      if (start < 0) return [];
+      return nodes.slice(start, start + 512);
+    });
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+    const identityPageSizes: number[] = [];
+    const checkpointWindowSizes: number[] = [];
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+    const { embedBatch } = await import('../../src/core/embeddings/embedder.js');
+
+    const result = await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      { batchSize: 64, subBatchSize: 64 },
+      undefined,
+      undefined,
+      {
+        loadExistingEmbeddingHashes: async (nodeIds) => {
+          identityPageSizes.push(nodeIds.length);
+          return new Map();
+        },
+        onCheckpointWindowStart: async ({ nodeIds }) => {
+          checkpointWindowSizes.push(nodeIds.length);
+        },
+      },
+    );
+
+    expect(result.nodesProcessed).toBe(5_001);
+    expect(checkpointWindowSizes).toEqual([5_000, 1]);
+    expect(Math.max(...identityPageSizes)).toBeLessThanOrEqual(512);
+    expect(
+      executeQuery.mock.calls
+        .map(([cypher]) => cypher as string)
+        .filter((cypher) => cypher.includes('MATCH (n:'))
+        .every((cypher) => cypher.includes('LIMIT 512')),
+    ).toBe(true);
+    expect(Math.max(...vi.mocked(embedBatch).mock.calls.map(([texts]) => texts.length))).toBe(8);
+    const createCalls = stmtCalls.filter((call) => call.cypher.includes('CREATE'));
+    expect(Math.max(...createCalls.map((call) => call.params.length))).toBe(8);
+  });
+
   it('deletes pending-window rows whose node is no longer embeddable', async () => {
     mockEmbedderSetup();
     const live = makeNode({ id: 'Function:live:src/live.ts', name: 'live' });

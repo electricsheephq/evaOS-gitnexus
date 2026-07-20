@@ -1708,13 +1708,27 @@ export const getLbugStats = async (): Promise<{ nodes: number; edges: number }> 
  *
  * Detects old schema (no chunkIndex column) and returns empty cache to trigger rebuild.
  */
-export const loadCachedEmbeddings = async (): Promise<{
+export interface LoadCachedEmbeddingsOptions {
+  /** Stream vectors instead of retaining them in the returned arrays. */
+  onBatch?: (batch: readonly CachedEmbedding[]) => void | Promise<void>;
+  /** Hard-capped at 256 so a 2,048-dimensional index stays bounded. */
+  batchSize?: number;
+}
+
+export const loadCachedEmbeddings = async (
+  options: LoadCachedEmbeddingsOptions = {},
+): Promise<{
   embeddingNodeIds: Set<string>;
   embeddings: CachedEmbedding[];
 }> => {
   const c = conn;
   if (!c) {
     return { embeddingNodeIds: new Set(), embeddings: [] };
+  }
+
+  const batchSize = options.batchSize ?? 256;
+  if (!Number.isSafeInteger(batchSize) || batchSize <= 0 || batchSize > 256) {
+    throw new Error('Cached embedding stream batchSize must be an integer in [1, 256]');
   }
 
   // The whole read runs inside the connection lock (#2264 review P2). It's safe
@@ -1725,6 +1739,55 @@ export const loadCachedEmbeddings = async (): Promise<{
   return withConnLock(async () => {
     const embeddingNodeIds = new Set<string>();
     const embeddings: CachedEmbedding[] = [];
+    let pendingBatch: CachedEmbedding[] = [];
+
+    const acceptRow = async (row: any, hasContentHash: boolean): Promise<void> => {
+      const nodeId = String(row.nodeId ?? row[0] ?? '');
+      if (!nodeId) return;
+      const embedding = row.embedding ?? row[4];
+      if (!embedding) return;
+      const cached: CachedEmbedding = {
+        nodeId,
+        chunkIndex: Number(row.chunkIndex ?? row[1] ?? 0),
+        startLine: Number(row.startLine ?? row[2] ?? 0),
+        endLine: Number(row.endLine ?? row[3] ?? 0),
+        embedding: Array.isArray(embedding)
+          ? embedding.map(Number)
+          : Array.from(embedding as any).map(Number),
+        contentHash: hasContentHash ? (row.contentHash ?? row[5] ?? undefined) : undefined,
+      };
+      if (options.onBatch) {
+        pendingBatch.push(cached);
+        if (pendingBatch.length === batchSize) {
+          await options.onBatch(pendingBatch);
+          pendingBatch = [];
+        }
+      } else {
+        embeddingNodeIds.add(nodeId);
+        embeddings.push(cached);
+      }
+    };
+
+    const streamRows = async (query: string, hasContentHash: boolean): Promise<void> => {
+      const queryResult = await c.query(query);
+      const results = Array.isArray(queryResult) ? queryResult : [queryResult];
+      let streamError: unknown;
+      try {
+        for (const result of results) {
+          while (await result.hasNext()) await acceptRow(await result.getNext(), hasContentHash);
+        }
+      } catch (error) {
+        streamError = error;
+        throw error;
+      } finally {
+        try {
+          await drainQueryResult(results);
+        } catch (error) {
+          if (streamError === undefined) throw error;
+        }
+      }
+    };
+
     try {
       // Schema migration detection: query with new columns to verify schema version.
       // Old schema only had (nodeId, embedding); new schema adds (id, chunkIndex, startLine, endLine, contentHash).
@@ -1739,48 +1802,67 @@ export const loadCachedEmbeddings = async (): Promise<{
       }
 
       // Try to read contentHash alongside chunk columns
-      let rows: any;
-      let hasContentHash = true;
       try {
-        rows = await c.query(
+        await streamRows(
           `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, e.embedding AS embedding, e.contentHash AS contentHash`,
+          true,
         );
       } catch (err: any) {
         // Fallback for legacy DBs without contentHash column
         const msg = err?.message ?? '';
         if (isMissingColumnOrTableError(msg)) {
-          hasContentHash = false;
-          rows = await c.query(
+          await streamRows(
             `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, e.embedding AS embedding`,
+            false,
           );
         } else {
           throw err;
         }
       }
-      for (const row of await readQueryRows(rows)) {
-        const nodeId = String(row.nodeId ?? row[0] ?? '');
-        if (!nodeId) continue;
-        embeddingNodeIds.add(nodeId);
-        const embedding = row.embedding ?? row[4];
-        if (embedding) {
-          embeddings.push({
-            nodeId,
-            chunkIndex: Number(row.chunkIndex ?? row[1] ?? 0),
-            startLine: Number(row.startLine ?? row[2] ?? 0),
-            endLine: Number(row.endLine ?? row[3] ?? 0),
-            embedding: Array.isArray(embedding)
-              ? embedding.map(Number)
-              : Array.from(embedding as any).map(Number),
-            contentHash: hasContentHash ? (row.contentHash ?? row[5] ?? undefined) : undefined,
-          });
-        }
-      }
-    } catch {
+      if (options.onBatch && pendingBatch.length > 0) await options.onBatch(pendingBatch);
+    } catch (error: any) {
+      if (!isMissingColumnOrTableError(error?.message ?? '')) throw error;
       /* embedding table may not exist */
     }
 
     return { embeddingNodeIds, embeddings };
   });
+};
+
+/** Fetch only the cached identities needed for one bounded node page. */
+export const fetchExistingEmbeddingHashesForNodeIds = async (
+  execQuery: (cypher: string) => Promise<any[]>,
+  nodeIds: readonly string[],
+): Promise<Map<string, string>> => {
+  if (nodeIds.length === 0) return new Map();
+  if (nodeIds.length > 512) throw new Error('Embedding identity page exceeds 512 node IDs');
+  const ids = `[${nodeIds.map((id) => `'${escapeCypherString(id)}'`).join(', ')}]`;
+  try {
+    const rows = await execQuery(
+      `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.nodeId IN ${ids} RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, e.contentHash AS contentHash`,
+    );
+    const hashes = new Map<string, string>();
+    for (const row of rows ?? []) {
+      const nodeId = row.nodeId ?? row[0];
+      if (!nodeId) continue;
+      const chunkIndex = row.chunkIndex ?? row[1];
+      const startLine = row.startLine ?? row[2];
+      const endLine = row.endLine ?? row[3];
+      const hash = row.contentHash ?? row[4] ?? STALE_HASH_SENTINEL;
+      const completeChunkMetadata =
+        chunkIndex !== undefined &&
+        chunkIndex !== null &&
+        startLine !== undefined &&
+        startLine !== null &&
+        endLine !== undefined &&
+        endLine !== null;
+      hashes.set(String(nodeId), completeChunkMetadata && hash ? hash : STALE_HASH_SENTINEL);
+    }
+    return hashes;
+  } catch (error: any) {
+    if (isMissingColumnOrTableError(error?.message ?? '')) return new Map();
+    throw error;
+  }
 };
 
 /**
