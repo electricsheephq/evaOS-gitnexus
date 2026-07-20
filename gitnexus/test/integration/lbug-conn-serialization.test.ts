@@ -13,7 +13,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
-import { NODE_TABLES } from '../../src/core/lbug/schema.js';
+import { EMBEDDING_DIMS, NODE_TABLES } from '../../src/core/lbug/schema.js';
 
 // Spy `withConnLock` while preserving its real behavior (call-through). The
 // adapter imports this module, so the spy observes every lock acquisition.
@@ -91,6 +91,46 @@ withTestLbugDB('conn-serialization', () => {
       expect(lockSpy).toHaveBeenCalled();
       expect(cached.embeddings).toEqual([]);
       expect(cached.embeddingNodeIds.size).toBe(0);
+    });
+
+    it('streams cached vectors in bounded batches and propagates sink failures', async () => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const vector = Array.from({ length: EMBEDDING_DIMS }, () => 0.25);
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash})',
+        [0, 1, 2].map((index) => ({
+          id: `stream-node:${index}`,
+          nodeId: `stream-node-${index}`,
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 1,
+          embedding: vector,
+          contentHash: `hash-${index}`,
+        })),
+      );
+      lockSpy.mockClear();
+
+      const sizes: number[] = [];
+      const cached = await adapter.loadCachedEmbeddings({
+        batchSize: 2,
+        onBatch: async (batch) => sizes.push(batch.length),
+      });
+      expect(lockSpy).toHaveBeenCalled();
+      expect(sizes).toEqual([2, 1]);
+      expect(cached.embeddings).toEqual([]);
+      expect(cached.embeddingNodeIds.size).toBe(0);
+
+      await expect(
+        adapter.loadCachedEmbeddings({
+          batchSize: 1,
+          onBatch: async () => {
+            throw new Error('snapshot sink failed');
+          },
+        }),
+      ).rejects.toThrow('snapshot sink failed');
+      await adapter.executeQuery(
+        "MATCH (e:CodeEmbedding) WHERE e.nodeId STARTS WITH 'stream-node-' DELETE e",
+      );
     });
 
     it('U4: deleteAllInterprocTaintPaths routes through withConnLock', async () => {

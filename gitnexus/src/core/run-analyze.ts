@@ -113,11 +113,29 @@ import {
   getInferredRepoName,
   resolveRepoIdentityRoot,
 } from '../storage/git.js';
-import type { CachedEmbedding } from './embeddings/types.js';
+import {
+  createEmbeddingSnapshot,
+  EMBEDDING_PRESERVATION_BATCH_SIZE,
+  EMBEDDING_SNAPSHOT_FILE,
+  readEmbeddingSnapshot,
+  removeEmbeddingSnapshot,
+  validateEmbeddingSnapshot,
+  type EmbeddingSnapshotInfo,
+} from './embeddings/cache-snapshot.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
-import { STALE_HASH_SENTINEL } from './lbug/schema.js';
+import {
+  discardStagedWorkspace,
+  getStagedAnalyzePaths,
+  hasPendingPromotion,
+  prepareStagedWorkspace,
+  promoteStagedGeneration,
+  validateStagedGeneration,
+  withAnalyzeOwnershipLock,
+  type RepositorySourceIdentity,
+  type StagedAnalyzePaths,
+} from './staged-promotion.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -141,6 +159,8 @@ export interface AnalyzeOptions {
    * bypass. See `allowDuplicateName` below.
    */
   force?: boolean;
+  /** Build and validate a shadow DB, then promote it through a durable journal. */
+  staged?: boolean;
   /**
    * Refuse every path that would require a full DB rebuild. The preflight is
    * intentionally stricter than normal analyze: it runs before migration
@@ -585,11 +605,11 @@ export const pdgModeMismatch = (recorded: RepoMeta['pdg'], options: PdgOptions):
   return false;
 };
 
-export async function runFullAnalysis(
+const runFullAnalysisImpl = async (
   repoPath: string,
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
-): Promise<AnalyzeResult> {
+): Promise<AnalyzeResult> => {
   const log = (msg: string) => callbacks.onLog?.(msg);
   const progress = (phase: string, percent: number, message: string) =>
     callbacks.onProgress(phase, percent, message);
@@ -638,26 +658,98 @@ export async function runFullAnalysis(
   // `~ ^ : ? *`, leading `-`, `..`) becomes `null` → the flat slot, matching
   // that a later `--branch <that-ref>` query would also be rejected. A normal
   // ref passes through unchanged so index-time and query-time labels round-trip.
-  const checkedOutBranch = repoHasGit
-    ? (sanitizeDetectedBranch(getCurrentBranch(repoPath)) ?? null)
-    : null;
-  // Analyze indexes the working tree, not an arbitrary ref. An explicit
-  // `--branch X` while a DIFFERENT branch Y is checked out would write Y's
-  // content (and Y's commit) into X's index slot, corrupting X (#2106). Refuse
-  // the mismatch. Detached HEAD / non-git (checkedOutBranch === null) still
-  // allow an explicit label so CI checkouts can name their snapshot.
+  const rawCheckedOutBranch = repoHasGit ? getCurrentBranch(repoPath) : null;
+  const checkedOutBranch = sanitizeDetectedBranch(rawCheckedOutBranch) ?? null;
+  const repositorySource: RepositorySourceIdentity = {
+    head: currentCommit,
+    branch: rawCheckedOutBranch,
+  };
+  const readRepositoryIdentity = (): RepositorySourceIdentity => ({
+    head: repoHasGit ? getCurrentCommit(repoPath) : '',
+    branch: repoHasGit ? getCurrentBranch(repoPath) : null,
+  });
+  const branchLabel = options.branch ?? checkedOutBranch;
+  const placement = options.branch ? await resolveBranchPlacement(repoPath, branchLabel) : {};
+  const canonicalPaths = getStoragePaths(repoPath, placement.branch);
+  const canonicalMetaDir = path.dirname(canonicalPaths.metaPath);
+  const promotionPaths = getStagedAnalyzePaths(canonicalPaths.lbugPath, canonicalMetaDir);
+  const stagedPaths: StagedAnalyzePaths | undefined = options.staged ? promotionPaths : undefined;
+
+  const commitStagedMetadataAndRegistry = async (meta: RepoMeta): Promise<string> => {
+    await saveMeta(canonicalMetaDir, meta);
+    return registerRepo(repoPath, meta, {
+      name: options.registryName,
+      allowDuplicateName: options.allowDuplicateName,
+      branch: placement.branch,
+    });
+  };
+
+  const promoteValidatedStage = async (paths: StagedAnalyzePaths): Promise<string | undefined> => {
+    const stagedMeta = await validateStagedGeneration(paths);
+    const stagedStats = await withLbugDb(paths.stagedLbugPath, getLbugStats, {
+      readOnly: true,
+    });
+    if (
+      (stagedMeta.stats?.nodes !== undefined && stagedMeta.stats.nodes !== stagedStats.nodes) ||
+      (stagedMeta.stats?.edges !== undefined && stagedMeta.stats.edges !== stagedStats.edges)
+    ) {
+      throw new Error(
+        `Staged DB validation failed: metadata records ` +
+          `${stagedMeta.stats?.nodes ?? '?'} nodes/${stagedMeta.stats?.edges ?? '?'} edges, ` +
+          `but the readable DB contains ${stagedStats.nodes} nodes/${stagedStats.edges} edges.`,
+      );
+    }
+    return (
+      await promoteStagedGeneration(paths, commitStagedMetadataAndRegistry, {
+        readRepositoryIdentity,
+      })
+    ).projectName;
+  };
+
+  // Every analyze mode owns the same canonical slot and must resolve its
+  // promotion journal before any fast path can report success. In particular,
+  // a crash at old-backed-up may leave the canonical pathname temporarily
+  // absent even when metadata still looks current.
+  if (await hasPendingPromotion(promotionPaths)) {
+    if (options.incrementalOnly) {
+      throw new Error(
+        'Incremental-only safety stop: a staged-promotion journal requires recovery before this index can be read as current. No recovery mutation was started.',
+      );
+    }
+    progress('lbug', 1, 'Recovering staged promotion...');
+    await promoteStagedGeneration(promotionPaths, commitStagedMetadataAndRegistry, {
+      readRepositoryIdentity,
+    });
+    log('Recovered and completed the previous staged promotion.');
+  }
+
+  // Analyze indexes the working tree, not an arbitrary ref. Recover a pending
+  // staged promotion first so a crash cannot leave the canonical pathname
+  // absent merely because the user switched branches before retrying. Once
+  // recovery is complete, refuse to start a new build for a mismatched label.
   if (options.branch && checkedOutBranch && options.branch !== checkedOutBranch) {
     throw new Error(
       `--branch "${options.branch}" does not match the checked-out branch "${checkedOutBranch}". ` +
         `Check out "${options.branch}" before indexing it, or omit --branch to index the current branch.`,
     );
   }
-  const branchLabel = options.branch ?? checkedOutBranch;
-  const placement = options.branch ? await resolveBranchPlacement(repoPath, branchLabel) : {};
-  const { lbugPath, metaPath } = getStoragePaths(repoPath, placement.branch);
-  // metaPath now points to the metadata file (gitnexus.json) in a branch-specific directory.
-  // metaDir is the directory containing the metadata file (and branch-specific DBs).
-  const metaDir = path.dirname(metaPath);
+
+  if (stagedPaths && options.repairFts) {
+    throw new Error('`--staged` cannot be combined with `--repair-fts`; repair is in-place only.');
+  }
+
+  if (stagedPaths) {
+    const canonicalMeta = await loadMeta(canonicalMetaDir);
+    const prepared = await prepareStagedWorkspace(stagedPaths, canonicalMeta, repositorySource);
+    log(
+      prepared.resumed
+        ? 'Resuming the existing staged generation; the canonical index remains untouched.'
+        : 'Prepared an isolated staged generation; the canonical index remains readable.',
+    );
+  }
+
+  const lbugPath = stagedPaths?.stagedLbugPath ?? canonicalPaths.lbugPath;
+  const metaDir = stagedPaths?.stagedMetaDir ?? canonicalMetaDir;
 
   if (options.incrementalOnly && (options.force || options.repairFts)) {
     incrementalOnlyStop('it cannot be combined with --force or --repair-fts');
@@ -724,7 +816,9 @@ export async function runFullAnalysis(
     }
   } else {
     // Normal analyze retains its established self-healing behavior.
-    const kuzuResult = await cleanupOldKuzuFiles(storagePath);
+    const kuzuResult = options.staged
+      ? { found: false, needsReindex: false }
+      : await cleanupOldKuzuFiles(storagePath);
     if (kuzuResult.found && kuzuResult.needsReindex) {
       log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
     }
@@ -734,11 +828,13 @@ export async function runFullAnalysis(
     // legacy fallback, so a reconciliation failure (read-only mount, full disk)
     // must never abort the analyze run — a repo that indexed fine read-only
     // before the rename must keep doing so.
-    try {
-      await reconcileMetadataFiles(repoPath);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException)?.code;
-      log(`Metadata reconciliation failed (non-critical${code ? `, ${code}` : ''}); continuing.`);
+    if (!options.staged) {
+      try {
+        await reconcileMetadataFiles(repoPath);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        log(`Metadata reconciliation failed (non-critical${code ? `, ${code}` : ''}); continuing.`);
+      }
     }
     existingMeta = await loadMeta(metaDir);
   }
@@ -1106,6 +1202,7 @@ export async function runFullAnalysis(
       const healUnregistered =
         options.allowDuplicateName === true && !(await isRepoRegistered(repoPath));
       if (!dirty && !healUnregistered) {
+        let promotedProjectName: string | undefined;
         // ── #2354: restamp the workspace label on a same-commit branch flip ──
         // The flat slot follows the checked-out working tree; a branch switch
         // at the SAME commit with a clean tree changes nothing the pipeline
@@ -1113,7 +1210,12 @@ export async function runFullAnalysis(
         // registry copy that query-side branch scoping reads) would go stale.
         // Detached HEAD / non-git (branchLabel === null) keeps the existing
         // stamp, mirroring the end-of-run meta write.
-        if (!placement.branch && branchLabel && existingMeta.branch !== branchLabel) {
+        if (
+          !stagedPaths &&
+          !placement.branch &&
+          branchLabel &&
+          existingMeta.branch !== branchLabel
+        ) {
           if (options.incrementalOnly) {
             incrementalOnlyStop('the flat index branch label requires a metadata restamp');
           }
@@ -1142,7 +1244,23 @@ export async function runFullAnalysis(
             );
           }
         }
-        if (!options.incrementalOnly) {
+        if (stagedPaths) {
+          const canonicalMeta = await loadMeta(canonicalMetaDir);
+          const stageWasFinalizedAfterItsCanonicalSource =
+            !canonicalMeta ||
+            canonicalMeta.lastCommit !== existingMeta.lastCommit ||
+            canonicalMeta.indexedAt !== existingMeta.indexedAt;
+          if (stageWasFinalizedAfterItsCanonicalSource) {
+            // The prior process can die after finalizing the staged DB/meta but
+            // before writing the promotion journal. A resumed run then reaches
+            // this same-commit fast path. Promote that validated generation
+            // instead of silently discarding completed work.
+            progress('lbug', 99, 'Promoting completed staged generation...');
+            promotedProjectName = await promoteValidatedStage(stagedPaths);
+          } else {
+            await discardStagedWorkspace(stagedPaths);
+          }
+        } else if (!options.incrementalOnly) {
           await ensureGitNexusIgnored(repoPath);
         }
         return {
@@ -1150,6 +1268,7 @@ export async function runFullAnalysis(
           // canonical repo basename (#1259) but leaves arbitrary subdirs
           // and `--skip-git` paths unchanged (#1232/#1233 intent preserved).
           repoName:
+            promotedProjectName ??
             options.registryName ??
             getInferredRepoName(repoPath) ??
             path.basename(resolveRepoIdentityRoot(repoPath)),
@@ -1177,8 +1296,13 @@ export async function runFullAnalysis(
   // The default-preserve branch is what makes a routine `analyze` (e.g. a
   // post-commit hook) safe: a multi-minute embedding pass is no longer
   // silently dropped just because the caller omitted `--embeddings`.
-  let cachedEmbeddingNodeIds = new Set<string>();
-  let cachedEmbeddings: CachedEmbedding[] = [];
+  const embeddingSnapshotPath = path.join(metaDir, EMBEDDING_SNAPSHOT_FILE);
+  const embeddingSnapshotSource = {
+    lastCommit: existingMeta?.lastCommit,
+    indexedAt: existingMeta?.indexedAt,
+  };
+  let embeddingSnapshotInfo: EmbeddingSnapshotInfo | undefined;
+  let embeddingSnapshotAvailable = false;
 
   const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
   const {
@@ -1226,31 +1350,64 @@ export async function runFullAnalysis(
   if (shouldLoadCache && existingMeta) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
-      const cached = options.incrementalOnly
-        ? await withLbugDb(lbugPath, loadCachedEmbeddings, { readOnly: true })
-        : await (async () => {
-            await initLbug(lbugPath);
-            return loadCachedEmbeddings();
-          })();
-      cachedEmbeddingNodeIds = cached.embeddingNodeIds;
-      cachedEmbeddings = cached.embeddings;
-      await closeLbug();
-    } catch (err: any) {
-      // Surface cache-load failures explicitly: silently swallowing here would
-      // re-introduce the original silent-data-loss symptom (embeddings end up
-      // at 0 in meta.json with no diagnostic) through a different door.
-      log(
-        `Warning: could not load cached embeddings ` +
-          `(${err?.message ?? String(err)}). ` +
-          `Embeddings will not be preserved on this run.`,
+      const expectedSnapshotCount = resumeEmbeddingCheckpoint ? undefined : existingEmbeddingCount;
+      embeddingSnapshotInfo = await validateEmbeddingSnapshot(
+        embeddingSnapshotPath,
+        embeddingSnapshotSource,
+        expectedSnapshotCount,
       );
-      cachedEmbeddingNodeIds = new Set<string>();
-      cachedEmbeddings = [];
+      if (embeddingSnapshotInfo) {
+        embeddingSnapshotAvailable = true;
+        log(
+          `Reusing validated embedding preservation snapshot ` +
+            `(${embeddingSnapshotInfo.count} vectors).`,
+        );
+      } else {
+        embeddingSnapshotInfo = await createEmbeddingSnapshot(
+          embeddingSnapshotPath,
+          embeddingSnapshotSource,
+          async (emit) => {
+            const load = async () =>
+              loadCachedEmbeddings({
+                batchSize: EMBEDDING_PRESERVATION_BATCH_SIZE,
+                onBatch: emit,
+              });
+            const cached = options.incrementalOnly
+              ? await withLbugDb(lbugPath, load, { readOnly: true })
+              : await (async () => {
+                  await initLbug(lbugPath);
+                  return load();
+                })();
+            // Legacy unit doubles return a small array and ignore onBatch. The
+            // snapshot writer consumes that return without weakening production's
+            // streaming path.
+            return cached.embeddings;
+          },
+        );
+        embeddingSnapshotAvailable = true;
+        await closeLbug();
+      }
+      if (
+        !resumeEmbeddingCheckpoint &&
+        existingEmbeddingCount > 0 &&
+        embeddingSnapshotInfo.count !== existingEmbeddingCount
+      ) {
+        throw new Error(
+          `Embedding preservation snapshot contains ${embeddingSnapshotInfo.count} vectors, ` +
+            `but metadata records ${existingEmbeddingCount}; refusing a rebuild that could lose vectors.`,
+        );
+      }
+    } catch (err: any) {
       try {
         await closeLbug();
       } catch {
         /* swallow */
       }
+      throw new Error(
+        `Could not create a bounded embedding preservation snapshot; analysis stopped ` +
+          `before the rebuild could discard vectors (${err?.message ?? String(err)}).`,
+        { cause: err },
+      );
     }
   }
 
@@ -1883,91 +2040,76 @@ export async function runFullAnalysis(
     //      propagates errors (a completed writeback means a deterministic
     //      delete outcome) and this process holds the exclusive DB lock (no
     //      concurrent writer).
-    // The per-batch try/catch stays as a last-resort guard only — it no
-    // longer fires on the happy path.
+    // Restore insertion failures propagate: silently skipping a failed batch
+    // would finalize metadata with fewer vectors than the preserved snapshot.
     let restoredEmbeddingCount = 0;
-    if (cachedEmbeddings.length > 0) {
-      const cachedDims = cachedEmbeddings[0].embedding.length;
+    if (embeddingSnapshotInfo && embeddingSnapshotInfo.count > 0) {
+      const cachedDims = embeddingSnapshotInfo.dimensions;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
       if (cachedDims !== EMBEDDING_DIMS) {
         // Dimensions changed (e.g. switched embedding model) — discard cache and re-embed all
         log(
           `Embedding dimensions changed (${cachedDims}d -> ${EMBEDDING_DIMS}d), discarding cache`,
         );
-        cachedEmbeddings = [];
-        cachedEmbeddingNodeIds = new Set();
       } else {
         const { batchInsertEmbeddings: batchInsert } =
           await import('./embeddings/embedding-pipeline.js');
-        // (1) Live-graph filter — the FULL pipeline graph (always produced),
-        // NOT the incremental subgraph, or unchanged files' rows would be
-        // dropped from the restore set.
-        const liveEmbeddings = cachedEmbeddings.filter(
-          (e) => pipelineResult.graph.getNode(e.nodeId) !== undefined,
+        progress(
+          'embeddings',
+          88,
+          `Restoring ${embeddingSnapshotInfo.count} cached embeddings in bounded batches...`,
         );
-        // (2) Restore-scope filter (see the discipline note above).
-        const rowsToRestore =
-          deletedFilePathsForRestore === null
-            ? liveEmbeddings
-            : liveEmbeddings.filter((e) => {
-                const filePath = pipelineResult.graph.getNode(e.nodeId)?.properties?.filePath;
-                return typeof filePath === 'string' && deletedFilePathsForRestore!.has(filePath);
-              });
-        progress('embeddings', 88, `Restoring ${rowsToRestore.length} cached embeddings...`);
-        const EMBED_BATCH = 200;
-        for (let i = 0; i < rowsToRestore.length; i += EMBED_BATCH) {
-          const batch = rowsToRestore.slice(i, i + EMBED_BATCH);
-
-          try {
-            await batchInsert(executeWithReusedStatement, batch);
-            restoredEmbeddingCount += batch.length;
-          } catch {
-            /* last-resort guard — conflict-free by construction above */
-          }
-        }
-
-        // Legacy-orphan sweep (FIX 3, finder B): the live-graph filter's
-        // REJECTS — cached rows whose owning node no longer exists — are the
-        // rows stranded by the era when the embedding delete was a no-op
-        // (tri-review 4669518496 P2-1; schema version stays 6), plus this
-        // run's just-deleted files' rows (already join-deleted above — the
-        // exact-id DELETE matches nothing for those, so including them is a
-        // harmless no-op rather than worth a fragile nodeId parse to
-        // exclude). On the SURGICAL path the true legacy orphans still sit
-        // in the DB and the node join can never reach them again (no owning
-        // node), so delete them by exact row id. On wiped paths the rejects
-        // were simply not restored — nothing to sweep. Legacy-tolerant: a
-        // sweep failure must never fail a completed writeback, so the whole
-        // sweep warns-and-continues.
-        if (deletedFilePathsForRestore !== null) {
-          const orphanRowIds = cachedEmbeddings
-            .filter((e) => pipelineResult.graph.getNode(e.nodeId) === undefined)
-            .map((e) => `${e.nodeId}:${e.chunkIndex}`);
-          if (orphanRowIds.length > 0) {
-            try {
-              for (let i = 0; i < orphanRowIds.length; i += DELETE_FILES_CHUNK_SIZE) {
-                const chunk = orphanRowIds.slice(i, i + DELETE_FILES_CHUNK_SIZE);
-                const listLiteral = `[${chunk
-                  .map((id) => `'${escapeCypherString(id)}'`)
-                  .join(', ')}]`;
-                await executeQuery(
-                  `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.id IN ${listLiteral} DELETE e`,
+        await readEmbeddingSnapshot(
+          embeddingSnapshotPath,
+          embeddingSnapshotSource,
+          async (snapshotBatch) => {
+            const rowsToRestore = [];
+            const orphanRowIds: string[] = [];
+            for (const embedding of snapshotBatch) {
+              const liveNode = pipelineResult.graph.getNode(embedding.nodeId);
+              if (!liveNode) {
+                if (deletedFilePathsForRestore !== null) {
+                  orphanRowIds.push(`${embedding.nodeId}:${embedding.chunkIndex}`);
+                }
+                continue;
+              }
+              if (deletedFilePathsForRestore !== null) {
+                const filePath = liveNode.properties?.filePath;
+                if (typeof filePath !== 'string' || !deletedFilePathsForRestore.has(filePath)) {
+                  continue;
+                }
+              }
+              rowsToRestore.push(embedding);
+            }
+            if (rowsToRestore.length > 0) {
+              await batchInsert(executeWithReusedStatement, rowsToRestore);
+              restoredEmbeddingCount += rowsToRestore.length;
+            }
+            if (orphanRowIds.length > 0) {
+              try {
+                for (let i = 0; i < orphanRowIds.length; i += DELETE_FILES_CHUNK_SIZE) {
+                  const chunk = orphanRowIds.slice(i, i + DELETE_FILES_CHUNK_SIZE);
+                  const listLiteral = `[${chunk
+                    .map((id) => `'${escapeCypherString(id)}'`)
+                    .join(', ')}]`;
+                  await executeQuery(
+                    `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.id IN ${listLiteral} DELETE e`,
+                  );
+                }
+                log(
+                  `Swept ${orphanRowIds.length} cached embedding row(s) with no live owning node.`,
+                );
+              } catch (err) {
+                log(
+                  `Warning: could not sweep ${orphanRowIds.length} orphaned embedding ` +
+                    `row(s) (${(err as Error).message}); they are unreachable by search ` +
+                    'joins and will be retried next run.',
                 );
               }
-              log(
-                `Swept ${orphanRowIds.length} cached embedding row(s) with no live owning ` +
-                  'node — legacy orphans stranded while the embedding delete was a no-op; ' +
-                  'ids already removed with their files match nothing.',
-              );
-            } catch (err) {
-              log(
-                `Warning: could not sweep ${orphanRowIds.length} orphaned embedding ` +
-                  `row(s) (${(err as Error).message}); they are unreachable by search ` +
-                  'joins and will be retried next run.',
-              );
             }
-          }
-        }
+          },
+          resumeEmbeddingCheckpoint ? undefined : existingEmbeddingCount,
+        );
       }
     }
 
@@ -2045,17 +2187,9 @@ export async function runFullAnalysis(
         httpMode ? 'Connecting to embedding endpoint...' : 'Loading embedding model...',
       );
       const { runEmbeddingPipeline } = await import('./embeddings/embedding-pipeline.js');
+      const { fetchExistingEmbeddingHashesForNodeIds } = await import('./lbug/lbug-adapter.js');
       embeddingIdentityForRun ??= await resolveEmbeddingIdentity();
       const embeddingIdentity = embeddingIdentityForRun;
-      // Build a Map<nodeId, contentHash> from cached embeddings for incremental mode
-      let existingEmbeddings: Map<string, string> | undefined;
-      if (cachedEmbeddingNodeIds.size > 0) {
-        existingEmbeddings = new Map<string, string>();
-        for (const e of cachedEmbeddings) {
-          existingEmbeddings.set(e.nodeId, e.contentHash ?? STALE_HASH_SENTINEL);
-        }
-      }
-
       const saveEmbeddingCheckpoint = async (
         checkpoint: {
           nodesProcessed: number;
@@ -2112,10 +2246,12 @@ export async function runFullAnalysis(
           progress('embeddings', scaled, label);
         },
         {},
-        cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
-        existingEmbeddings,
+        undefined,
+        undefined,
         {
           forceReembedNodeIds: pendingEmbeddingNodeIds,
+          loadExistingEmbeddingHashes: (nodeIds) =>
+            fetchExistingEmbeddingHashesForNodeIds(executeQuery, nodeIds),
           onCheckpointWindowStart: async ({ nodeIds, ...checkpoint }) => {
             await saveEmbeddingCheckpoint(checkpoint, nodeIds, existingMeta?.stats?.embeddings);
           },
@@ -2316,34 +2452,49 @@ export async function runFullAnalysis(
       log(`Warning: could not save parse cache (${(e as Error).message}); continuing.`);
     }
 
-    // Forward the --name alias and the registry-collision bypass bit.
-    // `allowDuplicateName` is its own concern — independent from the
-    // pipeline `force` above. The CLI maps it from
-    // `--allow-duplicate-name` only; `--force` and `--skills` both
-    // trigger pipeline re-run but never bypass the registry guard.
-    // The returned name is the one actually written to the registry
-    // (after applying the precedence chain in registerRepo) — reuse it
-    // so AGENTS.md / skill files reference the same name MCP clients
-    // will look up (#979).
-    const projectName = await registerRepo(repoPath, meta, {
-      name: options.registryName,
-      allowDuplicateName: options.allowDuplicateName,
-      // Non-primary branch runs upsert into the entry's branches[]; the
-      // primary/flat run (placement.branch === undefined) refreshes the
-      // top-level fields (#2106).
-      branch: placement.branch,
-    });
+    // ── Close LadybugDB ──────────────────────────────────────────────
+    // Stop the manual checkpoint driver before closeLbug so its
+    // in-flight CHECKPOINT cannot race the `safeClose` CHECKPOINT.
+    await walCheckpointDriver.stop();
+    // CLI callers (about to process.exit) skip the native close to dodge a
+    // LadybugDB destructor double-free after --pdg writes — closeLbugBeforeExit
+    // CHECKPOINTs for durability then leaves the handles for process exit to
+    // reclaim (#2264). Long-lived callers close for real.
+    await (options.skipNativeCloseOnExit && !stagedPaths ? closeLbugBeforeExit() : closeLbug());
+
+    if (embeddingSnapshotAvailable) {
+      await removeEmbeddingSnapshot(embeddingSnapshotPath).catch((error) => {
+        log(
+          `Warning: could not remove completed embedding preservation snapshot ` +
+            `(${(error as Error).message}); it will be ignored unless its source identity matches.`,
+        );
+      });
+    }
+
+    // The staged DB is closed and checkpointed before validation. Promotion
+    // retains the old canonical file as a backup until metadata + registry are
+    // committed, so every crash boundary has at least one complete generation.
+    let projectName: string;
+    if (stagedPaths) {
+      progress('lbug', 97, 'Validating staged generation...');
+      progress('lbug', 99, 'Promoting staged generation...');
+      const promotedProjectName = await promoteValidatedStage(stagedPaths);
+      projectName =
+        promotedProjectName ??
+        options.registryName ??
+        getInferredRepoName(repoPath) ??
+        path.basename(resolveRepoIdentityRoot(repoPath));
+    } else {
+      // Forward the --name alias and registry-collision bypass only after the
+      // canonical DB is finalized. In staged mode this same commit is journaled.
+      projectName = await registerRepo(repoPath, meta, {
+        name: options.registryName,
+        allowDuplicateName: options.allowDuplicateName,
+        branch: placement.branch,
+      });
+    }
 
     // ── #2354: the flat workspace slot has adopted this run's branch ──────
-    // Drop a now-shadowed `branches/<slug>/` sub-index for the same label
-    // (unreachable once the flat slot serves it) and align the registry's
-    // top-level branch label. Best-effort like the parse-cache save above
-    // (#2364 review F5): the index is complete and registered, and a failure
-    // here leaves only a stale registry label / undeleted shadowed dir —
-    // never wrong routing, because the flat meta this run already stamped is
-    // what applyBranchScope trusts. Retried by the next content-changing run
-    // (same-commit fast-path runs skip it: their guard compares the
-    // already-stamped meta label).
     if (!placement.branch && branchLabel) {
       try {
         await adoptFlatBranchLabel(repoPath, branchLabel);
@@ -2354,10 +2505,10 @@ export async function runFullAnalysis(
       }
     }
 
-    // Keep generated .gitnexus contents ignored without editing the user's root .gitignore.
+    // Side effects that describe the canonical generation happen only after a
+    // staged promotion has committed.
     await ensureGitNexusIgnored(repoPath);
 
-    // ── Generate AI context files (best-effort) ───────────────────────
     let aggregatedClusterCount = 0;
     if (pipelineResult.communityResult?.communities) {
       const groups = new Map<string, number>();
@@ -2368,9 +2519,6 @@ export async function runFullAnalysis(
       aggregatedClusterCount = Array.from(groups.values()).filter((count) => count >= 5).length;
     }
 
-    // Only (re)generate the repo-root AI context files (AGENTS.md / CLAUDE.md /
-    // skills) for the primary/flat index (#2106). A non-primary branch analyze
-    // must not churn the repo's committed AGENTS.md with branch-specific stats.
     if (!placement.branch) {
       try {
         await generateAIContextFiles(
@@ -2399,16 +2547,6 @@ export async function runFullAnalysis(
       }
     }
 
-    // ── Close LadybugDB ──────────────────────────────────────────────
-    // Stop the manual checkpoint driver before closeLbug so its
-    // in-flight CHECKPOINT cannot race the `safeClose` CHECKPOINT.
-    await walCheckpointDriver.stop();
-    // CLI callers (about to process.exit) skip the native close to dodge a
-    // LadybugDB destructor double-free after --pdg writes — closeLbugBeforeExit
-    // CHECKPOINTs for durability then leaves the handles for process exit to
-    // reclaim (#2264). Long-lived callers close for real.
-    await (options.skipNativeCloseOnExit ? closeLbugBeforeExit() : closeLbug());
-
     progress('done', 100, 'Done');
 
     return {
@@ -2436,10 +2574,21 @@ export async function runFullAnalysis(
       // process still terminates — no hang, no abort. flushWAL keeps the partial
       // index durable; process exit reclaims the handles. Long-lived callers
       // (skipNativeCloseOnExit unset) close for real.
-      await (options.skipNativeCloseOnExit ? closeLbugBeforeExit() : closeLbug());
+      await (options.skipNativeCloseOnExit && !stagedPaths ? closeLbugBeforeExit() : closeLbug());
     } catch {
       /* swallow */
     }
     throw err;
   }
+};
+
+export async function runFullAnalysis(
+  repoPath: string,
+  options: AnalyzeOptions,
+  callbacks: AnalyzeCallbacks,
+): Promise<AnalyzeResult> {
+  const { storagePath } = getStoragePaths(repoPath);
+  return withAnalyzeOwnershipLock(storagePath, () =>
+    runFullAnalysisImpl(repoPath, options, callbacks),
+  );
 }
