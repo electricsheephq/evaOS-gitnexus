@@ -75,6 +75,99 @@ withTestLbugDB('vector-extension', (handle) => {
 });
 
 /**
+ * Regression for #131: extension LOAD is connection-local. The read pool must
+ * prepare VECTOR on all eight slots before publication, otherwise concurrent
+ * HNSW queries fail depending on which connection is checked out.
+ */
+const poolVectorNodeId = 'Function:src/vector-pool.ts:target:1';
+withTestLbugDB(
+  'vector-pool-all-connections',
+  (handle) => {
+    it.skipIf(process.platform === 'win32')(
+      'runs a real HNSW query successfully on all eight pooled connections',
+      async () => {
+        const poolAdapter = await import('../../src/core/lbug/pool-adapter.js');
+        const { EMBEDDING_DIMS, EMBEDDING_INDEX_NAME, EMBEDDING_TABLE_NAME } =
+          await import('../../src/core/lbug/schema.js');
+        const queryVector = [1, ...new Array(EMBEDDING_DIMS - 1).fill(0)];
+        const query = `
+          CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
+            CAST([${queryVector.join(',')}] AS FLOAT[${EMBEDDING_DIMS}]), 1)
+          YIELD node AS emb, distance
+          RETURN emb.nodeId AS nodeId, distance
+        `;
+
+        expect(poolAdapter.getPoolCapabilities(handle.repoId)).toEqual({
+          fts: expect.any(Boolean),
+          vector: true,
+          connectionCount: 8,
+        });
+        const results = await Promise.all(
+          Array.from({ length: 8 }, () => poolAdapter.executeQuery(handle.repoId, query)),
+        );
+
+        expect(results).toHaveLength(8);
+        for (const rows of results) {
+          expect(rows[0]?.nodeId ?? rows[0]?.[0]).toBe(poolVectorNodeId);
+        }
+      },
+    );
+
+    it.skipIf(process.platform !== 'win32')(
+      'keeps graph queries available while VECTOR is disabled on Windows',
+      async () => {
+        const poolAdapter = await import('../../src/core/lbug/pool-adapter.js');
+
+        expect(poolAdapter.getPoolCapabilities(handle.repoId)).toEqual({
+          fts: expect.any(Boolean),
+          vector: false,
+          connectionCount: 8,
+        });
+        await expect(poolAdapter.probePoolConnections(handle.repoId)).resolves.toBe(8);
+      },
+    );
+  },
+  {
+    poolAdapter: true,
+    beforeFTS: async () => {
+      if (process.platform === 'win32') return;
+
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
+      const { resolveAnalyzeInstallPolicy } =
+        await import('../../src/core/lbug/extension-loader.js');
+      const { EMBEDDING_DIMS } = await import('../../src/core/lbug/schema.js');
+      const loaded = await adapter.loadVectorExtension(undefined, {
+        policy: resolveAnalyzeInstallPolicy(),
+      });
+      if (!loaded) {
+        throw new Error(
+          'VECTOR is required for the non-Windows eight-connection pool regression test',
+        );
+      }
+
+      await adapter.executeQuery(
+        `CREATE (:Function {id: '${poolVectorNodeId}', name: 'target', filePath: 'src/vector-pool.ts', startLine: 1, endLine: 3, isExported: true, content: '', description: ''})`,
+      );
+      await batchInsertEmbeddings(adapter.executeWithReusedStatement, [
+        {
+          nodeId: poolVectorNodeId,
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 3,
+          embedding: [1, ...new Array(EMBEDDING_DIMS - 1).fill(0)],
+        },
+      ]);
+      if (!(await adapter.createVectorIndex())) {
+        throw new Error('Failed to create the HNSW index for the eight-connection pool test');
+      }
+    },
+    timeout: 120_000,
+  },
+);
+
+/**
  * Regression: VECTOR/HNSW index creation during analyze (#2114).
  *
  * `CALL CREATE_VECTOR_INDEX(...)` compiles to multiple statements, which

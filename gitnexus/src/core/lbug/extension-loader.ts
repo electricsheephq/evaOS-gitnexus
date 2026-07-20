@@ -43,6 +43,8 @@ export interface ExtensionCapability {
 export interface ExtensionEnsureOptions {
   policy?: ExtensionInstallPolicy;
   installTimeoutMs?: number;
+  /** Per-call diagnostic sink. Pool callers use plain stderr so CLI JSON stays machine-readable. */
+  warn?: (message: string) => void;
 }
 
 export interface ExtensionManagerOptions {
@@ -229,7 +231,7 @@ export class ExtensionManager {
     const policy = opts.policy ?? this.options.policy ?? resolvePolicyFromEnv();
     const timeoutMs =
       opts.installTimeoutMs ?? this.options.installTimeoutMs ?? getExtensionInstallTimeoutMs();
-    const warn = this.options.warn ?? ((msg: string) => logger.warn(msg));
+    const warn = opts.warn ?? this.options.warn ?? ((msg: string) => logger.warn(msg));
 
     if (policy === 'never') {
       this.markUnavailable(name, label, 'extension install policy is "never"', warn);

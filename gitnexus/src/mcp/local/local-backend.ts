@@ -15,6 +15,7 @@ import {
   executeParameterized,
   closeLbug,
   isLbugReady,
+  getPoolCapabilities,
 } from '../../core/lbug/pool-adapter.js';
 import { isValidQueryParams } from '../../core/lbug/query-params.js';
 import { toDisplayLine } from './line-display.js';
@@ -419,6 +420,18 @@ function isBenignMissingTableError(err: unknown): boolean {
   return /does not exist|no such (table|label|rel)|unknown (table|label)|(table|label|rel|column|property)[^\n]*\bnot (defined|found)\b/i.test(
     msg,
   );
+}
+
+type SemanticRetrievalMode = 'vector-index' | 'exact-scan' | 'not-indexed' | 'unavailable';
+
+interface SemanticSearchOutcome {
+  results: any[];
+  mode: SemanticRetrievalMode;
+  embeddingCount: number | null;
+  reason: string | null;
+  exactScanLimit: number;
+  /** True when semantic matches may exist but could not safely be returned. */
+  omitted: boolean;
 }
 
 const isReadOnlyDbError = (err: unknown): boolean => {
@@ -1910,9 +1923,18 @@ export class LocalBackend {
     // each so both get independent wall-time records without fighting
     // over a single `current` phase slot.
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const [bm25SearchResult, semanticResults] = await Promise.all([
-      timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
-      timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit)),
+    const poolCapabilities = getPoolCapabilities(repo.lbugPath);
+    const [bm25SearchResult, semanticSearchResult] = await Promise.all([
+      timer.time(
+        'bm25',
+        poolCapabilities?.fts === false
+          ? Promise.resolve({ results: [], ftsUsed: false })
+          : this.bm25Search(repo, searchQuery, searchLimit),
+      ),
+      timer.time(
+        'vector',
+        this.semanticSearch(repo, searchQuery, searchLimit, poolCapabilities?.vector !== false),
+      ),
     ]);
 
     // Guard against undefined results (#1489) — when FTS is entirely
@@ -1936,7 +1958,7 @@ export class LocalBackend {
       }
     }
 
-    const safeSemanticResults = semanticResults ?? [];
+    const safeSemanticResults = semanticSearchResult.results;
     for (let i = 0; i < safeSemanticResults.length; i++) {
       const result = safeSemanticResults[i];
       const key = result.nodeId || result.filePath;
@@ -2295,6 +2317,13 @@ export class LocalBackend {
         'Symbol enrichment partially failed — some process/cohesion/content data may be missing from these results (see server logs).',
       );
     }
+    if (semanticSearchResult.omitted) {
+      warnings.push(
+        ftsUsed
+          ? `Semantic results were omitted; this response is BM25-only (semantic_reason: ${semanticSearchResult.reason}).`
+          : `Semantic results were omitted and BM25 is unavailable (semantic_reason: ${semanticSearchResult.reason}).`,
+      );
+    }
     if (rerankWarning) warnings.push(rerankWarning);
 
     return {
@@ -2302,8 +2331,15 @@ export class LocalBackend {
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
       timing,
+      retrieval: {
+        keyword_mode: ftsUsed ? 'fts' : 'unavailable',
+        semantic_mode: semanticSearchResult.mode,
+        embedding_count: semanticSearchResult.embeddingCount,
+        semantic_reason: semanticSearchResult.reason,
+        exact_scan_limit: semanticSearchResult.exactScanLimit,
+      },
       ...(warnings.length > 0 && { warning: warnings.join(' ') }),
-      ...(enrichmentDegraded && { partial: true }),
+      ...((enrichmentDegraded || semanticSearchResult.omitted) && { partial: true }),
     };
   }
 
@@ -2506,29 +2542,99 @@ export class LocalBackend {
   /**
    * Semantic vector search helper
    */
-  private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
+  private async semanticSearch(
+    repo: RepoHandle,
+    query: string,
+    limit: number,
+    vectorPoolAvailable = true,
+  ): Promise<SemanticSearchOutcome> {
+    const exactScanLimit = getExactScanLimit();
+    let embeddingCount: number;
+
     try {
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       const tableCheck = await executeQuery(
         repo.lbugPath,
         `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN COUNT(*) AS cnt LIMIT 1`,
       );
-      if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
+      embeddingCount = Number(tableCheck?.[0]?.cnt ?? tableCheck?.[0]?.[0] ?? 0);
+      if (!Number.isFinite(embeddingCount) || embeddingCount <= 0) {
+        return {
+          results: [],
+          mode: 'not-indexed',
+          embeddingCount: 0,
+          reason: 'no-embeddings-indexed',
+          exactScanLimit,
+          omitted: false,
+        };
+      }
+    } catch (err) {
+      if (isBenignMissingTableError(err)) {
+        return {
+          results: [],
+          mode: 'not-indexed',
+          embeddingCount: 0,
+          reason: 'no-embeddings-indexed',
+          exactScanLimit,
+          omitted: false,
+        };
+      }
+      logQueryError('query:embedding-index-check', err);
+      return {
+        results: [],
+        mode: 'unavailable',
+        embeddingCount: null,
+        reason: 'embedding-index-check-failed',
+        exactScanLimit,
+        omitted: true,
+      };
+    }
 
+    let queryVec: number[];
+    let dims: number;
+    try {
       const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
-      const queryVec = await embedQuery(query);
-      const dims = getEmbeddingDims();
-      const queryVecStr = `[${queryVec.join(',')}]`;
-      const maxDistance = getVectorMaxDistance(DEFAULT_MCP_VECTOR_MAX_DISTANCE);
+      queryVec = await embedQuery(query);
+      dims = getEmbeddingDims();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '';
+      if (
+        !this.warnedMissingEmbeddingStack &&
+        (isMissingLocalEmbeddingStackMessage(message) ||
+          isLocalEmbeddingRuntimeBlockerMessage(message))
+      ) {
+        this.warnedMissingEmbeddingStack = true;
+        logger.warn(`GitNexus [query:vector]: ${message}`);
+      } else {
+        logQueryError('query:embedding-query', err);
+      }
+      return {
+        results: [],
+        mode: 'unavailable',
+        embeddingCount,
+        reason: 'embedding-query-failed',
+        exactScanLimit,
+        omitted: true,
+      };
+    }
 
-      let bestChunks = new Map<
-        string,
-        { distance: number; chunkIndex: number; startLine: number; endLine: number }
-      >();
-      if (isVectorExtensionSupportedByPlatform()) {
-        try {
-          bestChunks = await collectBestChunks(limit, async (fetchLimit) => {
-            const vectorQuery = `
+    const queryVecStr = `[${queryVec.join(',')}]`;
+    const maxDistance = getVectorMaxDistance(DEFAULT_MCP_VECTOR_MAX_DISTANCE);
+
+    let bestChunks = new Map<
+      string,
+      { distance: number; chunkIndex: number; startLine: number; endLine: number }
+    >();
+    let semanticMode: SemanticRetrievalMode = 'unavailable';
+    let semanticReason = vectorPoolAvailable
+      ? 'vector-extension-unsupported'
+      : 'vector-extension-unavailable';
+    let vectorIndexSucceeded = false;
+
+    if (vectorPoolAvailable && isVectorExtensionSupportedByPlatform()) {
+      try {
+        bestChunks = await collectBestChunks(limit, async (fetchLimit) => {
+          const vectorQuery = `
             CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
               CAST(${queryVecStr} AS FLOAT[${dims}]), ${fetchLimit})
             YIELD node AS emb, distance
@@ -2539,49 +2645,61 @@ export class LocalBackend {
             ORDER BY distance
           `;
 
-            const embResults = await executeQuery(repo.lbugPath, vectorQuery);
-            return embResults.map((row) => ({
-              nodeId: row.nodeId ?? row[0],
-              chunkIndex: row.chunkIndex ?? row[1] ?? 0,
-              startLine: row.startLine ?? row[2] ?? 0,
-              endLine: row.endLine ?? row[3] ?? 0,
-              distance: row.distance ?? row[4],
-            }));
-          });
-        } catch (error) {
-          bestChunks = new Map();
-          if (!this.warnedVectorQueryFailure) {
-            this.warnedVectorQueryFailure = true;
-            logger.warn(
-              { err: error },
-              'GitNexus [query:vector]: VECTOR index query failed; using exact scan fallback',
-            );
-          }
+          const embResults = await executeQuery(repo.lbugPath, vectorQuery);
+          return embResults.map((row) => ({
+            nodeId: row.nodeId ?? row[0],
+            chunkIndex: row.chunkIndex ?? row[1] ?? 0,
+            startLine: row.startLine ?? row[2] ?? 0,
+            endLine: row.endLine ?? row[3] ?? 0,
+            distance: row.distance ?? row[4],
+          }));
+        });
+        vectorIndexSucceeded = true;
+        semanticMode = 'vector-index';
+        semanticReason = null;
+      } catch (error) {
+        if (!this.warnedVectorQueryFailure) {
+          this.warnedVectorQueryFailure = true;
+          logger.warn(
+            { err: error },
+            'GitNexus [query:vector]: VECTOR index query failed; using exact scan fallback',
+          );
         }
-      } else if (!this.warnedVectorUnsupported) {
-        // Rare diagnostic: surface why we fell back to the exact scan path so
-        // operators can see at a glance that VECTOR is disabled by platform
-        // policy. Emitted once per `LocalBackend` instance lifetime to avoid
-        // noisy stderr on hot semantic-search paths (DoD §2.8).
-        this.warnedVectorUnsupported = true;
-        logger.warn(
-          'GitNexus [query:vector]: VECTOR extension not supported on this platform; using exact scan fallback',
-        );
+        semanticReason = 'vector-index-query-failed';
+      }
+    } else if (!this.warnedVectorUnsupported) {
+      // Emit the connection/platform diagnosis once to stderr. MCP receives
+      // only the stable reason code below, never the native LOAD error.
+      this.warnedVectorUnsupported = true;
+      logger.warn(
+        vectorPoolAvailable
+          ? 'GitNexus [query:vector]: VECTOR extension not supported on this platform; using exact scan fallback'
+          : 'GitNexus [query:vector]: VECTOR extension unavailable across the read pool; using exact scan fallback',
+      );
+    }
+
+    // A successful HNSW query with zero matches is authoritative: it must not
+    // trigger an exact scan. Fallback is reserved for an unavailable/failed
+    // vector path, and remains bounded by the existing safety limit.
+    if (!vectorIndexSucceeded) {
+      if (embeddingCount > exactScanLimit) {
+        if (!this.warnedExactScanLimit) {
+          this.warnedExactScanLimit = true;
+          logger.warn(
+            `GitNexus [query:vector]: exact scan refused; ${embeddingCount} chunks exceed the configured safety limit of ${exactScanLimit}. Restore the VECTOR index or deliberately raise GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT after reviewing memory cost.`,
+          );
+        }
+        return {
+          results: [],
+          mode: 'unavailable',
+          embeddingCount,
+          reason: 'exact-scan-limit-exceeded',
+          exactScanLimit,
+          omitted: true,
+        };
       }
 
-      if (bestChunks.size === 0) {
-        const embeddingCount = Number(tableCheck[0].cnt ?? tableCheck[0][0] ?? 0);
-        const exactLimit = getExactScanLimit();
-        if (embeddingCount > exactLimit) {
-          if (!this.warnedExactScanLimit) {
-            this.warnedExactScanLimit = true;
-            logger.warn(
-              `GitNexus [query:vector]: exact scan refused; ${embeddingCount} chunks exceed the configured safety limit of ${exactLimit}. Restore the VECTOR index or deliberately raise GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT after reviewing memory cost.`,
-            );
-          }
-          return [];
-        }
-
+      try {
         const rows = await executeQuery(
           repo.lbugPath,
           `
@@ -2608,60 +2726,70 @@ export class LocalBackend {
             },
           ]),
         );
+        semanticMode = 'exact-scan';
+      } catch (err) {
+        logQueryError('query:vector-exact-scan', err);
+        return {
+          results: [],
+          mode: 'unavailable',
+          embeddingCount,
+          reason: 'exact-scan-query-failed',
+          exactScanLimit,
+          omitted: true,
+        };
       }
-
-      if (bestChunks.size === 0) return [];
-
-      const results: any[] = [];
-
-      for (const [nodeId, chunk] of Array.from(bestChunks.entries()).slice(0, limit)) {
-        const labelEndIdx = nodeId.indexOf(':');
-        const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
-
-        // Validate label against known node types to prevent Cypher injection
-        if (!VALID_NODE_LABELS.has(label)) continue;
-
-        try {
-          const nodeQuery =
-            label === 'File'
-              ? `MATCH (n:File {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`
-              : `MATCH (n:\`${label}\` {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`;
-
-          const nodeRows = await executeParameterized(repo.lbugPath, nodeQuery, { nodeId });
-          if (nodeRows.length > 0) {
-            const nodeRow = nodeRows[0];
-            results.push({
-              nodeId,
-              name: nodeRow.name ?? nodeRow[0] ?? '',
-              type: label,
-              filePath: nodeRow.filePath ?? nodeRow[1] ?? '',
-              distance: chunk.distance,
-              startLine: chunk.startLine,
-              endLine: chunk.endLine,
-            });
-          }
-        } catch {}
-      }
-
-      return results;
-    } catch (err) {
-      // Embeddings disabled is the common, silent case. But a pruned or
-      // Node-unloadable optional stack (#2370/#2372) also lands here — surface it
-      // once so semantic search doesn't silently degrade to BM25 with no hint
-      // (the exact silent-degradation mode #2370 exists to fix). Emitted once per
-      // LocalBackend instance to keep stderr quiet on hot paths (like the VECTOR
-      // fallback above). All other errors stay silent, as before.
-      const message = err instanceof Error ? err.message : '';
-      if (
-        !this.warnedMissingEmbeddingStack &&
-        (isMissingLocalEmbeddingStackMessage(message) ||
-          isLocalEmbeddingRuntimeBlockerMessage(message))
-      ) {
-        this.warnedMissingEmbeddingStack = true;
-        logger.warn(`GitNexus [query:vector]: ${message}`);
-      }
-      return [];
     }
+
+    if (bestChunks.size === 0) {
+      return {
+        results: [],
+        mode: semanticMode,
+        embeddingCount,
+        reason: semanticReason,
+        exactScanLimit,
+        omitted: false,
+      };
+    }
+
+    const results: any[] = [];
+
+    for (const [nodeId, chunk] of Array.from(bestChunks.entries()).slice(0, limit)) {
+      const labelEndIdx = nodeId.indexOf(':');
+      const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
+
+      // Validate label against known node types to prevent Cypher injection
+      if (!VALID_NODE_LABELS.has(label)) continue;
+
+      try {
+        const nodeQuery =
+          label === 'File'
+            ? `MATCH (n:File {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`
+            : `MATCH (n:\`${label}\` {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`;
+
+        const nodeRows = await executeParameterized(repo.lbugPath, nodeQuery, { nodeId });
+        if (nodeRows.length > 0) {
+          const nodeRow = nodeRows[0];
+          results.push({
+            nodeId,
+            name: nodeRow.name ?? nodeRow[0] ?? '',
+            type: label,
+            filePath: nodeRow.filePath ?? nodeRow[1] ?? '',
+            distance: chunk.distance,
+            startLine: chunk.startLine,
+            endLine: chunk.endLine,
+          });
+        }
+      } catch {}
+    }
+
+    return {
+      results,
+      mode: semanticMode,
+      embeddingCount,
+      reason: semanticReason,
+      exactScanLimit,
+      omitted: false,
+    };
   }
 
   async executeCypher(

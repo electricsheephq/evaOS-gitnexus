@@ -23,11 +23,33 @@ vi.mock('../../src/mcp/core/embedder.js', () => ({
 
 import { LocalBackend } from '../../src/mcp/local/local-backend.js';
 
-interface SemanticSearchable {
-  semanticSearch(repo: { lbugPath: string }, query: string, limit: number): Promise<unknown[]>;
+interface SemanticSearchOutcome {
+  results: unknown[];
+  mode: string;
+  embeddingCount: number | null;
+  reason: string | null;
+  exactScanLimit: number;
+  omitted: boolean;
 }
-const callSemanticSearch = (b: LocalBackend): Promise<unknown[]> =>
+
+interface SemanticSearchable {
+  semanticSearch(
+    repo: { lbugPath: string },
+    query: string,
+    limit: number,
+  ): Promise<SemanticSearchOutcome>;
+}
+const callSemanticSearch = (b: LocalBackend): Promise<SemanticSearchOutcome> =>
   (b as unknown as SemanticSearchable).semanticSearch({ lbugPath: '/tmp/x' }, 'q', 5);
+
+const unavailableEmbeddingQuery = {
+  results: [],
+  mode: 'unavailable',
+  embeddingCount: 5,
+  reason: 'embedding-query-failed',
+  exactScanLimit: expect.any(Number),
+  omitted: true,
+};
 
 const stackWarns = (cap: LoggerCapture): number =>
   cap
@@ -45,13 +67,13 @@ describe('LocalBackend.semanticSearch — missing-stack warning (#2372)', () => 
     embedQueryMock.mockReset();
   });
 
-  it('warns once with the actionable message and returns [] on a pruned stack', async () => {
+  it('warns once with the actionable message and reports omission on a pruned stack', async () => {
     embedQueryMock.mockRejectedValue(new Error(localEmbeddingStackMissingMessage()));
     const backend = new LocalBackend();
     const cap = _captureLogger();
     try {
-      expect(await callSemanticSearch(backend)).toEqual([]);
-      expect(await callSemanticSearch(backend)).toEqual([]);
+      expect(await callSemanticSearch(backend)).toMatchObject(unavailableEmbeddingQuery);
+      expect(await callSemanticSearch(backend)).toMatchObject(unavailableEmbeddingQuery);
       expect(stackWarns(cap)).toBe(1); // once per LocalBackend instance
     } finally {
       cap.restore();
@@ -63,7 +85,7 @@ describe('LocalBackend.semanticSearch — missing-stack warning (#2372)', () => 
     const backend = new LocalBackend();
     const cap = _captureLogger();
     try {
-      expect(await callSemanticSearch(backend)).toEqual([]);
+      expect(await callSemanticSearch(backend)).toMatchObject(unavailableEmbeddingQuery);
       expect(stackWarns(cap)).toBe(0);
     } finally {
       cap.restore();
