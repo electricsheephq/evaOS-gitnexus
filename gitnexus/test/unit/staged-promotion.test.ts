@@ -177,6 +177,68 @@ describe('staged promotion journal', () => {
     expect(await exists(paths.journalPath)).toBe(false);
   });
 
+  for (const installedDbState of ['missing', 'wrong'] as const) {
+    it(`does not restore the old DB over staged metadata when the installed DB is ${installedDbState}`, async () => {
+      const { paths, canonicalLbugPath, canonicalMetaDir } = await setup();
+      let attempts = 0;
+      const commit = async (meta: RepoMeta): Promise<string> => {
+        attempts++;
+        await saveMeta(canonicalMetaDir, meta);
+        throw new Error('register failed');
+      };
+
+      await expect(promoteStagedGeneration(paths, commit)).rejects.toThrow('register failed');
+      if (installedDbState === 'missing') {
+        await fs.rm(canonicalLbugPath);
+      } else {
+        await fs.writeFile(canonicalLbugPath, 'wrong-installed-generation');
+      }
+
+      await expect(promoteStagedGeneration(paths, commit)).rejects.toThrow(
+        'canonical database identity changed',
+      );
+      expect(attempts).toBe(1);
+      expect((await loadMeta(canonicalMetaDir))?.lastCommit).toBe('new');
+      expect(await fs.readFile(paths.backupLbugPath, 'utf8')).toBe('old-generation');
+      expect(await exists(paths.journalPath)).toBe(true);
+      if (installedDbState === 'missing') {
+        expect(await exists(canonicalLbugPath)).toBe(false);
+      } else {
+        expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe(
+          'wrong-installed-generation',
+        );
+      }
+    });
+  }
+
+  it('finishes registration after source HEAD moves once the staged DB and metadata are canonical', async () => {
+    const { paths, canonicalLbugPath, canonicalMetaDir } = await setup();
+    let attempts = 0;
+    const commit = async (meta: RepoMeta): Promise<string> => {
+      attempts++;
+      await saveMeta(canonicalMetaDir, meta);
+      if (attempts === 1) throw new Error('register failed');
+      return 'repo';
+    };
+
+    await expect(
+      promoteStagedGeneration(paths, commit, {
+        readRepositoryIdentity: () => sourceRepo,
+      }),
+    ).rejects.toThrow('register failed');
+
+    await expect(
+      promoteStagedGeneration(paths, commit, {
+        readRepositoryIdentity: () => ({ head: 'later-head', branch: 'other' }),
+      }),
+    ).resolves.toMatchObject({ projectName: 'repo', recovered: true });
+    expect(attempts).toBe(2);
+    expect(await fs.readFile(canonicalLbugPath, 'utf8')).toBe('new-generation');
+    expect((await loadMeta(canonicalMetaDir))?.lastCommit).toBe('new');
+    expect(await exists(paths.backupLbugPath)).toBe(false);
+    expect(await exists(paths.journalPath)).toBe(false);
+  });
+
   it('refuses recovery when metadata differs from both source and staged generations', async () => {
     const { paths, canonicalLbugPath, canonicalMetaDir } = await setup();
     let attempts = 0;

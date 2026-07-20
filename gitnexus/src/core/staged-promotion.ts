@@ -575,11 +575,15 @@ const assertPromotionSourceUnchanged = async (
 
   const canonicalDb = await statRegularFile(paths.canonicalLbugPath);
   const backupDb = allowOldDbInBackup ? await statRegularFile(paths.backupLbugPath) : undefined;
-  const dbMatches = source.hadCanonical
-    ? identitiesEqual(canonicalDb, source.sourceDb) || identitiesEqual(backupDb, source.sourceDb)
-    : source.sourceDb === undefined &&
-      (canonicalDb === undefined ||
-        (allowOldDbInBackup && identitiesEqual(canonicalDb, source.stagedDb)));
+  const dbMatches =
+    metadataState === 'staged'
+      ? identitiesEqual(canonicalDb, source.stagedDb)
+      : source.hadCanonical
+        ? identitiesEqual(canonicalDb, source.sourceDb) ||
+          identitiesEqual(backupDb, source.sourceDb)
+        : source.sourceDb === undefined &&
+          (canonicalDb === undefined ||
+            (allowOldDbInBackup && identitiesEqual(canonicalDb, source.stagedDb)));
   if (!dbMatches) {
     throw new PromotionSourceChangedError(
       'database',
@@ -587,7 +591,10 @@ const assertPromotionSourceUnchanged = async (
     );
   }
 
-  if (hooks.readRepositoryIdentity) {
+  // Once the exact staged DB/meta pair is canonical, source HEAD movement no
+  // longer invalidates that installed generation. Registration is the only
+  // unfinished idempotent step and must be allowed to complete.
+  if (hooks.readRepositoryIdentity && metadataState === 'source') {
     const currentRepo = await hooks.readRepositoryIdentity();
     if (!identitiesEqual(currentRepo, source.sourceRepo)) {
       throw new PromotionSourceChangedError(
