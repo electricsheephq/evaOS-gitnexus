@@ -1933,12 +1933,7 @@ export class LocalBackend {
       ),
       timer.time(
         'vector',
-        this.semanticSearch(
-          repo,
-          searchQuery,
-          searchLimit,
-          poolCapabilities?.vector !== false,
-        ),
+        this.semanticSearch(repo, searchQuery, searchLimit, poolCapabilities?.vector !== false),
       ),
     ]);
 

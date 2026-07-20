@@ -17,11 +17,7 @@
 
 import fs from 'fs/promises';
 import lbug from '@ladybugdb/core';
-import {
-  isReadOnlyDbError,
-  loadFTSExtension,
-  loadVectorExtension,
-} from './lbug-adapter.js';
+import { isReadOnlyDbError, loadFTSExtension, loadVectorExtension } from './lbug-adapter.js';
 import { closeQueryResults } from './query-result-utils.js';
 import {
   createLbugDatabase,
@@ -688,9 +684,7 @@ export const initLbugNonRecovering = async (repoId: string, dbPath: string): Pro
  * A partial load disables that capability for the whole pool while preserving
  * graph queries; callers must never assume a capability from one lucky slot.
  */
-async function preparePoolConnections(
-  connections: lbug.Connection[],
-): Promise<PoolCapabilities> {
+async function preparePoolConnections(connections: lbug.Connection[]): Promise<PoolCapabilities> {
   let fts = true;
   let vector = true;
 
@@ -741,9 +735,10 @@ async function doInitLbug(
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= LOCK_RETRY_ATTEMPTS; attempt++) {
       try {
-        const db = options.allowRecovery === false
-          ? await openReadOnlyDatabaseNonRecovering(dbPath)
-          : await openReadOnlyDatabase(dbPath);
+        const db =
+          options.allowRecovery === false
+            ? await openReadOnlyDatabaseNonRecovering(dbPath)
+            : await openReadOnlyDatabase(dbPath);
         shared = { db, refCount: 0, ftsLoaded: false };
         dbCache.set(dbPath, shared);
         break;

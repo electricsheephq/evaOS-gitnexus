@@ -37,13 +37,8 @@ vi.mock('../../src/core/lbug/lbug-config.js', () => ({
   WAL_RECOVERY_SUGGESTION: '',
 }));
 
-const {
-  closeLbug,
-  getPoolCapabilities,
-  initLbugWithDb,
-  isLbugReady,
-  probePoolConnections,
-} = await import('../../src/core/lbug/pool-adapter.js');
+const { closeLbug, getPoolCapabilities, initLbugWithDb, isLbugReady, probePoolConnections } =
+  await import('../../src/core/lbug/pool-adapter.js');
 
 describe('read-pool optional extension loading', () => {
   afterEach(async () => {

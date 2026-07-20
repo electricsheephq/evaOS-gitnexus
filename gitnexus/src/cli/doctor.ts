@@ -290,7 +290,8 @@ export const doctorCommand = async (
   console.log(`  ${label('doctor.labels.graphStore', 18)}${capabilities.graph}`);
   // Live LOAD probe, not the static platform capability — the static value
   // said "available" while analyze failed to load the extension (#2374).
-  const poolProbe = nativeCheck.ok && repoMeta ? await probeDoctorPool(storagePaths.lbugPath) : null;
+  const poolProbe =
+    nativeCheck.ok && repoMeta ? await probeDoctorPool(storagePaths.lbugPath) : null;
   const ftsProbe = nativeCheck.ok
     ? poolProbe
       ? {

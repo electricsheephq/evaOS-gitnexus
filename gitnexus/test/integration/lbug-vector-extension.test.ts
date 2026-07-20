@@ -87,9 +87,8 @@ withTestLbugDB(
       'runs a real HNSW query successfully on all eight pooled connections',
       async () => {
         const poolAdapter = await import('../../src/core/lbug/pool-adapter.js');
-        const { EMBEDDING_DIMS, EMBEDDING_INDEX_NAME, EMBEDDING_TABLE_NAME } = await import(
-          '../../src/core/lbug/schema.js'
-        );
+        const { EMBEDDING_DIMS, EMBEDDING_INDEX_NAME, EMBEDDING_TABLE_NAME } =
+          await import('../../src/core/lbug/schema.js');
         const queryVector = [1, ...new Array(EMBEDDING_DIMS - 1).fill(0)];
         const query = `
           CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
@@ -134,12 +133,10 @@ withTestLbugDB(
       if (process.platform === 'win32') return;
 
       const adapter = await import('../../src/core/lbug/lbug-adapter.js');
-      const { batchInsertEmbeddings } = await import(
-        '../../src/core/embeddings/embedding-pipeline.js'
-      );
-      const { resolveAnalyzeInstallPolicy } = await import(
-        '../../src/core/lbug/extension-loader.js'
-      );
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
+      const { resolveAnalyzeInstallPolicy } =
+        await import('../../src/core/lbug/extension-loader.js');
       const { EMBEDDING_DIMS } = await import('../../src/core/lbug/schema.js');
       const loaded = await adapter.loadVectorExtension(undefined, {
         policy: resolveAnalyzeInstallPolicy(),
