@@ -37,7 +37,19 @@ export interface EmbeddingSnapshotSource {
 export interface EmbeddingSnapshotInfo {
   count: number;
   dimensions: number;
+  /** Repeated physical rows coalesced by (nodeId, chunkIndex). */
+  duplicateRows?: number;
 }
+
+const embeddingIdentity = (row: Pick<SnapshotRow, 'nodeId' | 'chunkIndex'>): string =>
+  `${row.nodeId}\0${row.chunkIndex}`;
+
+const snapshotInfo = (
+  count: number,
+  dimensions: number,
+  duplicateRows: number,
+): EmbeddingSnapshotInfo =>
+  duplicateRows > 0 ? { count, dimensions, duplicateRows } : { count, dimensions };
 
 const encodeEmbedding = (embedding: number[]): string => {
   const vector = Float32Array.from(embedding);
@@ -80,6 +92,9 @@ export const createEmbeddingSnapshot = async (
   const digest = createHash('sha256');
   let count = 0;
   let dimensions = 0;
+  let duplicateRows = 0;
+  // Identities are small; vectors remain bounded to the caller's 256-row batch.
+  const seenIdentities = new Set<string>();
 
   const emit = async (batch: readonly CachedEmbedding[]): Promise<void> => {
     if (batch.length > EMBEDDING_PRESERVATION_BATCH_SIZE) {
@@ -94,6 +109,12 @@ export const createEmbeddingSnapshot = async (
       if (rowDimensions !== dimensions) {
         throw new Error('Embedding preservation snapshot mixes vector dimensions');
       }
+      const identity = embeddingIdentity(embedding);
+      if (seenIdentities.has(identity)) {
+        duplicateRows++;
+        continue;
+      }
+      seenIdentities.add(identity);
       const line = `${JSON.stringify(toSnapshotRow(embedding))}\n`;
       digest.update(line);
       payload += line;
@@ -122,7 +143,7 @@ export const createEmbeddingSnapshot = async (
     await handle.sync();
     await handle.close();
     await fs.rename(tempPath, snapshotPath);
-    return { count, dimensions };
+    return snapshotInfo(count, dimensions, duplicateRows);
   } catch (error) {
     await handle.close().catch(() => {});
     await fs.rm(tempPath, { force: true }).catch(() => {});
@@ -144,9 +165,12 @@ export const validateEmbeddingSnapshot = async (
   }
   const lines = createInterface({ input, crlfDelay: Infinity });
   const digest = createHash('sha256');
-  let count = 0;
+  let physicalCount = 0;
+  let uniqueCount = 0;
+  let duplicateRows = 0;
   let dimensions = 0;
   let footer: SnapshotFooter | undefined;
+  const seenIdentities = new Set<string>();
 
   try {
     for await (const line of lines) {
@@ -166,7 +190,13 @@ export const validateEmbeddingSnapshot = async (
       if (dimensions === 0) dimensions = rowDimensions;
       if (rowDimensions !== dimensions) return undefined;
       digest.update(`${line}\n`);
-      count++;
+      physicalCount++;
+      const identity = embeddingIdentity(value);
+      if (seenIdentities.has(identity)) duplicateRows++;
+      else {
+        seenIdentities.add(identity);
+        uniqueCount++;
+      }
     }
   } catch {
     return undefined;
@@ -178,16 +208,16 @@ export const validateEmbeddingSnapshot = async (
   if (
     !footer ||
     footer.schema !== SNAPSHOT_SCHEMA ||
-    footer.count !== count ||
+    footer.count !== physicalCount ||
     footer.dimensions !== dimensions ||
     footer.sha256 !== digest.digest('hex') ||
     footer.sourceLastCommit !== source.lastCommit ||
     footer.sourceIndexedAt !== source.indexedAt ||
-    (expectedCount !== undefined && count !== expectedCount)
+    (expectedCount !== undefined && uniqueCount !== expectedCount)
   ) {
     return undefined;
   }
-  return { count, dimensions };
+  return snapshotInfo(uniqueCount, dimensions, duplicateRows);
 };
 
 /**
@@ -206,11 +236,15 @@ export const readEmbeddingSnapshot = async (
   const input = createReadStream(snapshotPath, { encoding: 'utf8' });
   const lines = createInterface({ input, crlfDelay: Infinity });
   let batch: CachedEmbedding[] = [];
+  const seenIdentities = new Set<string>();
   try {
     for await (const line of lines) {
       if (!line) continue;
       const value = JSON.parse(line) as SnapshotRow | SnapshotFooter;
       if (value.type === 'complete') break;
+      const identity = embeddingIdentity(value);
+      if (seenIdentities.has(identity)) continue;
+      seenIdentities.add(identity);
       batch.push({
         nodeId: value.nodeId,
         chunkIndex: value.chunkIndex,
