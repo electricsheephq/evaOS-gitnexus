@@ -56,8 +56,23 @@ const encodeEmbedding = (embedding: number[]): string => {
   return Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength).toString('base64');
 };
 
-const decodeEmbedding = (encoded: string, dimensions: number): number[] => {
+const decodeEmbeddingBytes = (encoded: string): Buffer => {
+  if (
+    encoded.length === 0 ||
+    encoded.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)
+  ) {
+    throw new Error('Embedding preservation snapshot contains a malformed vector');
+  }
   const bytes = Buffer.from(encoded, 'base64');
+  if (bytes.toString('base64') !== encoded) {
+    throw new Error('Embedding preservation snapshot contains a malformed vector');
+  }
+  return bytes;
+};
+
+const decodeEmbedding = (encoded: string, dimensions: number): number[] => {
+  const bytes = decodeEmbeddingBytes(encoded);
   if (bytes.byteLength !== dimensions * Float32Array.BYTES_PER_ELEMENT) {
     throw new Error('Embedding preservation snapshot contains a malformed vector');
   }
@@ -184,7 +199,7 @@ export const validateEmbeddingSnapshot = async (
       if (footer || value.type !== 'embedding' || typeof value.embeddingBase64 !== 'string') {
         return undefined;
       }
-      const byteLength = Buffer.byteLength(value.embeddingBase64, 'base64');
+      const byteLength = decodeEmbeddingBytes(value.embeddingBase64).byteLength;
       if (byteLength === 0 || byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) return undefined;
       const rowDimensions = byteLength / Float32Array.BYTES_PER_ELEMENT;
       if (dimensions === 0) dimensions = rowDimensions;

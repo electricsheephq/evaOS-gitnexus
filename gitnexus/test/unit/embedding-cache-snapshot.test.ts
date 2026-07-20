@@ -125,6 +125,34 @@ describe('bounded embedding preservation snapshot', () => {
     expect(onBatch).not.toHaveBeenCalled();
   });
 
+  it('rejects malformed base64 before invoking any restore batch', async () => {
+    const snapshotPath = await makePath();
+    const source = { lastCommit: 'abc', indexedAt: '2026-07-20T00:00:00.000Z' };
+    const rows = makeRows(257);
+    await createEmbeddingSnapshot(snapshotPath, source, async (emit) => {
+      await emit(rows.slice(0, 256));
+      await emit(rows.slice(256));
+    });
+
+    const lines = (await fs.readFile(snapshotPath, 'utf8')).trimEnd().split('\n');
+    const footer = JSON.parse(lines.pop() ?? '{}') as Record<string, unknown>;
+    const malformed = JSON.parse(lines[256]) as Record<string, unknown>;
+    const encoded = String(malformed.embeddingBase64);
+    malformed.embeddingBase64 = `${encoded.slice(0, 5)}!${encoded.slice(6)}`;
+    lines[256] = JSON.stringify(malformed);
+    footer.sha256 = createHash('sha256')
+      .update(lines.map((line) => `${line}\n`).join(''))
+      .digest('hex');
+    await fs.writeFile(snapshotPath, `${lines.join('\n')}\n${JSON.stringify(footer)}\n`);
+    const onBatch = vi.fn();
+
+    await expect(validateEmbeddingSnapshot(snapshotPath, source, 257)).resolves.toBeUndefined();
+    await expect(readEmbeddingSnapshot(snapshotPath, source, onBatch, 257)).rejects.toThrow(
+      'failed validation',
+    );
+    expect(onBatch).not.toHaveBeenCalled();
+  });
+
   it('binds a reusable snapshot to its source generation', async () => {
     const snapshotPath = await makePath();
     const source = { lastCommit: 'abc', indexedAt: '2026-07-20T00:00:00.000Z' };
