@@ -53,13 +53,15 @@ export const mcpCommand = async (options?: {
   // stdout at module init, but transitive deps (pino, pino-pretty, the
   // worker-thread transport) could in theory, and the import-closure
   // regression test enforces the leaf invariant.
-  const [{ startMCPServer }, { LocalBackend }, { logger }, { createMcpRepositoryPolicy }] =
+  const [{ startMCPServer }, { LocalBackend }, { logger }, repositoryPolicyModule] =
     await Promise.all([
       import('../mcp/server.js'),
       import('../mcp/local/local-backend.js'),
       import('../core/logger.js'),
       import('../mcp/repository-policy.js'),
     ]);
+  const { createMcpRepositoryPolicy, McpRepositoryPolicy, McpRepositoryPolicyConfigurationError } =
+    repositoryPolicyModule;
 
   // Missing-optional-grammar warnings are intentionally NOT emitted here.
   // `gitnexus analyze` already warns at index time, filtered by the repo's
@@ -73,19 +75,34 @@ export const mcpCommand = async (options?: {
   const backend = new LocalBackend();
   await backend.init();
 
-  const repositoryPolicy = await createMcpRepositoryPolicy(backend);
-  const repos = await repositoryPolicy.scopeBackend(backend).listRepos();
-  if (repos.length === 0) {
-    // Operator-actionable but the server still starts and serves; warn-level,
-    // not error. Tools will discover newly-analyzed repos via lazy refresh.
-    logger.warn(
-      'GitNexus: No indexed repos yet. Run `gitnexus analyze` in a git repo — the server will pick it up automatically.',
+  const repositoryPolicy = await createMcpRepositoryPolicy(backend).catch((error: unknown) => {
+    if (options?.http || !(error instanceof McpRepositoryPolicyConfigurationError)) throw error;
+    logger.error(
+      {
+        configurationKey: error.key,
+        failureReason: error.reason,
+        entryPosition: error.entryPosition,
+        mode: 'blocked',
+      },
+      error.message,
     );
-  } else {
-    logger.info(
-      { repoCount: repos.length, repos: repos.map((r) => r.name) },
-      'GitNexus: MCP server starting',
-    );
+    return McpRepositoryPolicy.blocked(error);
+  });
+
+  if (!repositoryPolicy.configurationError) {
+    const repos = await repositoryPolicy.scopeBackend(backend).listRepos();
+    if (repos.length === 0) {
+      // Operator-actionable but the server still starts and serves; warn-level,
+      // not error. Tools will discover newly-analyzed repos via lazy refresh.
+      logger.warn(
+        'GitNexus: No indexed repos yet. Run `gitnexus analyze` in a git repo — the server will pick it up automatically.',
+      );
+    } else {
+      logger.info(
+        { repoCount: repos.length, repos: repos.map((r) => r.name) },
+        'GitNexus: MCP server starting',
+      );
+    }
   }
 
   // Start HTTP server or fall back to stdio (default).
