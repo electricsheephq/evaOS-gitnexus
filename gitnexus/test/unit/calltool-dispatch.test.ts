@@ -738,7 +738,7 @@ describe('LocalBackend.callTool', () => {
           ),
       ).toBe(true);
       expect(result.retrieval).toMatchObject({
-        keyword_mode: 'bm25',
+        keyword_mode: 'fts',
         semantic_mode: 'exact-scan',
         embedding_count: 1,
         semantic_reason: 'vector-extension-unsupported',
@@ -773,7 +773,7 @@ describe('LocalBackend.callTool', () => {
     expect(result.retrieval).toMatchObject({
       semantic_mode: 'vector-index',
       embedding_count: 1,
-      semantic_reason: 'vector-index-query-succeeded',
+      semantic_reason: null,
     });
     expect(result).not.toHaveProperty('partial');
   });

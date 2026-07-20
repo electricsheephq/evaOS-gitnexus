@@ -428,7 +428,7 @@ interface SemanticSearchOutcome {
   results: any[];
   mode: SemanticRetrievalMode;
   embeddingCount: number | null;
-  reason: string;
+  reason: string | null;
   exactScanLimit: number;
   /** True when semantic matches may exist but could not safely be returned. */
   omitted: boolean;
@@ -2337,7 +2337,7 @@ export class LocalBackend {
       definitions: definitions.slice(0, 20), // cap standalone definitions
       timing,
       retrieval: {
-        keyword_mode: ftsUsed ? 'bm25' : 'unavailable',
+        keyword_mode: ftsUsed ? 'fts' : 'unavailable',
         semantic_mode: semanticSearchResult.mode,
         embedding_count: semanticSearchResult.embeddingCount,
         semantic_reason: semanticSearchResult.reason,
@@ -2661,7 +2661,7 @@ export class LocalBackend {
         });
         vectorIndexSucceeded = true;
         semanticMode = 'vector-index';
-        semanticReason = 'vector-index-query-succeeded';
+        semanticReason = null;
       } catch (error) {
         if (!this.warnedVectorQueryFailure) {
           this.warnedVectorQueryFailure = true;
