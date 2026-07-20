@@ -4,6 +4,26 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.3] - 2026-07-20
+
+### Added
+
+- **Truthful retrieval status for every query** reports the active keyword and semantic modes, live embedding count, stable omission reason, and unchanged 20,000-row exact-scan limit (#131, #138)
+- **Bounded staged analysis for large repositories** builds beside the readable canonical index, checkpoints pending embedding work, resumes safely, journals promotion, and routes SIGTERM through the checkpoint path (#132, #139)
+- **Read-only MCP and registry doctors** validate production policy resolution and expose canonical-remote, alias, count, WAL/shadow, and live pooled-extension health without binding MCP or repairing state (#127, #133, #140)
+
+### Fixed
+
+- **Semantic retrieval remains available across the full LadybugDB read pool** by loading FTS and VECTOR on all eight prewarmed connections and treating partial capability or query failure as explicit degradation rather than a silent omission (#131, #138)
+- **Invalid stdio MCP repository policy is fail-closed and agent-visible** while tool discovery remains available; HTTP policy remains fail-fast and no malformed allowlist can fall back to unrestricted access (#129)
+- **GitHub SSH and HTTPS remotes share one canonical identity**, and concurrent or duplicate top-level registration is refused before index storage is created (#133, #140)
+- **Voyage 2,048-dimensional requests use the provider's `output_dimension` field** while OpenAI-compatible endpoints retain `dimensions` (#141, #142)
+
+### Changed
+
+- Large embedding work pages at bounded sizes and supports optional sanitized resource telemetry. Voyage indexing remains strictly one repository at a time and has no host memory, swap, RSS, or free-memory admission or termination gate.
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+
 ## [1.6.10-electric.2] - 2026-07-15
 
 ### Added
