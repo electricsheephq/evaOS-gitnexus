@@ -15,8 +15,8 @@ vi.mock('v8', () => ({
   },
 }));
 
-// Pin physical RAM to 16GB so the RAM-aware auto-cap (0.75 x RAM, clamped
-// >= 16384) resolves deterministically to 16384 regardless of the host machine.
+// Pin physical RAM to 16GB so the bounded auto-cap resolves deterministically
+// to its 6144MB ceiling regardless of the host machine.
 vi.mock('os', async () => {
   const actual = await vi.importActual<typeof import('os')>('os');
   const mocked = { ...actual, totalmem: () => 16 * 1024 * 1024 * 1024 };
@@ -103,7 +103,7 @@ describe('analyzeCommand heap respawn', () => {
     else process.env.NODE_OPTIONS = initialNodeOptions;
   });
 
-  it('re-execs analyze with the auto-sized heap cap (16GB-clamped) + larger semi-space and bridges progress redraw when parent is a TTY', async () => {
+  it('re-execs analyze with the bounded heap cap + larger semi-space and bridges progress redraw when parent is a TTY', async () => {
     delete process.env.NODE_OPTIONS;
     restoreStderrIsTTY = setStreamIsTTY(process.stderr, true);
     getHeapStatisticsMock.mockReturnValue({ heap_size_limit: 512 * 1024 * 1024 });
@@ -114,9 +114,9 @@ describe('analyzeCommand heap respawn', () => {
 
     expect(spawnMock).toHaveBeenCalledTimes(1);
     const [, args, opts] = spawnMock.mock.calls[0];
-    expect(args).toContain('--max-old-space-size=16384');
+    expect(args).toContain('--max-old-space-size=6144');
     expect(args).toContain('--max-semi-space-size=128');
-    expect(opts.env.NODE_OPTIONS).toContain('--max-old-space-size=16384');
+    expect(opts.env.NODE_OPTIONS).toContain('--max-old-space-size=6144');
     expect(opts.env.NODE_OPTIONS).toContain('--max-semi-space-size=128');
     expect(opts.env.GITNEXUS_RESPAWN_PROGRESS_TTY).toBe('1');
   });
@@ -146,6 +146,16 @@ describe('analyzeCommand heap respawn', () => {
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
+  it('honors the underscore spelling of an explicit NODE_OPTIONS heap cap', async () => {
+    process.env.NODE_OPTIONS = '--max_old_space_size=4096';
+    getHeapStatisticsMock.mockReturnValue({ heap_size_limit: 512 * 1024 * 1024 });
+
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+    await analyzeCommand('/__gitnexus_nonexistent__', {});
+
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
   it('prints heap guidance when respawned analyze exits with likely OOM', async () => {
     delete process.env.NODE_OPTIONS;
     getHeapStatisticsMock.mockReturnValue({ heap_size_limit: 512 * 1024 * 1024 });
@@ -164,7 +174,7 @@ describe('analyzeCommand heap respawn', () => {
       .find((r) => r.msg.includes('Analysis likely ran out of memory'));
     expect(oomGuidance).toBeDefined();
     const msg = oomGuidance?.msg ?? '';
-    expect(msg).toContain('auto-sized to 16384MB');
+    expect(msg).toContain('auto-sized to 6144MB');
     expect(msg).toContain('NODE_OPTIONS="--max-old-space-size=<MB>"');
     expect(msg).toContain('[your-args]');
     expect(msg).toContain('native crash unrelated to heap size');
@@ -283,33 +293,35 @@ describe('analyzeCommand heap respawn', () => {
 describe('computeHeapCapMb (RAM-aware auto heap cap)', () => {
   const GB = 1024 * 1024 * 1024;
 
-  it('sizes to 0.75x physical RAM when unconstrained', async () => {
+  it('clamps half of large physical RAM to 6144MB', async () => {
     const { computeHeapCapMb } = await import('../../src/cli/analyze.js');
-    // 31GB -> 31744MB -> floor(0.75 * 31744) = 23808
-    expect(computeHeapCapMb(31 * GB, null)).toBe(23808);
+    expect(computeHeapCapMb(31 * GB, null)).toBe(6144);
   });
 
-  it('clamps to the 16384 floor on small boxes', async () => {
+  it('uses half of effective RAM inside the clamp range', async () => {
     const { computeHeapCapMb } = await import('../../src/cli/analyze.js');
-    // 8GB -> 0.75 * 8192 = 6144 -> clamped to 16384
-    expect(computeHeapCapMb(8 * GB, null)).toBe(16384);
+    expect(computeHeapCapMb(8 * GB, null)).toBe(4096);
+  });
+
+  it('clamps small effective memory to the 2048MB floor', async () => {
+    const { computeHeapCapMb } = await import('../../src/cli/analyze.js');
+    expect(computeHeapCapMb(2 * GB, null)).toBe(2048);
+    expect(computeHeapCapMb(8 * GB, 1 * GB)).toBe(2048);
   });
 
   it('ignores the unconstrained sentinel from constrainedMemory()', async () => {
     const { computeHeapCapMb } = await import('../../src/cli/analyze.js');
     // ~1.8e19 sentinel > totalmem -> ignored, uses physical RAM
-    expect(computeHeapCapMb(31 * GB, 1.8e19)).toBe(23808);
+    expect(computeHeapCapMb(31 * GB, 1.8e19)).toBe(6144);
   });
 
   it('honors a real cgroup cap smaller than physical RAM', async () => {
     const { computeHeapCapMb } = await import('../../src/cli/analyze.js');
-    // min(31, 12) = 12GB -> 0.75 * 12288 = 9216 -> clamped to 16384
-    expect(computeHeapCapMb(31 * GB, 12 * GB)).toBe(16384);
+    expect(computeHeapCapMb(31 * GB, 12 * GB)).toBe(6144);
   });
 
   it('uses a large cgroup cap when it exceeds the floor', async () => {
     const { computeHeapCapMb } = await import('../../src/cli/analyze.js');
-    // 48GB cap on a 64GB box -> floor(0.75 * 49152) = 36864
-    expect(computeHeapCapMb(64 * GB, 48 * GB)).toBe(36864);
+    expect(computeHeapCapMb(64 * GB, 48 * GB)).toBe(6144);
   });
 });

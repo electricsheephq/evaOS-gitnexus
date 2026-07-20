@@ -137,6 +137,14 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     expect(opts.incrementalOnly).toBe(true);
   });
 
+  it('passes --staged through to runFullAnalysis', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { staged: true });
+
+    expect(runFullAnalysisMock.mock.calls[0][1].staged).toBe(true);
+  });
+
   it('rejects combining --repair-fts with --force', async () => {
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 

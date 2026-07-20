@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { STALE_HASH_SENTINEL } from '../../src/core/lbug/schema.js';
-import { fetchExistingEmbeddingHashes } from '../../src/core/lbug/lbug-adapter.js';
+import {
+  fetchExistingEmbeddingHashes,
+  fetchExistingEmbeddingHashesForNodeIds,
+} from '../../src/core/lbug/lbug-adapter.js';
 
 describe('fetchExistingEmbeddingHashes', () => {
   it('treats rows without chunk-aware metadata as stale even when contentHash exists', async () => {
@@ -46,5 +49,32 @@ describe('fetchExistingEmbeddingHashes', () => {
 
     expect(result?.get('Function:src/main.ts:foo')).toBe(STALE_HASH_SENTINEL);
     expect(execQuery).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('fetchExistingEmbeddingHashesForNodeIds', () => {
+  it('queries only the requested bounded identity page', async () => {
+    const hash = 'abcdef1234567890abcdef1234567890abcdef12';
+    const execQuery = vi
+      .fn()
+      .mockResolvedValue([
+        { nodeId: 'node-1', chunkIndex: 0, startLine: 1, endLine: 2, contentHash: hash },
+      ]);
+
+    const result = await fetchExistingEmbeddingHashesForNodeIds(execQuery, ['node-1', "node-'2"]);
+
+    expect(result.get('node-1')).toBe(hash);
+    expect(execQuery).toHaveBeenCalledWith(expect.stringContaining("['node-1', 'node-\\'2']"));
+  });
+
+  it('rejects identity pages above 512 before querying', async () => {
+    const execQuery = vi.fn();
+    await expect(
+      fetchExistingEmbeddingHashesForNodeIds(
+        execQuery,
+        Array.from({ length: 513 }, (_, index) => `node-${index}`),
+      ),
+    ).rejects.toThrow('exceeds 512');
+    expect(execQuery).not.toHaveBeenCalled();
   });
 });
