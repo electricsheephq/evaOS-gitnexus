@@ -5,6 +5,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   deriveEmbeddingMode,
   deriveEmbeddingCap,
+  resolveEmbeddingNodeLimit,
   DEFAULT_EMBEDDING_NODE_LIMIT,
 } from '../../src/core/embedding-mode.js';
 import {
@@ -74,6 +75,74 @@ describe('run-analyze module', () => {
       await tmpRepo.cleanup();
     }
   });
+
+  it('stamps the current index schema for non-Git repositories', async () => {
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-non-git-schema-');
+    const tmpHome = await createTempDir('gitnexus-run-analyze-non-git-schema-home-');
+    const savedHome = process.env.GITNEXUS_HOME;
+    const savedExtension = process.env.GITNEXUS_LBUG_EXTENSION_INSTALL;
+    const savedUrl = process.env.GITNEXUS_EMBEDDING_URL;
+    const savedModel = process.env.GITNEXUS_EMBEDDING_MODEL;
+    const savedDims = process.env.GITNEXUS_EMBEDDING_DIMS;
+    try {
+      process.env.GITNEXUS_HOME = tmpHome.dbPath;
+      process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = 'never';
+      await fs.writeFile(
+        path.join(tmpRepo.dbPath, 'index.ts'),
+        'export function nonGitSchemaStamp() { return "current"; }\n',
+      );
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      );
+
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      expect((await loadMeta(storagePath))?.schemaVersion).toBe(INCREMENTAL_SCHEMA_VERSION);
+
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '384';
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async () =>
+            new Response('{"error":"intentional checkpoint stop"}', {
+              status: 400,
+              headers: { 'content-type': 'application/json' },
+            }),
+        ),
+      );
+
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          { embeddings: true, force: true, skipAgentsMd: true, skipSkills: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow();
+
+      const interrupted = await loadMeta(storagePath);
+      expect(interrupted?.embeddingCheckpoint).toBeDefined();
+      expect(interrupted?.schemaVersion).toBe(INCREMENTAL_SCHEMA_VERSION);
+    } finally {
+      vi.unstubAllGlobals();
+      if (savedHome === undefined) delete process.env.GITNEXUS_HOME;
+      else process.env.GITNEXUS_HOME = savedHome;
+      if (savedExtension === undefined) delete process.env.GITNEXUS_LBUG_EXTENSION_INSTALL;
+      else process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = savedExtension;
+      if (savedUrl === undefined) delete process.env.GITNEXUS_EMBEDDING_URL;
+      else process.env.GITNEXUS_EMBEDDING_URL = savedUrl;
+      if (savedModel === undefined) delete process.env.GITNEXUS_EMBEDDING_MODEL;
+      else process.env.GITNEXUS_EMBEDDING_MODEL = savedModel;
+      if (savedDims === undefined) delete process.env.GITNEXUS_EMBEDDING_DIMS;
+      else process.env.GITNEXUS_EMBEDDING_DIMS = savedDims;
+      await tmpRepo.cleanup();
+      await tmpHome.cleanup();
+    }
+  }, 120_000);
 
   it('resumes a matching embedding checkpoint instead of taking the clean fast path', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-embedding-checkpoint-');
@@ -626,6 +695,12 @@ describe('deriveEmbeddingMode', () => {
 });
 
 describe('deriveEmbeddingCap', () => {
+  it('preserves an explicit cap while resuming a checkpoint', () => {
+    expect(resolveEmbeddingNodeLimit(100_000, true)).toBe(100_000);
+    expect(resolveEmbeddingNodeLimit(undefined, true)).toBe(0);
+    expect(resolveEmbeddingNodeLimit(undefined, false)).toBeUndefined();
+  });
+
   it('uses the default 50K cap when limit is undefined', () => {
     const d = deriveEmbeddingCap(10_000, undefined);
     expect(d.nodeLimit).toBe(DEFAULT_EMBEDDING_NODE_LIMIT);
@@ -649,6 +724,20 @@ describe('deriveEmbeddingCap', () => {
     expect(d.capDisabled).toBe(true);
     expect(d.skipForCap).toBe(false);
     expect(d.nodeLimit).toBe(0);
+  });
+
+  it('does not apply the local-model default cap to remote HTTP embeddings', () => {
+    const d = deriveEmbeddingCap(1_000_000, undefined, true);
+    expect(d.capDisabled).toBe(true);
+    expect(d.skipForCap).toBe(false);
+    expect(d.nodeLimit).toBe(0);
+  });
+
+  it('still honors an explicit custom cap for remote HTTP embeddings', () => {
+    const d = deriveEmbeddingCap(100_001, 100_000, true);
+    expect(d.capDisabled).toBe(false);
+    expect(d.skipForCap).toBe(true);
+    expect(d.nodeLimit).toBe(100_000);
   });
 
   it('honors a custom positive cap', () => {
