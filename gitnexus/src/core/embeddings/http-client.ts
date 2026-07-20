@@ -17,7 +17,7 @@ const HTTP_TIMEOUT_MS = 30_000;
 const HTTP_MAX_RETRIES = 2;
 const HTTP_RETRY_BACKOFF_MS = 1_000;
 const HTTP_RETRY_CAP_MS = 5_000;
-const HTTP_BATCH_SIZE = 64;
+const HTTP_BATCH_SIZE = 8;
 const DEFAULT_DIMS = 384;
 const HTTP_BREAKER_KEY = 'embeddings-http';
 

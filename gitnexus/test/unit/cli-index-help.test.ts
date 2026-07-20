@@ -274,6 +274,7 @@ describe('CLI help surface', () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('--repair-fts');
     expect(result.stdout).toContain('--incremental-only');
+    expect(result.stdout).toContain('--staged');
   });
 
   it('doctor help includes the read-only recovery plan option', () => {

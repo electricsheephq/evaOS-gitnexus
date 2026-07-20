@@ -42,6 +42,7 @@ import { rankExactEmbeddingRows, type ExactEmbeddingRow } from './exact-search.j
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME, STALE_HASH_SENTINEL } from '../lbug/schema.js';
 import { loadVectorExtension, createVectorIndex } from '../lbug/lbug-adapter.js';
 import { escapeCypherString } from '../lbug/cypher-escape.js';
+import { isMissingColumnOrTableError } from '../lbug/schema-errors.js';
 import type { ExtensionInstallPolicy } from '../lbug/extension-loader.js';
 import { getExactScanLimit } from '../platform/capabilities.js';
 import { logger } from '../logger.js';
@@ -109,121 +110,163 @@ export const contentHashForNode = (
  */
 export type EmbeddingProgressCallback = (progress: EmbeddingProgress) => void;
 
-/**
- * Query all embeddable nodes from LadybugDB
- * Uses table-specific queries for different label types
- */
-const queryEmbeddableNodes = async (
+export const EMBEDDABLE_NODE_PAGE_SIZE = 512;
+const MAX_EMBEDDING_BATCH_SIZE = 16;
+const MAX_EMBEDDING_SUB_BATCH_SIZE = 8;
+
+interface EmbeddableNodeRef {
+  id: string;
+  label: string;
+}
+
+const mapEmbeddableRow = (row: any, label: string): EmbeddableNode => {
+  const hasExportedColumn = label === LABEL_METHOD || LABELS_WITH_EXPORTED.has(label);
+  const content = row.content ?? row[4] ?? '';
+  return {
+    id: String(row.id ?? row[0] ?? ''),
+    name: String(row.name ?? row[1] ?? ''),
+    label: String(row.label ?? row[2] ?? label),
+    filePath: String(row.filePath ?? row[3] ?? ''),
+    content,
+    startLine: label === 'File' ? 1 : (row.startLine ?? row[5]),
+    endLine: label === 'File' ? Math.max(1, content.split('\n').length) : (row.endLine ?? row[6]),
+    isExported: hasExportedColumn ? (row.isExported ?? row[7]) : undefined,
+    description: row.description ?? (hasExportedColumn ? row[8] : row[7]),
+    ...(label === LABEL_METHOD
+      ? {
+          parameterCount: row.parameterCount ?? row[9],
+          returnType: row.returnType ?? row[10],
+        }
+      : {}),
+  };
+};
+
+const buildEmbeddableNodeQuery = (
+  label: string,
+  selector: { afterId?: string; nodeIds?: readonly string[] },
+): string => {
+  const table = label === 'File' ? 'File' : `\`${label}\``;
+  const where = selector.nodeIds
+    ? `WHERE n.id IN [${selector.nodeIds.map((id) => `'${escapeCypherString(id)}'`).join(', ')}]`
+    : selector.afterId
+      ? `WHERE n.id > '${escapeCypherString(selector.afterId)}'`
+      : '';
+  const projection =
+    label === 'File'
+      ? `n.id AS id, n.name AS name, 'File' AS label, n.filePath AS filePath, n.content AS content`
+      : label === LABEL_METHOD
+        ? `n.id AS id, n.name AS name, 'Method' AS label,
+           n.filePath AS filePath, n.content AS content,
+           n.startLine AS startLine, n.endLine AS endLine,
+           n.isExported AS isExported, n.description AS description,
+           n.parameterCount AS parameterCount, n.returnType AS returnType`
+        : LABELS_WITH_EXPORTED.has(label)
+          ? `n.id AS id, n.name AS name, '${label}' AS label,
+             n.filePath AS filePath, n.content AS content,
+             n.startLine AS startLine, n.endLine AS endLine,
+             n.isExported AS isExported, n.description AS description`
+          : `n.id AS id, n.name AS name, '${label}' AS label,
+             n.filePath AS filePath, n.content AS content,
+             n.startLine AS startLine, n.endLine AS endLine,
+             n.description AS description`;
+  return `MATCH (n:${table}) ${where} RETURN ${projection} ORDER BY n.id LIMIT ${EMBEDDABLE_NODE_PAGE_SIZE}`;
+};
+
+const queryLabelNodePages = async function* (
   executeQuery: (cypher: string) => Promise<any[]>,
-): Promise<EmbeddableNode[]> => {
-  const allNodes: EmbeddableNode[] = [];
-
-  for (const label of EMBEDDABLE_LABELS) {
-    try {
-      let query: string;
-
-      if (label === LABEL_METHOD) {
-        // Method has parameterCount and returnType
-        query = `
-          MATCH (n:Method)
-          RETURN n.id AS id, n.name AS name, 'Method' AS label,
-                 n.filePath AS filePath, n.content AS content,
-                 n.startLine AS startLine, n.endLine AS endLine,
-                 n.isExported AS isExported, n.description AS description,
-                 n.parameterCount AS parameterCount, n.returnType AS returnType
-        `;
-      } else if (LABELS_WITH_EXPORTED.has(label)) {
-        // Function, Class, Interface have isExported and description
-        query = `
-          MATCH (n:\`${label}\`)
-          RETURN n.id AS id, n.name AS name, '${label}' AS label,
-                 n.filePath AS filePath, n.content AS content,
-                 n.startLine AS startLine, n.endLine AS endLine,
-                 n.isExported AS isExported, n.description AS description
-        `;
-      } else {
-        // Multi-language tables (Struct, Enum, etc.) — have description but no isExported
-        query = `
-          MATCH (n:\`${label}\`)
-          RETURN n.id AS id, n.name AS name, '${label}' AS label,
-                 n.filePath AS filePath, n.content AS content,
-                 n.startLine AS startLine, n.endLine AS endLine,
-                 n.description AS description
-        `;
-      }
-
-      const rows = await executeQuery(query);
-      for (const row of rows) {
-        const hasExportedColumn = label === LABEL_METHOD || LABELS_WITH_EXPORTED.has(label);
-        allNodes.push({
-          id: row.id ?? row[0],
-          name: row.name ?? row[1],
-          label: row.label ?? row[2],
-          filePath: row.filePath ?? row[3],
-          content: row.content ?? row[4] ?? '',
-          startLine: row.startLine ?? row[5],
-          endLine: row.endLine ?? row[6],
-          isExported: hasExportedColumn ? (row.isExported ?? row[7]) : undefined,
-          description: row.description ?? (hasExportedColumn ? row[8] : row[7]),
-          ...(label === LABEL_METHOD
-            ? {
-                parameterCount: row.parameterCount ?? row[9],
-                returnType: row.returnType ?? row[10],
-              }
-            : {}),
-        });
-      }
-    } catch (error) {
-      if (isDev) {
-        logger.warn({ error }, `Query for ${label} nodes failed:`);
-      }
-    }
+  label: string,
+): AsyncGenerator<EmbeddableNode[]> {
+  let afterId: string | undefined;
+  for (;;) {
+    const rows = await executeQuery(buildEmbeddableNodeQuery(label, { afterId }));
+    if (!rows || rows.length === 0) return;
+    const rawPage = rows.slice(0, EMBEDDABLE_NODE_PAGE_SIZE);
+    const nextAfterId = String(rawPage.at(-1)?.id ?? rawPage.at(-1)?.[0] ?? '');
+    if (!nextAfterId || (afterId !== undefined && nextAfterId <= afterId)) return;
+    afterId = nextAfterId;
+    const page = rawPage
+      .map((row) => mapEmbeddableRow(row, label))
+      .filter((node) =>
+        label === 'File'
+          ? Boolean(
+              node.id &&
+              node.filePath &&
+              node.content.trim() &&
+              node.content !== '[Binary file - content not stored]',
+            )
+          : Boolean(node.id),
+      );
+    if (page.length > 0) yield page;
+    if (rows.length < EMBEDDABLE_NODE_PAGE_SIZE) return;
   }
-
-  return allNodes.length > 0 ? allNodes : queryFallbackFileNodes(executeQuery);
 };
 
 /**
- * Static and documentation repositories may contain no code symbols while
- * still persisting useful text on File nodes. Keep File embeddings as a
- * zero-symbol fallback so code repositories retain symbol-first selection.
+ * Page code-symbol nodes deterministically. If the repository has no code
+ * symbols, page text-bearing File nodes instead.
  */
-const queryFallbackFileNodes = async (
+const queryEmbeddableNodes = async function* (
   executeQuery: (cypher: string) => Promise<any[]>,
-): Promise<EmbeddableNode[]> => {
-  try {
-    const rows = await executeQuery(`
-      MATCH (n:File)
-      RETURN n.id AS id, n.name AS name, 'File' AS label,
-             n.filePath AS filePath, n.content AS content
-    `);
-
-    return rows
-      .map((row) => {
-        const content = row.content ?? row[4] ?? '';
-        return {
-          id: row.id ?? row[0],
-          name: row.name ?? row[1],
-          label: row.label ?? row[2] ?? 'File',
-          filePath: row.filePath ?? row[3],
-          content,
-          startLine: 1,
-          endLine: Math.max(1, content.split('\n').length),
-        };
-      })
-      .filter(
-        (node) =>
-          node.id &&
-          node.filePath &&
-          node.content.trim() &&
-          node.content !== '[Binary file - content not stored]',
-      );
-  } catch (error) {
-    if (isDev) {
-      logger.warn({ error }, 'Fallback File-node embedding query failed:');
+): AsyncGenerator<EmbeddableNode[]> {
+  let sawCodeSymbol = false;
+  for (const label of EMBEDDABLE_LABELS) {
+    try {
+      for await (const page of queryLabelNodePages(executeQuery, label)) {
+        sawCodeSymbol = true;
+        yield page;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? '');
+      if (!isMissingColumnOrTableError(message)) throw error;
+      if (isDev) logger.warn({ error }, `Query for ${label} nodes failed:`);
     }
-    return [];
   }
+  if (!sawCodeSymbol) yield* queryFallbackFileNodes(executeQuery);
+};
+
+/** Static/documentation repository fallback, still bounded to 512 rows. */
+const queryFallbackFileNodes = async function* (
+  executeQuery: (cypher: string) => Promise<any[]>,
+): AsyncGenerator<EmbeddableNode[]> {
+  try {
+    yield* queryLabelNodePages(executeQuery, 'File');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? '');
+    if (!isMissingColumnOrTableError(message)) throw error;
+    if (isDev) logger.warn({ error }, 'Fallback File-node embedding query failed:');
+  }
+};
+
+const queryNodesByRefs = async (
+  executeQuery: (cypher: string) => Promise<any[]>,
+  refs: readonly EmbeddableNodeRef[],
+): Promise<EmbeddableNode[]> => {
+  if (refs.length > EMBEDDABLE_NODE_PAGE_SIZE) {
+    throw new Error(`Embeddable node page exceeds ${EMBEDDABLE_NODE_PAGE_SIZE}`);
+  }
+  const byLabel = new Map<string, EmbeddableNodeRef[]>();
+  for (const ref of refs) {
+    const labelRefs = byLabel.get(ref.label) ?? [];
+    labelRefs.push(ref);
+    byLabel.set(ref.label, labelRefs);
+  }
+  const byId = new Map<string, EmbeddableNode>();
+  for (const [label, labelRefs] of byLabel) {
+    const ids = labelRefs.map((ref) => ref.id);
+    const wanted = new Set(ids);
+    const rows = await executeQuery(buildEmbeddableNodeQuery(label, { nodeIds: ids }));
+    for (const row of rows.slice(0, EMBEDDABLE_NODE_PAGE_SIZE)) {
+      const node = mapEmbeddableRow(row, label);
+      if (wanted.has(node.id)) byId.set(node.id, node);
+    }
+  }
+  const nodes = refs
+    .map((ref) => byId.get(ref.id))
+    .filter((node): node is EmbeddableNode => !!node);
+  if (nodes.length !== refs.length) {
+    throw new Error('An embeddable node disappeared while its checkpoint window was active');
+  }
+  return nodes;
 };
 
 /**
@@ -319,6 +362,10 @@ export interface EmbeddingPipelineOptions {
   signal?: AbortSignal;
   checkpointEveryNodes?: number;
   forceReembedNodeIds?: ReadonlySet<string>;
+  /** Load cached node identities for one page; callers must return at most the requested IDs. */
+  loadExistingEmbeddingHashes?: (
+    nodeIds: readonly string[],
+  ) => Promise<Map<string, string> | undefined>;
   onCheckpointWindowStart?: (window: EmbeddingPipelineCheckpointWindow) => Promise<void>;
   onCheckpoint?: (checkpoint: EmbeddingPipelineCheckpoint) => Promise<void>;
 }
@@ -428,58 +475,60 @@ export const runEmbeddingPipeline = async (
       logger.info('🔍 Querying embeddable nodes...');
     }
 
-    // Phase 2: Query embeddable nodes
-    let nodes = await queryEmbeddableNodes(executeQuery);
-    throwIfCancelled();
-    const embeddableNodeIds = new Set(nodes.map((node) => node.id));
-
-    // Incremental mode: compare content hashes, delete stale rows, skip fresh ones.
-    // Computed hashes for stale nodes are cached so batchInsertEmbeddings can reuse them
-    // (avoids double computation).
-    const computedStaleHashes = new Map<string, string>();
-    // Stale rows are DELETE'd per-batch (just before each batch's INSERT) rather
-    // than all up front — see U6 / KTD7. `staleNodeIds` is consulted inside the
-    // batch loop; it stays empty in full (non-incremental) mode so no deletes fire.
-    const staleNodeIds = new Set<string>();
+    // Phase 2: scan bounded node pages and stream cached identity lookups. The
+    // first pass computes an exact progress total without retaining node content;
+    // the second pass builds one durable 5,000-node checkpoint window at a time.
     const forceReembedNodeIds = pipelineOptions.forceReembedNodeIds;
-    if (
-      (existingEmbeddings && existingEmbeddings.size > 0) ||
-      (forceReembedNodeIds && forceReembedNodeIds.size > 0)
-    ) {
-      const beforeCount = nodes.length;
-      nodes = nodes.filter((n) => {
-        const existingHash = existingEmbeddings?.get(n.id);
-        if (existingHash === undefined) {
-          // New node — needs embedding
-          return true;
-        }
-        const currentHash = contentHashForNode(n, finalConfig);
-        if (currentHash !== existingHash || forceReembedNodeIds?.has(n.id)) {
-          // Content changed — cache hash for reuse during insert, mark for DELETE + re-embed
-          computedStaleHashes.set(n.id, currentHash);
-          staleNodeIds.add(n.id);
-          return true;
-        }
-        // Hash matches — skip (fresh); no need to cache hash for skipped nodes
-        return false;
-      });
+    const removedPendingNodeIds = new Set(forceReembedNodeIds ?? []);
 
-      if (isDev) {
-        logger.info(
-          `📦 Incremental embeddings: ${beforeCount} total, ${existingEmbeddings.size} cached, ${staleNodeIds.size} stale, ${nodes.length} to embed`,
+    const loadPageHashes = async (
+      nodes: readonly EmbeddableNode[],
+    ): Promise<Map<string, string>> => {
+      if (pipelineOptions.loadExistingEmbeddingHashes) {
+        return (
+          (await pipelineOptions.loadExistingEmbeddingHashes(nodes.map((node) => node.id))) ??
+          new Map()
         );
       }
+      if (!existingEmbeddings || existingEmbeddings.size === 0) return new Map();
+      const page = new Map<string, string>();
+      for (const node of nodes) {
+        const hash = existingEmbeddings.get(node.id);
+        if (hash !== undefined) page.set(node.id, hash);
+      }
+      return page;
+    };
+
+    const selectPageRefs = async (
+      nodes: readonly EmbeddableNode[],
+      trackPendingPresence: boolean,
+    ): Promise<EmbeddableNodeRef[]> => {
+      const existingHashes = await loadPageHashes(nodes);
+      const selected: EmbeddableNodeRef[] = [];
+      for (const node of nodes) {
+        if (trackPendingPresence) removedPendingNodeIds.delete(node.id);
+        const existingHash = existingHashes.get(node.id);
+        if (
+          existingHash === undefined ||
+          existingHash !== contentHashForNode(node, finalConfig) ||
+          forceReembedNodeIds?.has(node.id)
+        ) {
+          selected.push({ id: node.id, label: node.label });
+        }
+      }
+      return selected;
+    };
+
+    let totalNodes = 0;
+    for await (const page of queryEmbeddableNodes(executeQuery)) {
+      throwIfCancelled();
+      totalNodes += (await selectPageRefs(page, true)).length;
     }
 
-    if (forceReembedNodeIds && forceReembedNodeIds.size > 0) {
-      const removedPendingNodeIds = [...forceReembedNodeIds].filter(
-        (nodeId) => !embeddableNodeIds.has(nodeId),
-      );
-      await deleteStaleEmbeddingRows(executeWithReusedStatement, removedPendingNodeIds);
+    if (removedPendingNodeIds.size > 0) {
+      await deleteStaleEmbeddingRows(executeWithReusedStatement, [...removedPendingNodeIds]);
       throwIfCancelled();
     }
-
-    const totalNodes = nodes.length;
 
     if (isDev) {
       logger.info(`📊 Found ${totalNodes} embeddable nodes`);
@@ -507,13 +556,10 @@ export const runEmbeddingPipeline = async (
     }
 
     // Phase 3: Chunk + embed nodes
-    const batchSize = finalConfig.batchSize;
+    const batchSize = Math.min(finalConfig.batchSize, MAX_EMBEDDING_BATCH_SIZE);
     const chunkSize = finalConfig.chunkSize;
     const overlap = finalConfig.overlap;
-    const checkpointWindowNodeCount = Math.max(
-      batchSize,
-      Math.ceil(checkpointEveryNodes / batchSize) * batchSize,
-    );
+    const checkpointWindowNodeCount = checkpointEveryNodes;
     let processedNodes = 0;
 
     onProgress({
@@ -525,147 +571,139 @@ export const runEmbeddingPipeline = async (
       totalBatches: Math.ceil(totalNodes / batchSize),
     });
 
-    // Process in batches of nodes
-    for (let batchIndex = 0; batchIndex < totalNodes; batchIndex += batchSize) {
-      throwIfCancelled();
-      if (pipelineOptions.onCheckpointWindowStart && batchIndex % checkpointWindowNodeCount === 0) {
+    const processNodePage = async (nodes: EmbeddableNode[]): Promise<void> => {
+      const pageHashes = await loadPageHashes(nodes);
+      for (let batchIndex = 0; batchIndex < nodes.length; batchIndex += batchSize) {
+        throwIfCancelled();
+        const batch = nodes.slice(batchIndex, batchIndex + batchSize);
+        const allTexts: string[] = [];
+        const allUpdates: Array<{
+          nodeId: string;
+          chunkIndex: number;
+          startLine: number;
+          endLine: number;
+          contentHash: string;
+        }> = [];
+
+        for (const node of batch) {
+          const isShort = isShortLabel(node.label);
+          const startLine = node.startLine ?? 0;
+          const endLine = node.endLine ?? 0;
+          if (!isShort && STRUCTURAL_LABELS.has(node.label)) {
+            try {
+              const names = await extractStructuralNames(node.content, node.filePath);
+              node.methodNames = names.methodNames;
+              node.fieldNames = names.fieldNames;
+            } catch {
+              // AST extraction failed — names stay undefined, text-generator handles gracefully
+            }
+          }
+
+          const hash = contentHashForNode(node, finalConfig);
+          let chunks: Array<{
+            text: string;
+            chunkIndex: number;
+            startLine: number;
+            endLine: number;
+          }>;
+          if (isShort) {
+            chunks = [{ text: node.content, chunkIndex: 0, startLine, endLine }];
+          } else {
+            try {
+              chunks = await chunkNode(
+                node.label,
+                node.content,
+                node.filePath,
+                startLine,
+                endLine,
+                chunkSize,
+                overlap,
+              );
+            } catch (chunkErr) {
+              if (isDev) {
+                logger.warn(
+                  { chunkErr },
+                  `⚠️ AST chunking failed for ${node.label} "${node.name}" (${node.filePath}), falling back to character-based chunking:`,
+                );
+              }
+              chunks = characterChunk(node.content, startLine, endLine, chunkSize, overlap);
+            }
+          }
+
+          let prevTail = '';
+          for (const chunk of chunks) {
+            allTexts.push(
+              generateEmbeddingText(node, chunk.text, finalConfig, chunk.chunkIndex, prevTail),
+            );
+            allUpdates.push({
+              nodeId: node.id,
+              chunkIndex: chunk.chunkIndex,
+              startLine: chunk.startLine,
+              endLine: chunk.endLine,
+              contentHash: hash,
+            });
+            prevTail = overlap > 0 ? chunk.text.slice(-overlap) : '';
+          }
+        }
+
+        const batchStaleIds = batch
+          .filter((node) => pageHashes.has(node.id))
+          .map((node) => node.id);
+        await deleteStaleEmbeddingRows(executeWithReusedStatement, batchStaleIds);
+        throwIfCancelled();
+
+        const embedSubBatch = Math.min(finalConfig.subBatchSize, MAX_EMBEDDING_SUB_BATCH_SIZE);
+        for (let si = 0; si < allTexts.length; si += embedSubBatch) {
+          const subTexts = allTexts.slice(si, si + embedSubBatch);
+          const subUpdates = allUpdates.slice(si, si + embedSubBatch);
+          let embeddings: Float32Array[];
+          try {
+            embeddings = await embedBatch(subTexts, { signal: pipelineOptions.signal });
+          } catch (embedErr) {
+            logger.error(
+              { embedErr },
+              `❌ embedBatch failed for ${subTexts.length} texts (first: "${subTexts[0]?.substring(0, 80)}..."):`,
+            );
+            throw embedErr;
+          }
+          await batchInsertEmbeddings(
+            executeWithReusedStatement,
+            subUpdates.map((update, index) => ({
+              ...update,
+              embedding: embeddingToArray(embeddings[index]),
+            })),
+          );
+          throwIfCancelled();
+        }
+
+        processedNodes += batch.length;
+        totalChunks += allUpdates.length;
+        onProgress({
+          phase: 'embedding',
+          percent: Math.round(20 + (processedNodes / totalNodes) * 70),
+          nodesProcessed: processedNodes,
+          totalNodes,
+          currentBatch: Math.ceil(processedNodes / batchSize),
+          totalBatches: Math.ceil(totalNodes / batchSize),
+        });
+      }
+    };
+
+    const processCheckpointWindow = async (refs: EmbeddableNodeRef[]): Promise<void> => {
+      if (pipelineOptions.onCheckpointWindowStart) {
         await pipelineOptions.onCheckpointWindowStart({
           nodesProcessed: processedNodes,
           totalNodes,
           chunksProcessed: totalChunks,
-          nodeIds: nodes
-            .slice(batchIndex, batchIndex + checkpointWindowNodeCount)
-            .map((node) => node.id),
+          nodeIds: refs.map((ref) => ref.id),
         });
         throwIfCancelled();
       }
-      const batch = nodes.slice(batchIndex, batchIndex + batchSize);
-
-      // Chunk each node and generate text
-      const allTexts: string[] = [];
-      const allUpdates: Array<{
-        nodeId: string;
-        chunkIndex: number;
-        startLine: number;
-        endLine: number;
-        contentHash: string;
-      }> = [];
-
-      for (const node of batch) {
-        const isShort = isShortLabel(node.label);
-        const startLine = node.startLine ?? 0;
-        const endLine = node.endLine ?? 0;
-
-        // Extract structural names for class-like nodes via AST extractors
-        if (!isShort && STRUCTURAL_LABELS.has(node.label)) {
-          try {
-            const names = await extractStructuralNames(node.content, node.filePath);
-            node.methodNames = names.methodNames;
-            node.fieldNames = names.fieldNames;
-          } catch {
-            // AST extraction failed — names stay undefined, text-generator handles gracefully
-          }
-        }
-
-        // Compute content hash once per node (re-use cached value for stale nodes)
-        const hash = computedStaleHashes.get(node.id) ?? contentHashForNode(node, finalConfig);
-
-        let chunks: Array<{ text: string; chunkIndex: number; startLine: number; endLine: number }>;
-        if (isShort) {
-          chunks = [{ text: node.content, chunkIndex: 0, startLine, endLine }];
-        } else {
-          try {
-            chunks = await chunkNode(
-              node.label,
-              node.content,
-              node.filePath,
-              startLine,
-              endLine,
-              chunkSize,
-              overlap,
-            );
-          } catch (chunkErr) {
-            if (isDev) {
-              logger.warn(
-                { chunkErr },
-                `⚠️ AST chunking failed for ${node.label} "${node.name}" (${node.filePath}), falling back to character-based chunking:`,
-              );
-            }
-            chunks = characterChunk(node.content, startLine, endLine, chunkSize, overlap);
-          }
-        }
-
-        let prevTail = '';
-        for (const chunk of chunks) {
-          const text = generateEmbeddingText(
-            node,
-            chunk.text,
-            finalConfig,
-            chunk.chunkIndex,
-            prevTail,
-          );
-          allTexts.push(text);
-          allUpdates.push({
-            nodeId: node.id,
-            chunkIndex: chunk.chunkIndex,
-            startLine: chunk.startLine,
-            endLine: chunk.endLine,
-            contentHash: hash,
-          });
-          prevTail = overlap > 0 ? chunk.text.slice(-overlap) : '';
-        }
+      for (let i = 0; i < refs.length; i += EMBEDDABLE_NODE_PAGE_SIZE) {
+        const pageRefs = refs.slice(i, i + EMBEDDABLE_NODE_PAGE_SIZE);
+        await processNodePage(await queryNodesByRefs(executeQuery, pageRefs));
       }
-
-      // U6 / KTD7: delete this batch's stale rows immediately before its inserts,
-      // so an interrupted re-embed loses at most one batch (not the whole index).
-      // Preserves Kuzu's required DELETE-before-INSERT for vector-indexed rows.
-      const batchStaleIds = batch.filter((n) => staleNodeIds.has(n.id)).map((n) => n.id);
-      await deleteStaleEmbeddingRows(executeWithReusedStatement, batchStaleIds);
-      throwIfCancelled();
-
-      // Embed chunk texts in sub-batches to control memory
-      const EMBED_SUB_BATCH = finalConfig.subBatchSize;
-      for (let si = 0; si < allTexts.length; si += EMBED_SUB_BATCH) {
-        const subTexts = allTexts.slice(si, si + EMBED_SUB_BATCH);
-        const subUpdates = allUpdates.slice(si, si + EMBED_SUB_BATCH);
-
-        let embeddings: Float32Array[];
-        try {
-          embeddings = await embedBatch(subTexts, { signal: pipelineOptions.signal });
-        } catch (embedErr) {
-          logger.error(
-            { embedErr },
-            `❌ embedBatch failed for ${subTexts.length} texts (first: "${subTexts[0]?.substring(0, 80)}..."):`,
-          );
-          throw embedErr;
-        }
-
-        const dbUpdates = subUpdates.map((u, i) => ({
-          ...u,
-          embedding: embeddingToArray(embeddings[i]),
-        }));
-
-        await batchInsertEmbeddings(executeWithReusedStatement, dbUpdates);
-        throwIfCancelled();
-      }
-
-      processedNodes += batch.length;
-      totalChunks += allUpdates.length;
-
-      const embeddingProgress = 20 + (processedNodes / totalNodes) * 70;
-      onProgress({
-        phase: 'embedding',
-        percent: Math.round(embeddingProgress),
-        nodesProcessed: processedNodes,
-        totalNodes,
-        currentBatch: Math.floor(batchIndex / batchSize) + 1,
-        totalBatches: Math.ceil(totalNodes / batchSize),
-      });
-
-      if (
-        pipelineOptions.onCheckpoint &&
-        (processedNodes % checkpointWindowNodeCount === 0 || processedNodes === totalNodes)
-      ) {
+      if (pipelineOptions.onCheckpoint) {
         await pipelineOptions.onCheckpoint({
           nodesProcessed: processedNodes,
           totalNodes,
@@ -673,7 +711,21 @@ export const runEmbeddingPipeline = async (
         });
         throwIfCancelled();
       }
+    };
+
+    let checkpointRefs: EmbeddableNodeRef[] = [];
+    for await (const page of queryEmbeddableNodes(executeQuery)) {
+      throwIfCancelled();
+      const selected = await selectPageRefs(page, false);
+      for (const ref of selected) {
+        checkpointRefs.push(ref);
+        if (checkpointRefs.length === checkpointWindowNodeCount) {
+          await processCheckpointWindow(checkpointRefs);
+          checkpointRefs = [];
+        }
+      }
     }
+    if (checkpointRefs.length > 0) await processCheckpointWindow(checkpointRefs);
 
     // Phase 4: Create vector index
     throwIfCancelled();

@@ -55,6 +55,10 @@ program
   .description('Index a repository (full analysis)')
   .option('-f, --force', 'Force full re-index even if up to date')
   .option(
+    '--staged',
+    'Build and validate an isolated DB, then promote it with a crash-safe journal',
+  )
+  .option(
     '--incremental-only',
     'Refuse recovery, migration, or scale escalation that would require a full rebuild',
   )
