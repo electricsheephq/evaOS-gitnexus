@@ -63,9 +63,13 @@ describe('read-pool optional extension loading', () => {
 
     expect(loadFTSExtensionMock).toHaveBeenCalledTimes(8);
     expect(loadVectorExtensionMock).toHaveBeenCalledTimes(8);
-    expect(loadFTSExtensionMock).toHaveBeenCalledWith(expect.anything(), { policy: 'load-only' });
+    expect(loadFTSExtensionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ policy: 'load-only', warn: expect.any(Function) }),
+    );
     expect(loadVectorExtensionMock).toHaveBeenCalledWith(expect.anything(), {
       policy: 'load-only',
+      warn: expect.any(Function),
     });
     expect(getPoolCapabilities('repo-a')).toEqual({
       fts: true,

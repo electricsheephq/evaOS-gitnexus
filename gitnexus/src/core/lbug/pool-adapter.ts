@@ -692,12 +692,24 @@ async function preparePoolConnections(connections: lbug.Connection[]): Promise<P
   // but some LadybugDB builds are not safe to initialize extensions in parallel.
   for (const connection of connections) {
     try {
-      if (!(await loadFTSExtension(connection, { policy: 'load-only' }))) fts = false;
+      if (
+        !(await loadFTSExtension(connection, {
+          policy: 'load-only',
+          warn: poolSidecarLogger.warn,
+        }))
+      )
+        fts = false;
     } catch {
       fts = false;
     }
     try {
-      if (!(await loadVectorExtension(connection, { policy: 'load-only' }))) vector = false;
+      if (
+        !(await loadVectorExtension(connection, {
+          policy: 'load-only',
+          warn: poolSidecarLogger.warn,
+        }))
+      )
+        vector = false;
     } catch {
       vector = false;
     }

@@ -292,13 +292,19 @@ export const doctorCommand = async (
   // said "available" while analyze failed to load the extension (#2374).
   const poolProbe =
     nativeCheck.ok && repoMeta ? await probeDoctorPool(storagePaths.lbugPath) : null;
+  // The aggregate pool verdict is authoritative, but its booleans intentionally
+  // contain no native error text. On failure, run the same bounded, offline LOAD
+  // diagnostic doctor historically used so remediation remains specific.
+  const ftsFailureProbe = poolProbe && !poolProbe.fts ? await probeFtsExtensionLoad() : null;
   const ftsProbe = nativeCheck.ok
     ? poolProbe
       ? {
           loaded: poolProbe.fts,
           reason: poolProbe.fts
             ? undefined
-            : (poolProbe.reason ?? 'FTS did not load on every read-pool connection'),
+            : ((!ftsFailureProbe?.loaded ? ftsFailureProbe?.reason : undefined) ??
+              poolProbe.reason ??
+              'FTS did not load on every read-pool connection'),
         }
       : await probeFtsExtensionLoad()
     : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
@@ -317,13 +323,17 @@ export const doctorCommand = async (
       console.log(`  ${padDisplayEnd('', 18)}${remedy}`);
     }
   }
+  const vectorFailureProbe =
+    poolProbe && !poolProbe.vector ? await probeVectorExtensionLoad() : null;
   const vectorProbe = nativeCheck.ok
     ? poolProbe
       ? {
           loaded: poolProbe.vector,
           reason: poolProbe.vector
             ? undefined
-            : (poolProbe.reason ?? 'VECTOR did not load on every read-pool connection'),
+            : ((!vectorFailureProbe?.loaded ? vectorFailureProbe?.reason : undefined) ??
+              poolProbe.reason ??
+              'VECTOR did not load on every read-pool connection'),
         }
       : await probeVectorExtensionLoad()
     : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
