@@ -7,6 +7,7 @@ import path from 'path';
 import lbug from '@ladybugdb/core';
 import { closeQueryResults } from './query-result-utils.js';
 import { escapeCypherString } from './cypher-escape.js';
+import { isMissingColumnOrTableError } from './schema-errors.js';
 import { withConnLock } from './conn-lock.js';
 import { isWalDriverActive } from './wal-driver-state.js';
 import { KnowledgeGraph } from '../graph/types.js';
@@ -225,16 +226,6 @@ let vectorIndexEnsured = false;
 const ensuredFTSIndexes = new Set<string>();
 
 const ftsIndexKey = (tableName: string, indexName: string): string => `${tableName}:${indexName}`;
-
-/**
- * Check if an error indicates a missing column or table (schema-level problem)
- * rather than a transient/connection error. Used for legacy DB fallback logic.
- */
-const isMissingColumnOrTableError = (msg: string): boolean =>
-  msg.includes('does not exist') ||
-  // Kuzu-specific: "(table|column|property) ... not found" — narrow enough to avoid
-  // matching transient errors like "connection not found" or "key not found".
-  /(table|column|property).*not found/i.test(msg);
 
 /** Expose the current Database for pool adapter reuse in tests. */
 export const getDatabase = (): lbug.Database | null => db;

@@ -361,6 +361,67 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(result.nodesProcessed).toBe(1);
   });
 
+  it('propagates unexpected symbol-query failures instead of building a partial index', async () => {
+    mockEmbedderSetup();
+
+    const executeQuery = vi.fn().mockRejectedValue(new Error('connection reset by peer'));
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await expect(
+      runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress),
+    ).rejects.toThrow('connection reset by peer');
+    expect(vectorIndexMock).not.toHaveBeenCalled();
+  });
+
+  it('propagates unexpected fallback File-query failures', async () => {
+    mockEmbedderSetup();
+
+    const executeQuery = vi.fn().mockImplementation(async (cypher: string) => {
+      if (cypher.includes('MATCH (n:File)')) throw new Error('database is closed');
+      return [];
+    });
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await expect(
+      runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress),
+    ).rejects.toThrow('database is closed');
+    expect(vectorIndexMock).not.toHaveBeenCalled();
+  });
+
+  it('retains missing-schema fallback for labels absent from legacy databases', async () => {
+    mockEmbedderSetup();
+
+    const fileNode = makeNode({
+      id: 'File:README.md',
+      name: 'README.md',
+      label: 'File',
+      filePath: 'README.md',
+      content: '# Legacy repository',
+    });
+    const executeQuery = vi.fn().mockImplementation(async (cypher: string) => {
+      if (cypher.includes('MATCH (n:`Function`)')) {
+        throw new Error('Binder exception: Table Function does not exist');
+      }
+      if (cypher.includes('MATCH (n:File)')) return [fileNode];
+      return [];
+    });
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    const result = await runEmbeddingPipeline(executeQuery, executeWithReusedStatement, onProgress);
+
+    expect(result.nodesProcessed).toBe(1);
+    expect(vectorIndexMock).toHaveBeenCalledOnce();
+  });
+
   it('skips unchanged nodes when hash matches', async () => {
     mockEmbedderSetup();
 

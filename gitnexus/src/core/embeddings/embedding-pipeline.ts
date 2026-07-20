@@ -42,6 +42,7 @@ import { rankExactEmbeddingRows, type ExactEmbeddingRow } from './exact-search.j
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME, STALE_HASH_SENTINEL } from '../lbug/schema.js';
 import { loadVectorExtension, createVectorIndex } from '../lbug/lbug-adapter.js';
 import { escapeCypherString } from '../lbug/cypher-escape.js';
+import { isMissingColumnOrTableError } from '../lbug/schema-errors.js';
 import type { ExtensionInstallPolicy } from '../lbug/extension-loader.js';
 import { getExactScanLimit } from '../platform/capabilities.js';
 import { logger } from '../logger.js';
@@ -215,6 +216,8 @@ const queryEmbeddableNodes = async function* (
         yield page;
       }
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? '');
+      if (!isMissingColumnOrTableError(message)) throw error;
       if (isDev) logger.warn({ error }, `Query for ${label} nodes failed:`);
     }
   }
@@ -228,6 +231,8 @@ const queryFallbackFileNodes = async function* (
   try {
     yield* queryLabelNodePages(executeQuery, 'File');
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? '');
+    if (!isMissingColumnOrTableError(message)) throw error;
     if (isDev) logger.warn({ error }, 'Fallback File-node embedding query failed:');
   }
 };
