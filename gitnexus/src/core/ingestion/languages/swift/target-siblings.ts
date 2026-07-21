@@ -17,13 +17,15 @@
  * single-Xcode-project assumption). Every `.swift` file in the same target
  * sees its siblings' top-level defs.
  *
- * Bindings are added through the append-only `bindingAugmentations`
- * channel (Contract Invariant I8) with `origin: 'namespace'`, exactly
- * like the Go implementation — `indexes.bindings` is frozen post-
- * finalize and must not be mutated.
+ * Bindings are added once per SPM target through the shared
+ * `namespaceFqnBindings` channel, gated for each module scope by
+ * `accessibleNamespacesByScope`. This preserves same-target visibility and
+ * local-first lookup without copying every target definition into every file
+ * (the old O(files x definitions) fan-out exhausted the heap on large Xcode
+ * workspaces with no Package.swift).
  */
 
-import type { BindingRef, ParsedFile, ScopeId, SymbolDefinition } from 'gitnexus-shared';
+import type { BindingRef, ParsedFile, ScopeId } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import { coerceSwiftTargets, groupSwiftFilesBySpmTarget } from './target-grouping.js';
 
@@ -44,46 +46,51 @@ export function populateSwiftTargetSiblings(
     targets,
   );
 
-  const augmentations = indexes.bindingAugmentations as Map<ScopeId, Map<string, BindingRef[]>>;
+  const namespaceBindings = indexes.namespaceFqnBindings as Map<string, Map<string, BindingRef[]>>;
+  const accessibleTargets = indexes.accessibleNamespacesByScope as Map<ScopeId, string[]>;
 
-  for (const [, group] of filesByTarget) {
+  for (const [targetName, group] of filesByTarget) {
     if (group.length < 2) continue; // no siblings to share
-    const siblings = group.map((parsed) => ({
-      filePath: parsed.filePath,
-      defs: [...parsed.localDefs] as SymbolDefinition[],
-    }));
-    for (const target of siblings) {
-      for (const receiver of siblings) {
-        if (receiver.filePath === target.filePath) continue; // no self-reference
-        const receiverModule = indexes.moduleScopes.byFilePath.get(receiver.filePath);
-        if (receiverModule === undefined) continue;
+    const targetKey = `swift-target:${targetName}`;
+    let targetBindings = namespaceBindings.get(targetKey);
+    if (targetBindings === undefined) {
+      targetBindings = new Map<string, BindingRef[]>();
+      namespaceBindings.set(targetKey, targetBindings);
+    }
+    const seenByName = new Map<string, Set<string>>();
 
-        for (const def of target.defs) {
-          const name = def.qualifiedName?.split('.').pop() ?? def.qualifiedName ?? '';
-          if (name === '') continue;
-          const bucket = getAugmentationBucket(augmentations, receiverModule, name);
-          if (bucket.some((b) => b.def.nodeId === def.nodeId)) continue;
-          bucket.push({ def, origin: 'namespace' });
+    for (const parsed of group) {
+      registerTargetAccess(accessibleTargets, parsed.moduleScope, targetKey);
+      for (const def of parsed.localDefs) {
+        const name = def.qualifiedName?.split('.').pop() ?? def.qualifiedName ?? '';
+        if (name === '') continue;
+        let bucket = targetBindings.get(name);
+        if (bucket === undefined) {
+          bucket = [];
+          targetBindings.set(name, bucket);
         }
+        let seen = seenByName.get(name);
+        if (seen === undefined) {
+          seen = new Set(bucket.map((binding) => binding.def.nodeId));
+          seenByName.set(name, seen);
+        }
+        if (seen.has(def.nodeId)) continue;
+        seen.add(def.nodeId);
+        bucket.push({ def, origin: 'namespace' });
       }
     }
   }
 }
 
-function getAugmentationBucket(
-  augmentations: Map<ScopeId, Map<string, BindingRef[]>>,
+function registerTargetAccess(
+  accessibleTargets: Map<ScopeId, string[]>,
   scopeId: ScopeId,
-  name: string,
-): BindingRef[] {
-  let scopeBindings = augmentations.get(scopeId);
-  if (scopeBindings === undefined) {
-    scopeBindings = new Map<string, BindingRef[]>();
-    augmentations.set(scopeId, scopeBindings);
+  targetKey: string,
+): void {
+  const existing = accessibleTargets.get(scopeId);
+  if (existing === undefined) {
+    accessibleTargets.set(scopeId, [targetKey]);
+  } else if (!existing.includes(targetKey)) {
+    existing.push(targetKey);
   }
-  let bucketArr = scopeBindings.get(name);
-  if (bucketArr === undefined) {
-    bucketArr = [];
-    scopeBindings.set(name, bucketArr);
-  }
-  return bucketArr;
 }
