@@ -125,7 +125,7 @@ import {
 } from './embeddings/cache-snapshot.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
-import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
+import { EMBEDDING_TABLE_NAME, STALE_HASH_SENTINEL } from './lbug/schema.js';
 import {
   discardStagedWorkspace,
   getStagedAnalyzePaths,
@@ -2047,6 +2047,14 @@ const runFullAnalysisImpl = async (
     // would finalize metadata with fewer vectors than the preserved snapshot.
     let restoredEmbeddingCount = 0;
     let skippedPendingEmbeddingRows = 0;
+    // Keep only restored row identities and one hash per owner node; vectors
+    // still stream through the bounded 256-row snapshot batches above. The
+    // exact row IDs are required because LadybugDB can make freshly restored
+    // non-PK nodeId predicates temporarily miss rows even while the PK sees
+    // them. Without this sidecar, stale regeneration can issue CREATE for a
+    // row that already exists and fail with a duplicate primary key (#155).
+    const restoredEmbeddingHashes = new Map<string, string>();
+    const restoredEmbeddingRowIds = new Map<string, string[]>();
     if (embeddingSnapshotInfo && embeddingSnapshotInfo.count > 0) {
       const cachedDims = embeddingSnapshotInfo.dimensions;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
@@ -2098,6 +2106,19 @@ const runFullAnalysisImpl = async (
             if (rowsToRestore.length > 0) {
               await batchInsert(executeWithReusedStatement, rowsToRestore);
               restoredEmbeddingCount += rowsToRestore.length;
+              for (const embedding of rowsToRestore) {
+                const restoredHash = embedding.contentHash || STALE_HASH_SENTINEL;
+                const priorHash = restoredEmbeddingHashes.get(embedding.nodeId);
+                restoredEmbeddingHashes.set(
+                  embedding.nodeId,
+                  priorHash === undefined || priorHash === restoredHash
+                    ? restoredHash
+                    : STALE_HASH_SENTINEL,
+                );
+                const rowIds = restoredEmbeddingRowIds.get(embedding.nodeId) ?? [];
+                rowIds.push(`${embedding.nodeId}:${embedding.chunkIndex}`);
+                restoredEmbeddingRowIds.set(embedding.nodeId, rowIds);
+              }
             }
             if (orphanRowIds.length > 0) {
               try {
@@ -2283,8 +2304,15 @@ const runFullAnalysisImpl = async (
         undefined,
         {
           forceReembedNodeIds: pendingEmbeddingNodeIds,
-          loadExistingEmbeddingHashes: (nodeIds) =>
-            fetchExistingEmbeddingHashesForNodeIds(executeQuery, nodeIds),
+          existingEmbeddingRowIds: restoredEmbeddingRowIds,
+          loadExistingEmbeddingHashes: async (nodeIds) => {
+            const hashes = await fetchExistingEmbeddingHashesForNodeIds(executeQuery, nodeIds);
+            for (const nodeId of nodeIds) {
+              const restoredHash = restoredEmbeddingHashes.get(nodeId);
+              if (restoredHash !== undefined) hashes.set(nodeId, restoredHash);
+            }
+            return hashes;
+          },
           onCheckpointWindowStart: async ({ nodeIds, ...checkpoint }) => {
             await saveEmbeddingCheckpoint(checkpoint, nodeIds, existingMeta?.stats?.embeddings);
           },
