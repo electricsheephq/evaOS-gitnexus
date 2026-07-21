@@ -362,6 +362,8 @@ export interface EmbeddingPipelineOptions {
   signal?: AbortSignal;
   checkpointEveryNodes?: number;
   forceReembedNodeIds?: ReadonlySet<string>;
+  /** Exact restored row identities, keyed by owner node, for PK-safe stale deletion. */
+  existingEmbeddingRowIds?: ReadonlyMap<string, readonly string[]>;
   /** Load cached node identities for one page; callers must return at most the requested IDs. */
   loadExistingEmbeddingHashes?: (
     nodeIds: readonly string[],
@@ -389,13 +391,29 @@ const deleteStaleEmbeddingRows = async (
     paramsList: Array<Record<string, any>>,
   ) => Promise<void>,
   nodeIds: string[],
+  existingEmbeddingRowIds?: ReadonlyMap<string, readonly string[]>,
 ): Promise<void> => {
   if (nodeIds.length === 0) return;
   try {
-    await executeWithReusedStatement(
-      `MATCH (e:${EMBEDDING_TABLE_NAME} {nodeId: $nodeId}) DELETE e`,
-      nodeIds.map((nodeId) => ({ nodeId })),
-    );
+    const exactRowIds: string[] = [];
+    const fallbackNodeIds: string[] = [];
+    for (const nodeId of nodeIds) {
+      const rowIds = existingEmbeddingRowIds?.get(nodeId);
+      if (rowIds && rowIds.length > 0) exactRowIds.push(...rowIds);
+      else fallbackNodeIds.push(nodeId);
+    }
+    if (exactRowIds.length > 0) {
+      await executeWithReusedStatement(
+        `MATCH (e:${EMBEDDING_TABLE_NAME} {id: $id}) DELETE e`,
+        [...new Set(exactRowIds)].map((id) => ({ id })),
+      );
+    }
+    if (fallbackNodeIds.length > 0) {
+      await executeWithReusedStatement(
+        `MATCH (e:${EMBEDDING_TABLE_NAME} {nodeId: $nodeId}) DELETE e`,
+        fallbackNodeIds.map((nodeId) => ({ nodeId })),
+      );
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (!msg.includes('does not exist')) {
@@ -526,7 +544,11 @@ export const runEmbeddingPipeline = async (
     }
 
     if (removedPendingNodeIds.size > 0) {
-      await deleteStaleEmbeddingRows(executeWithReusedStatement, [...removedPendingNodeIds]);
+      await deleteStaleEmbeddingRows(
+        executeWithReusedStatement,
+        [...removedPendingNodeIds],
+        pipelineOptions.existingEmbeddingRowIds,
+      );
       throwIfCancelled();
     }
 
@@ -649,7 +671,11 @@ export const runEmbeddingPipeline = async (
         const batchStaleIds = batch
           .filter((node) => pageHashes.has(node.id))
           .map((node) => node.id);
-        await deleteStaleEmbeddingRows(executeWithReusedStatement, batchStaleIds);
+        await deleteStaleEmbeddingRows(
+          executeWithReusedStatement,
+          batchStaleIds,
+          pipelineOptions.existingEmbeddingRowIds,
+        );
         throwIfCancelled();
 
         const embedSubBatch = Math.min(finalConfig.subBatchSize, MAX_EMBEDDING_SUB_BATCH_SIZE);
