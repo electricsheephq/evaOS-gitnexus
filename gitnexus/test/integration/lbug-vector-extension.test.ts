@@ -168,6 +168,64 @@ withTestLbugDB(
 );
 
 /**
+ * Regression for #158: loading VECTOR on every pooled connection is necessary
+ * but not sufficient for semantic retrieval. The repository must also have the
+ * exact HNSW index used by QUERY_VECTOR_INDEX. A successful query against an
+ * empty index is valid proof even when it returns zero rows.
+ */
+withTestLbugDB(
+  'doctor-vector-index-truth',
+  (handle) => {
+    it.skipIf(process.platform === 'win32')(
+      'reports a missing named HNSW index, then accepts a queryable empty index',
+      async () => {
+        const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+        const { probeDoctorPool } = await import('../../src/cli/doctor-pool-probe.js');
+
+        const missing = await probeDoctorPool(handle.dbPath);
+        expect(missing).toMatchObject({
+          vector: true,
+          vectorIndex: false,
+          vectorIndexReason: 'vector-index-missing-or-unqueryable',
+          exercisedConnections: 8,
+          connectionCount: 8,
+          reason: null,
+        });
+
+        await expect(adapter.createVectorIndex()).resolves.toBe(true);
+
+        const ready = await probeDoctorPool(handle.dbPath);
+        expect(ready).toMatchObject({
+          vector: true,
+          vectorIndex: true,
+          vectorIndexReason: null,
+          exercisedConnections: 8,
+          connectionCount: 8,
+          reason: null,
+        });
+      },
+    );
+  },
+  {
+    poolAdapter: true,
+    beforeFTS: async () => {
+      if (process.platform === 'win32') return;
+
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { resolveAnalyzeInstallPolicy } =
+        await import('../../src/core/lbug/extension-loader.js');
+      const loaded = await adapter.loadVectorExtension(undefined, {
+        policy: resolveAnalyzeInstallPolicy(),
+      });
+      if (!loaded) {
+        throw new Error('VECTOR is required for the live doctor HNSW truth regression test');
+      }
+    },
+    timeout: 120_000,
+  },
+);
+
+/**
  * Regression: VECTOR/HNSW index creation during analyze (#2114).
  *
  * `CALL CREATE_VECTOR_INDEX(...)` compiles to multiple statements, which

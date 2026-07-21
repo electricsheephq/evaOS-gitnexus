@@ -99,6 +99,8 @@ describe('doctor --registry read-only report (#133)', () => {
     doctorPoolMocks.probeDoctorPool.mockResolvedValue({
       fts: true,
       vector: true,
+      vectorIndex: true,
+      vectorIndexReason: null,
       exercisedConnections: 8,
       connectionCount: 8,
       reason: null,
@@ -268,6 +270,8 @@ describe('doctor --registry read-only report (#133)', () => {
     const capabilityProbe = vi.fn(async () => ({
       fts: true,
       vector: true,
+      vectorIndex: true,
+      vectorIndexReason: null,
       exercisedConnections: 8,
       connectionCount: 8,
       reason: null,
@@ -330,6 +334,8 @@ describe('doctor --registry read-only report (#133)', () => {
     const capabilityProbe = vi.fn(async () => ({
       fts: false,
       vector: true,
+      vectorIndex: true,
+      vectorIndexReason: null,
       exercisedConnections: 8,
       connectionCount: 8,
       reason: null,
@@ -348,6 +354,40 @@ describe('doctor --registry read-only report (#133)', () => {
       graph: 'available',
       fts: 'unavailable',
       vectorSearch: 'vector-index',
+      vectorSearchReason: null,
+    });
+  });
+
+  it('does not claim vector-index when the live named-index probe fails', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'missing-vector-index',
+      'MissingVectorIndex',
+      'https://github.com/owner/missing-vector-index.git',
+      { nodes: 1, edges: 0, embeddings: 25 },
+    );
+    const capabilityProbe = vi.fn(async () => ({
+      fts: true,
+      vector: true,
+      vectorIndex: false,
+      vectorIndexReason: 'vector-index-missing-or-unqueryable' as const,
+      exercisedConnections: 8,
+      connectionCount: 8,
+      reason: null,
+    }));
+
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({ nodes: 1, edges: 0, embeddings: 25 }),
+      capabilityProbe,
+    });
+
+    expect(report.entries[0]?.capabilities).toEqual({
+      source: 'active-probe',
+      graph: 'available',
+      fts: 'available',
+      vectorSearch: 'unavailable',
+      vectorSearchReason: 'vector-index-missing-or-unqueryable',
     });
   });
 
@@ -362,6 +402,8 @@ describe('doctor --registry read-only report (#133)', () => {
     doctorPoolMocks.probeDoctorPool.mockResolvedValue({
       fts: false,
       vector: false,
+      vectorIndex: false,
+      vectorIndexReason: 'pool-probe-unavailable',
       exercisedConnections: 0,
       connectionCount: 0,
       reason: `native load failed at ${indexed.lbugPath}`,
@@ -379,6 +421,7 @@ describe('doctor --registry read-only report (#133)', () => {
       graph: null,
       fts: null,
       vectorSearch: null,
+      vectorSearchReason: 'pool-probe-unavailable',
     });
     expect(JSON.stringify(report)).not.toContain(indexed.lbugPath);
   });
@@ -394,6 +437,8 @@ describe('doctor --registry read-only report (#133)', () => {
     doctorPoolMocks.probeDoctorPool.mockResolvedValue({
       fts: true,
       vector: true,
+      vectorIndex: true,
+      vectorIndexReason: null,
       exercisedConnections: 7,
       connectionCount: 8,
       reason: null,

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const poolMocks = vi.hoisted(() => ({
   closeLbug: vi.fn().mockResolvedValue(undefined),
+  executeQuery: vi.fn().mockResolvedValue([]),
   getPoolCapabilities: vi.fn(),
   initLbugNonRecovering: vi.fn().mockResolvedValue(undefined),
   probePoolConnections: vi.fn().mockResolvedValue(8),
@@ -16,6 +17,7 @@ describe('shared doctor read-pool probe', () => {
     vi.clearAllMocks();
     poolMocks.initLbugNonRecovering.mockResolvedValue(undefined);
     poolMocks.probePoolConnections.mockResolvedValue(8);
+    poolMocks.executeQuery.mockResolvedValue([]);
     poolMocks.getPoolCapabilities.mockReturnValue({
       fts: true,
       vector: true,
@@ -34,10 +36,16 @@ describe('shared doctor read-pool probe', () => {
     expect(result).toEqual({
       fts: true,
       vector: true,
+      vectorIndex: true,
+      vectorIndexReason: null,
       exercisedConnections: 8,
       connectionCount: 8,
       reason: null,
     });
+    expect(poolMocks.executeQuery).toHaveBeenCalledWith(
+      expect.stringMatching(/^doctor:/),
+      expect.stringMatching(/QUERY_VECTOR_INDEX.*code_embedding_idx/s),
+    );
     expect(poolMocks.closeLbug).toHaveBeenCalledOnce();
   });
 
@@ -51,6 +59,25 @@ describe('shared doctor read-pool probe', () => {
     await expect(probeDoctorPool('/repo/.gitnexus/lbug')).resolves.toMatchObject({
       fts: true,
       vector: false,
+      vectorIndex: false,
+      vectorIndexReason: 'vector-extension-unavailable',
+      exercisedConnections: 8,
+      connectionCount: 8,
+      reason: null,
+    });
+    expect(poolMocks.executeQuery).not.toHaveBeenCalled();
+  });
+
+  it('reports a missing named HNSW index without hiding healthy graph and FTS capability', async () => {
+    poolMocks.executeQuery.mockRejectedValue(
+      new Error("Table CodeEmbedding doesn't have an index with name code_embedding_idx"),
+    );
+
+    await expect(probeDoctorPool('/repo/.gitnexus/lbug')).resolves.toEqual({
+      fts: true,
+      vector: true,
+      vectorIndex: false,
+      vectorIndexReason: 'vector-index-missing-or-unqueryable',
       exercisedConnections: 8,
       connectionCount: 8,
       reason: null,

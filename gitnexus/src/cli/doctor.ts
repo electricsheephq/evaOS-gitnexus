@@ -24,7 +24,7 @@ import { diagnoseExtensionLoad } from '../core/lbug/extension-load-error.js';
 import { getExtensionInstallPolicy } from '../core/lbug/extension-loader.js';
 import { getGitRoot } from '../storage/git.js';
 import { getStoragePaths, loadMeta, type RepoMeta } from '../storage/repo-manager.js';
-import { probeDoctorPool } from './doctor-pool-probe.js';
+import { probeDoctorPool, type DoctorPoolProbe } from './doctor-pool-probe.js';
 import { t } from './i18n/index.js';
 
 export { probeDoctorPool, type DoctorPoolProbe } from './doctor-pool-probe.js';
@@ -157,7 +157,10 @@ export function pageSizeDoctorLines(
   return lines;
 }
 
-export function repoVectorDoctorStatus(meta: RepoMeta | null | undefined): {
+export function repoVectorDoctorStatus(
+  meta: RepoMeta | null | undefined,
+  liveProbe?: DoctorPoolProbe | null,
+): {
   status: string;
   detail: string | null;
 } {
@@ -167,6 +170,18 @@ export function repoVectorDoctorStatus(meta: RepoMeta | null | undefined): {
   const embeddingCount =
     Number.isFinite(rawEmbeddingCount) && rawEmbeddingCount > 0 ? Math.floor(rawEmbeddingCount) : 0;
   if (embeddingCount <= 0) return { status: 'no embeddings', detail: null };
+
+  if (liveProbe) {
+    if (liveProbe.vectorIndex) {
+      return { status: `vector-index (${embeddingCount} chunks)`, detail: null };
+    }
+    return {
+      status: `unavailable (${embeddingCount} chunks)`,
+      detail:
+        `Live HNSW probe failed (${liveProbe.vectorIndexReason ?? 'pool-probe-unavailable'}). ` +
+        'Run gitnexus analyze --embeddings to recreate the named VECTOR index.',
+    };
+  }
 
   const vector = meta.capabilities?.vectorSearch;
   if (!vector) {
@@ -386,7 +401,7 @@ export const doctorCommand = async (
   );
   if (capabilities.reason)
     console.log(`  ${label('doctor.labels.note', 18)}${capabilities.reason}`);
-  const repoVector = repoVectorDoctorStatus(repoMeta);
+  const repoVector = repoVectorDoctorStatus(repoMeta, poolProbe);
   console.log(`  ${padDisplayEnd('Repo VECTOR:', 18)}${repoVector.status}`);
   if (repoVector.detail) {
     console.log(`  ${padDisplayEnd('', 18)}${repoVector.detail}`);
