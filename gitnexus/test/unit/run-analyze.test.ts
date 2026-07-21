@@ -224,6 +224,11 @@ describe('run-analyze module', () => {
       if (!pendingNodeId) throw new Error('expected a persisted embedding node');
       await saveMeta(storagePath, {
         ...finalized,
+        incrementalInProgress: {
+          startedAt: Date.now(),
+          toWriteCount: 1,
+          phase: 'embedding-window',
+        },
         embeddingCheckpoint: {
           at: new Date().toISOString(),
           nodesProcessed: 0,
@@ -235,15 +240,22 @@ describe('run-analyze module', () => {
         },
       });
       fetchMock.mockClear();
+      const pendingLogs: string[] = [];
 
       await runFullAnalysis(
         tmpRepo.dbPath,
         { skipAgentsMd: true, skipSkills: true },
-        { onProgress: () => {} },
+        { onProgress: () => {}, onLog: (message) => pendingLogs.push(message) },
       );
 
       expect(fetchMock).toHaveBeenCalled();
       expect((await loadMeta(storagePath))?.embeddingCheckpoint).toBeUndefined();
+      expect((await loadMeta(storagePath))?.stats?.embeddings).toBe(1);
+      expect(
+        pendingLogs.some((message) =>
+          message.includes('pending checkpoint window; they will be regenerated'),
+        ),
+      ).toBe(true);
 
       const resumedPending = await loadMeta(storagePath);
       if (!resumedPending) throw new Error('expected pending-window resume metadata');
