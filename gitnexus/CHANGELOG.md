@@ -4,6 +4,20 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.4] - 2026-07-21
+
+### Fixed
+
+- **Interrupted staged embedding resumes delete stale restored rows by exact primary identity** before regeneration, preventing hidden stale rows from causing duplicate `CodeEmbedding` creates while vectors continue to stream in bounded batches (#155, #156)
+- **Registry doctor proves that the named HNSW index is queryable through the real eight-connection pool**, distinguishing extension availability from a usable vector index and returning a stable sanitized reason when the live probe fails (#158, #159)
+- **Large Swift targets share target-wide definitions and type bindings once** instead of copying them into every sibling module, keeping namespace memory bounded while preserving local-first lookup and SwiftPM target isolation (#132, #157)
+- **Valid legacy metadata with a missing nested FTS capability remains recoverable**, reporting the capability as unknown instead of throwing during recovery planning (#153, #154)
+
+### Changed
+
+- Remote Voyage fleet work may use at most two different-remote slots. A genuinely large repository runs alone through the exclusive queue lane; no host memory, swap, RSS, free-memory, or pressure gate applies to Voyage.
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+
 ## [1.6.10-electric.3] - 2026-07-20
 
 ### Added
