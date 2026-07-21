@@ -2045,6 +2045,7 @@ const runFullAnalysisImpl = async (
     // Restore insertion failures propagate: silently skipping a failed batch
     // would finalize metadata with fewer vectors than the preserved snapshot.
     let restoredEmbeddingCount = 0;
+    let skippedPendingEmbeddingRows = 0;
     if (embeddingSnapshotInfo && embeddingSnapshotInfo.count > 0) {
       const cachedDims = embeddingSnapshotInfo.dimensions;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
@@ -2068,6 +2069,16 @@ const runFullAnalysisImpl = async (
             const rowsToRestore = [];
             const orphanRowIds: string[] = [];
             for (const embedding of snapshotBatch) {
+              // A persisted checkpoint window is deliberately regenerated below.
+              // Restoring those rows first creates a delete-then-create cycle that
+              // LadybugDB's live VECTOR index can still reject as a duplicate key
+              // after an interrupted staged rebuild. The checkpoint bounds this
+              // exclusion to at most the pending window; every skipped row is
+              // force-selected by runEmbeddingPipeline before finalization.
+              if (resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.has(embedding.nodeId)) {
+                skippedPendingEmbeddingRows += 1;
+                continue;
+              }
               const liveNode = pipelineResult.graph.getNode(embedding.nodeId);
               if (!liveNode) {
                 if (deletedFilePathsForRestore !== null) {
@@ -2112,6 +2123,12 @@ const runFullAnalysisImpl = async (
           },
           resumeEmbeddingCheckpoint ? undefined : existingEmbeddingCount,
         );
+        if (skippedPendingEmbeddingRows > 0) {
+          log(
+            `Skipped ${skippedPendingEmbeddingRows} cached embedding row(s) from the ` +
+              'pending checkpoint window; they will be regenerated.',
+          );
+        }
       }
     }
 
