@@ -41,6 +41,19 @@ export interface EmbeddingSnapshotInfo {
   duplicateRows?: number;
 }
 
+const hasValidEmbeddingIdentity = (
+  row: unknown,
+): row is Pick<SnapshotRow, 'nodeId' | 'chunkIndex'> => {
+  if (!row || typeof row !== 'object') return false;
+  const candidate = row as Record<string, unknown>;
+  return (
+    typeof candidate.nodeId === 'string' &&
+    candidate.nodeId.length > 0 &&
+    Number.isSafeInteger(candidate.chunkIndex) &&
+    Number(candidate.chunkIndex) >= 0
+  );
+};
+
 const embeddingIdentity = (row: Pick<SnapshotRow, 'nodeId' | 'chunkIndex'>): string =>
   `${row.nodeId}\0${row.chunkIndex}`;
 
@@ -196,7 +209,12 @@ export const validateEmbeddingSnapshot = async (
         footer = value;
         continue;
       }
-      if (footer || value.type !== 'embedding' || typeof value.embeddingBase64 !== 'string') {
+      if (
+        footer ||
+        value.type !== 'embedding' ||
+        !hasValidEmbeddingIdentity(value) ||
+        typeof value.embeddingBase64 !== 'string'
+      ) {
         return undefined;
       }
       const byteLength = decodeEmbeddingBytes(value.embeddingBase64).byteLength;
@@ -257,6 +275,9 @@ export const readEmbeddingSnapshot = async (
       if (!line) continue;
       const value = JSON.parse(line) as SnapshotRow | SnapshotFooter;
       if (value.type === 'complete') break;
+      if (!hasValidEmbeddingIdentity(value)) {
+        throw new Error('Embedding preservation snapshot failed validation');
+      }
       const identity = embeddingIdentity(value);
       if (seenIdentities.has(identity)) continue;
       seenIdentities.add(identity);
