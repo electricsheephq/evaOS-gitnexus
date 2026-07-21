@@ -362,7 +362,7 @@ export interface EmbeddingPipelineOptions {
   signal?: AbortSignal;
   checkpointEveryNodes?: number;
   forceReembedNodeIds?: ReadonlySet<string>;
-  /** Exact restored row identities, keyed by owner node, for PK-safe stale deletion. */
+  /** Exact known row identities, keyed by owner node, for PK-safe stale deletion. */
   existingEmbeddingRowIds?: ReadonlyMap<string, readonly string[]>;
   /** Load cached node identities for one page; callers must return at most the requested IDs. */
   loadExistingEmbeddingHashes?: (
@@ -669,7 +669,10 @@ export const runEmbeddingPipeline = async (
         }
 
         const batchStaleIds = batch
-          .filter((node) => pageHashes.has(node.id))
+          .filter(
+            (node) =>
+              pageHashes.has(node.id) || pipelineOptions.existingEmbeddingRowIds?.has(node.id),
+          )
           .map((node) => node.id);
         await deleteStaleEmbeddingRows(
           executeWithReusedStatement,
