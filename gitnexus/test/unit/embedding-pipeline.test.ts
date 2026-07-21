@@ -205,6 +205,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
   // it was invoked instead of asserting CREATE_VECTOR_INDEX flowed through the
   // injected (prepared) executeQuery, which it must NOT.
   let vectorIndexMock: ReturnType<typeof vi.fn>;
+  let vectorIndexDropMock: ReturnType<typeof vi.fn>;
 
   // Helper node
   const makeNode = (overrides: Partial<EmbeddableNode> = {}): EmbeddableNode => ({
@@ -239,11 +240,13 @@ describe('runEmbeddingPipeline incremental filter', () => {
     }));
 
     // Mock the adapter (avoids needing the native lbug module). The pipeline
-    // imports both loadVectorExtension and createVectorIndex from here.
+    // imports vector-index lifecycle functions from here.
     vectorIndexMock = vi.fn().mockResolvedValue(true);
+    vectorIndexDropMock = vi.fn().mockResolvedValue(true);
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vectorIndexMock,
+      dropVectorIndex: vectorIndexDropMock,
     }));
   };
 
@@ -639,7 +642,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(createCalls.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('deletes a persisted pending-window row by exact primary key before regeneration (#162)', async () => {
+  it('drops staged HNSW before deleting and regenerating a persisted pending-window row (#162)', async () => {
     mockEmbedderSetup();
 
     const node = makeNode({
@@ -666,15 +669,20 @@ describe('runEmbeddingPipeline incremental filter', () => {
       {
         forceReembedNodeIds: new Set([node.id]),
         existingEmbeddingRowIds,
+        rebuildVectorIndexBeforeMutation: true,
       },
     );
 
     const mutationCalls = stmtCalls.filter(
       (call) => call.cypher.includes('DELETE') || call.cypher.includes('CREATE'),
     );
+    expect(vectorIndexDropMock).toHaveBeenCalledOnce();
     expect(mutationCalls[0].cypher).toContain('MATCH (e:CodeEmbedding {id: $id}) DELETE e');
     expect(mutationCalls[0].params).toEqual([{ id: `${node.id}:0` }]);
     expect(mutationCalls.some((call) => call.cypher.includes('CREATE'))).toBe(true);
+    expect(vectorIndexDropMock.mock.invocationCallOrder[0]).toBeLessThan(
+      vectorIndexMock.mock.invocationCallOrder[0],
+    );
   });
 
   it('treats STALE_HASH_SENTINEL as stale — triggers re-embed', async () => {

@@ -2313,6 +2313,8 @@ const runFullAnalysisImpl = async (
         {
           forceReembedNodeIds: pendingEmbeddingNodeIds,
           existingEmbeddingRowIds: restoredEmbeddingRowIds,
+          rebuildVectorIndexBeforeMutation:
+            Boolean(stagedPaths) && resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.size > 0,
           loadExistingEmbeddingHashes: async (nodeIds) => {
             const hashes = await fetchExistingEmbeddingHashesForNodeIds(executeQuery, nodeIds);
             for (const nodeId of nodeIds) {
