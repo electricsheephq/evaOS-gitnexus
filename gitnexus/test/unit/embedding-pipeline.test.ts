@@ -606,6 +606,39 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(createCalls.length).toBeGreaterThanOrEqual(1);
   });
 
+  it('deletes restored stale rows by exact primary key before recreating them (#155)', async () => {
+    mockEmbedderSetup();
+
+    const node = makeNode({ content: 'function foo() { return 42; }' });
+    const existingEmbeddings = new Map<string, string>([[node.id, 'wronghash']]);
+    const existingEmbeddingRowIds = new Map<string, readonly string[]>([
+      [node.id, [`${node.id}:0`, `${node.id}:1`]],
+    ]);
+    const executeQuery = mockExecuteQuery([node]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      {},
+      undefined,
+      existingEmbeddings,
+      { existingEmbeddingRowIds },
+    );
+
+    const deleteCalls = stmtCalls.filter((call) => call.cypher.includes('DELETE'));
+    expect(deleteCalls).toHaveLength(1);
+    expect(deleteCalls[0].cypher).toContain('{id: $id}');
+    expect(deleteCalls[0].params).toEqual([{ id: `${node.id}:0` }, { id: `${node.id}:1` }]);
+
+    const createCalls = stmtCalls.filter((call) => call.cypher.includes('CREATE'));
+    expect(createCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
   it('treats STALE_HASH_SENTINEL as stale — triggers re-embed', async () => {
     mockEmbedderSetup();
 

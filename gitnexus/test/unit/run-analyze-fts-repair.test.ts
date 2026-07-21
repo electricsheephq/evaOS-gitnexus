@@ -814,6 +814,109 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
       await tmpRepo.cleanup();
     }
   });
+
+  it('passes restored hashes and exact row identities to the embedding pipeline (#155)', async () => {
+    const restoredNodeId = 'Function:src/app.ts:handler';
+    const stubNode = {
+      id: restoredNodeId,
+      label: 'Function',
+      name: 'handler',
+      properties: { filePath: 'src/app.ts' },
+    };
+    const runEmbeddingPipeline = vi.fn(async () => ({
+      nodesProcessed: 1,
+      chunksProcessed: 1,
+      vectorIndexReady: true,
+      semanticMode: 'vector-index' as const,
+    }));
+    const fetchExistingEmbeddingHashesForNodeIds = vi.fn(async () => new Map<string, string>());
+    vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      initLbug: vi.fn(async () => undefined),
+      loadGraphToLbug: vi.fn(async () => undefined),
+      getLbugStats: vi.fn(async () => ({ nodes: 1, edges: 0, communities: 0, processes: 0 })),
+      executeQuery: vi.fn(async (cypher: string) =>
+        /RETURN count\(e\) AS cnt/.test(cypher) ? [{ cnt: 2 }] : [],
+      ),
+      executeWithReusedStatement: vi.fn(async () => undefined),
+      closeLbug: vi.fn(async () => undefined),
+      wipeLbugDbFiles: vi.fn(async () => undefined),
+      loadCachedEmbeddings: vi.fn(async () => ({
+        embeddingNodeIds: new Set([restoredNodeId]),
+        embeddings: [0, 1].map((chunkIndex) => ({
+          nodeId: restoredNodeId,
+          chunkIndex,
+          startLine: chunkIndex + 1,
+          endLine: chunkIndex + 2,
+          embedding: new Array(EMBEDDING_DIMS).fill(0),
+          contentHash: 'restored-hash',
+        })),
+      })),
+      fetchExistingEmbeddingHashesForNodeIds,
+      deleteNodesForFiles: vi.fn(async () => undefined),
+      deleteAllCommunitiesAndProcesses: vi.fn(async () => undefined),
+      queryImportersBatch: vi.fn(async () => []),
+      loadFTSExtension: vi.fn(async () => false),
+      DELETE_FILES_CHUNK_SIZE: 200,
+    }));
+    vi.doMock('../../src/core/search/fts-indexes.js', () => ({
+      initialiseSearchFTSStemmer: vi.fn(() => 'porter'),
+      createSearchFTSIndexes: vi.fn(async () => undefined),
+      verifySearchFTSIndexes: vi.fn(async () => []),
+    }));
+    vi.doMock('../../src/core/ingestion/pipeline.js', () => ({
+      runPipelineFromRepo: vi.fn(async (repoPath: string) => ({
+        repoPath,
+        totalFileCount: 1,
+        graph: {
+          forEachNode: (fn: (node: typeof stubNode) => void) => fn(stubNode),
+          getNode: (id: string) => (id === restoredNodeId ? stubNode : undefined),
+        },
+      })),
+    }));
+    vi.doMock('../../src/storage/repo-manager.js', async (importActual) => ({
+      ...(await importActual<typeof import('../../src/storage/repo-manager.js')>()),
+      registerRepo: vi.fn(async () => 'restored-identity-repo'),
+      ensureGitNexusIgnored: vi.fn(async () => undefined),
+    }));
+    vi.doMock('../../src/core/embeddings/embedding-pipeline.js', async (importActual) => ({
+      ...(await importActual<typeof import('../../src/core/embeddings/embedding-pipeline.js')>()),
+      runEmbeddingPipeline,
+      buildVectorIndex: vi.fn(async () => true),
+    }));
+
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-restored-identities-');
+    try {
+      const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      await fs.mkdir(storagePath, { recursive: true });
+      await saveMeta(storagePath, {
+        repoPath: tmpRepo.dbPath,
+        lastCommit: '',
+        indexedAt: new Date().toISOString(),
+        stats: { embeddings: 2 },
+      });
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(
+        tmpRepo.dbPath,
+        { force: true, embeddings: true, embeddingsNodeLimit: 0 },
+        { onProgress: () => {} },
+      );
+
+      expect(runEmbeddingPipeline).toHaveBeenCalledOnce();
+      const pipelineOptions = runEmbeddingPipeline.mock.calls[0][6];
+      expect(pipelineOptions.existingEmbeddingRowIds.get(restoredNodeId)).toEqual([
+        `${restoredNodeId}:0`,
+        `${restoredNodeId}:1`,
+      ]);
+      const hashes = await pipelineOptions.loadExistingEmbeddingHashes([restoredNodeId]);
+      expect(hashes.get(restoredNodeId)).toBe('restored-hash');
+      expect(fetchExistingEmbeddingHashesForNodeIds).toHaveBeenCalledWith(expect.any(Function), [
+        restoredNodeId,
+      ]);
+    } finally {
+      await tmpRepo.cleanup();
+    }
+  });
 });
 
 /**
