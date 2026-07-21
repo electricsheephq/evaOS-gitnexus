@@ -1,8 +1,4 @@
-import {
-  EMBEDDING_DIMS,
-  EMBEDDING_INDEX_NAME,
-  EMBEDDING_TABLE_NAME,
-} from '../core/lbug/schema.js';
+import { EMBEDDING_DIMS, EMBEDDING_INDEX_NAME, EMBEDDING_TABLE_NAME } from '../core/lbug/schema.js';
 
 export interface DoctorPoolProbe {
   fts: boolean;
@@ -75,8 +71,7 @@ export async function probeDoctorPool(dbPath: string): Promise<DoctorPoolProbe> 
       throw new Error('read-pool capability probe did not exercise all eight connections');
     }
     let vectorIndex = false;
-    let vectorIndexReason: DoctorPoolProbe['vectorIndexReason'] =
-      'vector-extension-unavailable';
+    let vectorIndexReason: DoctorPoolProbe['vectorIndexReason'] = 'vector-extension-unavailable';
     if (capabilities.vector) {
       try {
         // A successful zero-result query is still proof that the named HNSW
