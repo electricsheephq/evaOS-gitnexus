@@ -4,6 +4,17 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.6] - 2026-07-21
+
+### Fixed
+
+- **Interrupted staged embedding resumes rebuild the staged HNSW index around pending-window regeneration**, preventing LadybugDB's live vector index from retaining a deleted primary key long enough to reject its same-key replacement (#162, #168)
+
+### Changed
+
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.2` through `.5` installations remain available for rollback.
+
 ## [1.6.10-electric.5] - 2026-07-21
 
 ### Fixed
