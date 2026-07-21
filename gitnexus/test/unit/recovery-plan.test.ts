@@ -72,4 +72,31 @@ describe('recovery plan', () => {
     expect(log.mock.calls[0]?.[0]).toContain(`Repository: ${repoPath}`);
     expect(log.mock.calls[0]?.[0]).toContain('State: unindexed');
   });
+
+  it('treats a missing nested FTS capability in legacy metadata as unknown', async () => {
+    const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-recovery-legacy-'));
+    temporaryRoots.push(repoPath);
+    const { storagePath } = getStoragePaths(repoPath);
+    await fs.mkdir(storagePath, { recursive: true });
+    await saveMeta(storagePath, {
+      repoPath,
+      lastCommit: 'legacy-commit',
+      indexedAt: '2026-07-21T00:00:00.000Z',
+      stats: { files: 20_492, nodes: 275_835, embeddings: 84_501 },
+      capabilities: {
+        vectorSearch: {
+          provider: 'ladybugdb-vector',
+          status: 'vector-index',
+        },
+      },
+    });
+
+    const plan = await buildRecoveryPlan(repoPath);
+
+    expect(plan.state).toBe('clean');
+    expect(plan.fts.recordedStatus).toBe('unknown');
+    expect(formatRecoveryPlan(plan)).toContain(
+      'FTS: preserve derived indexes (recorded status: unknown)',
+    );
+  });
 });

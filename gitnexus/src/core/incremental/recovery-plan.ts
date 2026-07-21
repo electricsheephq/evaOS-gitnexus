@@ -51,7 +51,7 @@ export async function buildRecoveryPlan(repoPath: string): Promise<RecoveryPlan>
     dirty,
     graph: { path: lbugPath, exists: graphBytes !== null, bytes: graphBytes },
     wal: { sidecars },
-    fts: { recordedStatus: meta?.capabilities?.fts.status ?? 'unknown' },
+    fts: { recordedStatus: meta?.capabilities?.fts?.status ?? 'unknown' },
     metadata: { path: metaPath, exists: meta !== null },
     embeddings: { recordedCount: meta?.stats?.embeddings ?? null },
   };
