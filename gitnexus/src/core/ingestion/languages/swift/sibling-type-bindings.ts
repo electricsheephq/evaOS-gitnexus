@@ -35,7 +35,11 @@ import type { ParsedFile, ScopeId, TypeRef } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import type { WorkspaceResolutionIndex } from '../../scope-resolution/workspace-index.js';
 import { followChainPostFinalize } from '../../scope-resolution/passes/imported-return-types.js';
-import { coerceSwiftTargets, groupSwiftFilesBySpmTarget } from './target-grouping.js';
+import {
+  groupParsedSwiftFilesBySpmTarget,
+  registerSwiftTargetAccess,
+  swiftTargetNamespaceKey,
+} from './target-grouping.js';
 
 export function mirrorSwiftSiblingTypeBindings(
   parsedFiles: readonly ParsedFile[],
@@ -47,18 +51,13 @@ export function mirrorSwiftSiblingTypeBindings(
 
   // Group files by SPM target subtree (the module). No-source-dir → all
   // files in one `__default__` bucket.
-  const targets = coerceSwiftTargets(resolutionConfig);
-  const filesByTarget = groupSwiftFilesBySpmTarget(
-    parsedFiles,
-    (parsed) => parsed.filePath,
-    targets,
-  );
+  const filesByTarget = groupParsedSwiftFilesBySpmTarget(parsedFiles, resolutionConfig);
   const sharedTypes = indexes.namespaceTypeBindings as Map<string, Map<string, TypeRef>>;
   const accessibleTargets = indexes.accessibleNamespacesByScope as Map<ScopeId, string[]>;
 
   for (const [targetName, group] of filesByTarget) {
     if (group.length < 2) continue; // no siblings to mirror from
-    const targetKey = `swift-target:${targetName}`;
+    const targetKey = swiftTargetNamespaceKey(targetName);
     let targetTypes = sharedTypes.get(targetKey);
     if (targetTypes === undefined) {
       targetTypes = new Map<string, TypeRef>();
@@ -66,7 +65,7 @@ export function mirrorSwiftSiblingTypeBindings(
     }
 
     for (const parsed of group) {
-      registerTargetAccess(accessibleTargets, parsed.moduleScope, targetKey);
+      registerSwiftTargetAccess(accessibleTargets, parsed.moduleScope, targetKey);
     }
     for (const parsed of group) {
       const sourceModule = moduleScopeByFile.get(parsed.filePath);
@@ -76,18 +75,5 @@ export function mirrorSwiftSiblingTypeBindings(
         targetTypes.set(name, followChainPostFinalize(ref, sourceModule.id, indexes));
       }
     }
-  }
-}
-
-function registerTargetAccess(
-  accessibleTargets: Map<ScopeId, string[]>,
-  scopeId: ScopeId,
-  targetKey: string,
-): void {
-  const existing = accessibleTargets.get(scopeId);
-  if (existing === undefined) {
-    accessibleTargets.set(scopeId, [targetKey]);
-  } else if (!existing.includes(targetKey)) {
-    existing.push(targetKey);
   }
 }

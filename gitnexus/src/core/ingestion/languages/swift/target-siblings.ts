@@ -27,7 +27,11 @@
 
 import type { BindingRef, ParsedFile, ScopeId } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
-import { coerceSwiftTargets, groupSwiftFilesBySpmTarget } from './target-grouping.js';
+import {
+  groupParsedSwiftFilesBySpmTarget,
+  registerSwiftTargetAccess,
+  swiftTargetNamespaceKey,
+} from './target-grouping.js';
 
 export function populateSwiftTargetSiblings(
   parsedFiles: readonly ParsedFile[],
@@ -39,19 +43,14 @@ export function populateSwiftTargetSiblings(
 ): void {
   // Group files by SPM target subtree (the module). No-source-dir → all
   // files in one `__default__` bucket.
-  const targets = coerceSwiftTargets(ctx.resolutionConfig);
-  const filesByTarget = groupSwiftFilesBySpmTarget(
-    parsedFiles,
-    (parsed) => parsed.filePath,
-    targets,
-  );
+  const filesByTarget = groupParsedSwiftFilesBySpmTarget(parsedFiles, ctx.resolutionConfig);
 
   const namespaceBindings = indexes.namespaceFqnBindings as Map<string, Map<string, BindingRef[]>>;
   const accessibleTargets = indexes.accessibleNamespacesByScope as Map<ScopeId, string[]>;
 
   for (const [targetName, group] of filesByTarget) {
     if (group.length < 2) continue; // no siblings to share
-    const targetKey = `swift-target:${targetName}`;
+    const targetKey = swiftTargetNamespaceKey(targetName);
     let targetBindings = namespaceBindings.get(targetKey);
     if (targetBindings === undefined) {
       targetBindings = new Map<string, BindingRef[]>();
@@ -60,7 +59,7 @@ export function populateSwiftTargetSiblings(
     const seenByName = new Map<string, Set<string>>();
 
     for (const parsed of group) {
-      registerTargetAccess(accessibleTargets, parsed.moduleScope, targetKey);
+      registerSwiftTargetAccess(accessibleTargets, parsed.moduleScope, targetKey);
       for (const def of parsed.localDefs) {
         const name = def.qualifiedName?.split('.').pop() ?? def.qualifiedName ?? '';
         if (name === '') continue;
@@ -79,18 +78,5 @@ export function populateSwiftTargetSiblings(
         bucket.push({ def, origin: 'namespace' });
       }
     }
-  }
-}
-
-function registerTargetAccess(
-  accessibleTargets: Map<ScopeId, string[]>,
-  scopeId: ScopeId,
-  targetKey: string,
-): void {
-  const existing = accessibleTargets.get(scopeId);
-  if (existing === undefined) {
-    accessibleTargets.set(scopeId, [targetKey]);
-  } else if (!existing.includes(targetKey)) {
-    existing.push(targetKey);
   }
 }
