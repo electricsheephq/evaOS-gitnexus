@@ -175,8 +175,9 @@ export interface AnalyzeOptions {
   embeddings?: boolean;
   /**
    * Override the auto-skip node-count cap for embedding generation.
-   * `undefined` (default) keeps the built-in 50,000-node safety limit;
-   * `0` disables the cap entirely; any positive integer sets a custom cap.
+   * `undefined` uses the 50,000-node local-model default and no automatic cap
+   * for remote HTTP providers; `0` disables the cap entirely; any positive
+   * integer sets an explicit cap for either provider type.
    * Mapped from the CLI's `--embeddings [limit]` argument.
    */
   embeddingsNodeLimit?: number;

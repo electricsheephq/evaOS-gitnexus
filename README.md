@@ -360,15 +360,15 @@ gitnexus analyze --wal-checkpoint-threshold 67108864  # LadybugDB WAL auto-check
 
 If `analyze` reports a worker parse timeout on a large or unusual repository, it keeps running and falls back safely. To give slow worker jobs more time, use `--worker-timeout 60` or set `GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=60000`. For very large files, `GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES` controls the worker job byte budget.
 
-**Embeddings node limit** — `gitnexus analyze --embeddings` generates semantic search vectors with a default 50,000-node safety cap to protect memory on large repositories:
+**Embeddings node limit** — `gitnexus analyze --embeddings` applies the automatic 50,000-node safety cap only to local embedding models. Remote HTTP providers such as Voyage default to no automatic cap:
 
 ```bash
-gitnexus analyze --embeddings          # default 50,000 node safety cap
-gitnexus analyze --embeddings 0        # disable the cap entirely
-gitnexus analyze --embeddings 100000   # custom cap
+gitnexus analyze --embeddings          # local: 50,000 cap; remote HTTP/Voyage: uncapped
+gitnexus analyze --embeddings 0        # explicitly disable the cap
+gitnexus analyze --embeddings 100000   # explicit cap for either provider type
 ```
 
-If embeddings are skipped on a large repository, the indexed graph likely exceeds the default cap — re-run with `--embeddings 0` or a higher limit.
+If local embeddings are skipped on a large repository, the indexed graph likely exceeds the local-model cap — re-run with `--embeddings 0` or a higher explicit limit. Remote HTTP/Voyage generation is not skipped by an automatic node-count cap.
 
 </details>
 
