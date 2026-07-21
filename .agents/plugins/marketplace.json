@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "gitnexus",
-      "version": "1.6.10-electric.5",
+      "version": "1.6.10-electric.6",
       "source": {
         "source": "local",
         "path": "./gitnexus-claude-plugin"
