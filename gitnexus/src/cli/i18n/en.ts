@@ -176,7 +176,7 @@ export const en = {
     'Refuse recovery, migration, or scale escalation that would require a full rebuild',
   'help.option.analyze.repairFts': 'Repair/rebuild search FTS indexes without full re-analysis',
   'help.option.analyze.embeddings':
-    'Enable embedding generation for semantic search (off by default). Optional [limit] overrides the 50,000-node safety cap; pass 0 to disable the cap entirely.',
+    'Enable embedding generation for semantic search (off by default). Local models default to a 50,000-node safety cap; remote HTTP providers default uncapped. Optional [limit] sets an explicit cap; pass 0 to disable it.',
   'help.option.analyze.dropEmbeddings':
     'Drop existing embeddings on rebuild. By default, an `analyze` without `--embeddings` preserves any embeddings already present in the index.',
   'help.option.analyze.skills':

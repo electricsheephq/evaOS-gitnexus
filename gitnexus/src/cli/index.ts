@@ -66,7 +66,8 @@ program
   .option(
     '--embeddings [limit]',
     'Enable embedding generation for semantic search (off by default). ' +
-      'Optional [limit] overrides the 50,000-node safety cap; pass 0 to disable the cap entirely.',
+      'Local models default to a 50,000-node safety cap; remote HTTP providers default uncapped. ' +
+      'Optional [limit] sets an explicit cap; pass 0 to disable it.',
   )
   .option(
     '--drop-embeddings',
