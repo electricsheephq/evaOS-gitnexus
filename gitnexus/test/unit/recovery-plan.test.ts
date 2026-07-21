@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { doctorCommand } from '../../src/cli/doctor.js';
 import { buildRecoveryPlan, formatRecoveryPlan } from '../../src/core/incremental/recovery-plan.js';
-import { getStoragePaths, saveMeta } from '../../src/storage/repo-manager.js';
+import { getStoragePaths, loadMeta, saveMeta } from '../../src/storage/repo-manager.js';
 
 const temporaryRoots: string[] = [];
 
@@ -76,9 +76,9 @@ describe('recovery plan', () => {
   it('treats a missing nested FTS capability in legacy metadata as unknown', async () => {
     const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-recovery-legacy-'));
     temporaryRoots.push(repoPath);
-    const { storagePath } = getStoragePaths(repoPath);
+    const { storagePath, metaPath } = getStoragePaths(repoPath);
     await fs.mkdir(storagePath, { recursive: true });
-    await saveMeta(storagePath, {
+    const rawLegacyMeta = JSON.stringify({
       repoPath,
       lastCommit: 'legacy-commit',
       indexedAt: '2026-07-21T00:00:00.000Z',
@@ -90,6 +90,18 @@ describe('recovery plan', () => {
         },
       },
     });
+    await fs.writeFile(metaPath, rawLegacyMeta, 'utf8');
+
+    const loaded = await loadMeta(storagePath);
+    expect(loaded?.capabilities).toEqual({
+      graph: { provider: 'legacy-metadata', status: 'unavailable' },
+      fts: { provider: 'legacy-metadata', status: 'unavailable' },
+      vectorSearch: {
+        provider: 'ladybugdb-vector',
+        status: 'vector-index',
+        exactScanLimit: 0,
+      },
+    });
 
     const plan = await buildRecoveryPlan(repoPath);
 
@@ -98,5 +110,6 @@ describe('recovery plan', () => {
     expect(formatRecoveryPlan(plan)).toContain(
       'FTS: preserve derived indexes (recorded status: unknown)',
     );
+    expect(await fs.readFile(metaPath, 'utf8')).toBe(rawLegacyMeta);
   });
 });

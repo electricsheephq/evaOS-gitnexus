@@ -497,13 +497,77 @@ export const cleanupOldKuzuFiles = async (
   }
 };
 
+export const LEGACY_CAPABILITY_PROVIDER = 'legacy-metadata';
+
+type RecordedCapabilities = NonNullable<RepoMeta['capabilities']>;
+type RecordedAvailability = RecordedCapabilities['graph'];
+
+const isJsonRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const normalizeRecordedAvailability = (value: unknown): RecordedAvailability => {
+  const recorded = isJsonRecord(value) ? value : {};
+  const status = recorded.status;
+  return {
+    provider:
+      typeof recorded.provider === 'string' ? recorded.provider : LEGACY_CAPABILITY_PROVIDER,
+    status:
+      status === 'available' || status === 'degraded' || status === 'unavailable'
+        ? status
+        : 'unavailable',
+  };
+};
+
+const normalizeRecordedVector = (value: unknown): RecordedCapabilities['vectorSearch'] => {
+  const recorded = isJsonRecord(value) ? value : {};
+  const status = recorded.status;
+  const exactScanLimit = Number(recorded.exactScanLimit);
+  const normalized: RecordedCapabilities['vectorSearch'] = {
+    provider:
+      typeof recorded.provider === 'string' ? recorded.provider : LEGACY_CAPABILITY_PROVIDER,
+    status:
+      status === 'vector-index' || status === 'exact-scan' || status === 'unavailable'
+        ? status
+        : 'unavailable',
+    exactScanLimit:
+      Number.isFinite(exactScanLimit) && exactScanLimit >= 0 ? Math.floor(exactScanLimit) : 0,
+  };
+  if (typeof recorded.reason === 'string') normalized.reason = recorded.reason;
+  return normalized;
+};
+
+/**
+ * Normalize parseable pre-capability metadata at the read boundary. `saveMeta`
+ * still accepts only the full RepoMeta contract; this compatibility path fills
+ * missing nested capability fields with conservative, non-positive values and
+ * never writes the synthesized shape back to disk.
+ */
+const normalizeLoadedMeta = (value: unknown): RepoMeta | null => {
+  if (!isJsonRecord(value)) return null;
+  const rawCapabilities = value.capabilities;
+  if (rawCapabilities === undefined) return value as unknown as RepoMeta;
+  if (!isJsonRecord(rawCapabilities)) {
+    return { ...value, capabilities: undefined } as unknown as RepoMeta;
+  }
+  return {
+    ...value,
+    capabilities: {
+      graph: normalizeRecordedAvailability(rawCapabilities.graph),
+      fts: normalizeRecordedAvailability(rawCapabilities.fts),
+      vectorSearch: normalizeRecordedVector(rawCapabilities.vectorSearch),
+    },
+  } as unknown as RepoMeta;
+};
+
 /**
  * Load metadata from the legacy `meta.json` mirror in the given directory.
  * Returns null when the file is absent, unreadable, or unparseable — a
  * corrupt legacy file is treated the same as a missing one (safe rebuild).
  */
-const loadMetaLegacy = async (metaDir: string): Promise<RepoMeta | null> =>
-  tryReadMetaFile(metaDir, LEGACY_METADATA_FILE);
+const loadMetaLegacy = async (metaDir: string): Promise<RepoMeta | null> => {
+  const legacy = await tryReadMetaFile(metaDir, LEGACY_METADATA_FILE);
+  return legacy ? normalizeLoadedMeta(legacy) : null;
+};
 
 /**
  * Load metadata from a directory containing the metadata file (gitnexus.json).
@@ -527,7 +591,7 @@ export const loadMeta = async (metaDir: string): Promise<RepoMeta | null> => {
     return isMissingFilesystemError(err) ? loadMetaLegacy(metaDir) : null;
   }
   try {
-    return JSON.parse(raw) as RepoMeta;
+    return normalizeLoadedMeta(JSON.parse(raw));
   } catch {
     // Corrupt primary file — do NOT mask it with legacy content.
     return null;

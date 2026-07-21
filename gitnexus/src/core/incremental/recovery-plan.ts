@@ -1,6 +1,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { getStoragePaths, loadMeta, type RepoMeta } from '../../storage/repo-manager.js';
+import {
+  getStoragePaths,
+  LEGACY_CAPABILITY_PROVIDER,
+  loadMeta,
+  type RepoMeta,
+} from '../../storage/repo-manager.js';
 
 export interface RecoveryPlan {
   repoPath: string;
@@ -40,6 +45,7 @@ export async function buildRecoveryPlan(repoPath: string): Promise<RecoveryPlan>
   }
 
   const dirty = meta?.incrementalInProgress ?? null;
+  const recordedFts = meta?.capabilities?.fts;
   return {
     repoPath: resolvedRepoPath,
     state: !meta ? 'unindexed' : dirty ? 'interrupted' : 'clean',
@@ -51,7 +57,12 @@ export async function buildRecoveryPlan(repoPath: string): Promise<RecoveryPlan>
     dirty,
     graph: { path: lbugPath, exists: graphBytes !== null, bytes: graphBytes },
     wal: { sidecars },
-    fts: { recordedStatus: meta?.capabilities?.fts?.status ?? 'unknown' },
+    fts: {
+      recordedStatus:
+        !recordedFts || recordedFts.provider === LEGACY_CAPABILITY_PROVIDER
+          ? 'unknown'
+          : recordedFts.status,
+    },
     metadata: { path: metaPath, exists: meta !== null },
     embeddings: { recordedCount: meta?.stats?.embeddings ?? null },
   };
