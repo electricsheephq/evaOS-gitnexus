@@ -240,6 +240,12 @@ jobs:
         shell: bash
         env:
           SHARD: ${{ matrix.shard }}/${{ needs.shard-plan.outputs.total }}
+          # Shard 1 includes cli-e2e (about 4.5 minutes by itself). Two release
+          # runs completed every other file but reached the 15-minute process
+          # watchdog before cli-e2e could report its summary on slower Windows
+          # runners. Keep macOS at the default and give Windows bounded headroom
+          # inside the existing 25-minute job timeout.
+          GITNEXUS_CROSS_PLATFORM_TIMEOUT_MINUTES: ${{ runner.os == 'Windows' && '20' || '15' }}
         run: npx tsx scripts/run-cross-platform.ts --shard="$SHARD"
         working-directory: gitnexus
 
