@@ -23,7 +23,7 @@ All notable changes to GitNexus will be documented in this file.
 
 ### Changed
 
-- Large embedding work pages at bounded sizes and supports optional sanitized resource telemetry. Voyage indexing remains strictly one repository at a time and has no host memory, swap, RSS, or free-memory admission or termination gate.
+- Large embedding work pages at bounded sizes and supports optional sanitized resource telemetry. Voyage indexing remains strictly one repository at a time and has no host memory, swap, RSS, or free-memory admission or termination gate. Remote HTTP/Voyage defaults to no automatic node-count cap; the 50,000-node automatic cap applies only to local models unless an operator supplies an explicit limit.
 - Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
 
 ## [1.6.10-electric.2] - 2026-07-15
