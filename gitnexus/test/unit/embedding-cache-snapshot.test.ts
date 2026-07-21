@@ -153,6 +153,46 @@ describe('bounded embedding preservation snapshot', () => {
     expect(onBatch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [
+      'missing nodeId',
+      (row: Record<string, unknown>) => {
+        delete row.nodeId;
+      },
+    ],
+    [
+      'non-integer chunkIndex',
+      (row: Record<string, unknown>) => {
+        row.chunkIndex = 'zero';
+      },
+    ],
+  ])('rejects %s before invoking any restore batch', async (_name, corruptIdentity) => {
+    const snapshotPath = await makePath();
+    const source = { lastCommit: 'abc', indexedAt: '2026-07-20T00:00:00.000Z' };
+    const rows = makeRows(257);
+    await createEmbeddingSnapshot(snapshotPath, source, async (emit) => {
+      await emit(rows.slice(0, 256));
+      await emit(rows.slice(256));
+    });
+
+    const lines = (await fs.readFile(snapshotPath, 'utf8')).trimEnd().split('\n');
+    const footer = JSON.parse(lines.pop() ?? '{}') as Record<string, unknown>;
+    const malformed = JSON.parse(lines[256]) as Record<string, unknown>;
+    corruptIdentity(malformed);
+    lines[256] = JSON.stringify(malformed);
+    footer.sha256 = createHash('sha256')
+      .update(lines.map((line) => `${line}\n`).join(''))
+      .digest('hex');
+    await fs.writeFile(snapshotPath, `${lines.join('\n')}\n${JSON.stringify(footer)}\n`);
+    const onBatch = vi.fn();
+
+    await expect(validateEmbeddingSnapshot(snapshotPath, source, 257)).resolves.toBeUndefined();
+    await expect(readEmbeddingSnapshot(snapshotPath, source, onBatch, 257)).rejects.toThrow(
+      'failed validation',
+    );
+    expect(onBatch).not.toHaveBeenCalled();
+  });
+
   it('binds a reusable snapshot to its source generation', async () => {
     const snapshotPath = await makePath();
     const source = { lastCommit: 'abc', indexedAt: '2026-07-20T00:00:00.000Z' };
