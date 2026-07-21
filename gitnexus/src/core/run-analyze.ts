@@ -2047,7 +2047,7 @@ const runFullAnalysisImpl = async (
     // would finalize metadata with fewer vectors than the preserved snapshot.
     let restoredEmbeddingCount = 0;
     let skippedPendingEmbeddingRows = 0;
-    // Keep only restored row identities and one hash per owner node; vectors
+    // Keep exact known row identities and one restored hash per owner node; vectors
     // still stream through the bounded 256-row snapshot batches above. The
     // exact row IDs are required because LadybugDB can make freshly restored
     // non-PK nodeId predicates temporarily miss rows even while the PK sees
@@ -2086,6 +2086,14 @@ const runFullAnalysisImpl = async (
               // force-selected by runEmbeddingPipeline before finalization.
               if (resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.has(embedding.nodeId)) {
                 skippedPendingEmbeddingRows += 1;
+                // The staged database can already contain this row from the
+                // interrupted window even though its non-PK nodeId lookup is
+                // temporarily invisible behind LadybugDB's live VECTOR index.
+                // Carry the exact primary key without its reusable hash so the
+                // pipeline deletes it immediately before regenerating the batch.
+                const rowIds = restoredEmbeddingRowIds.get(embedding.nodeId) ?? [];
+                rowIds.push(`${embedding.nodeId}:${embedding.chunkIndex}`);
+                restoredEmbeddingRowIds.set(embedding.nodeId, rowIds);
                 continue;
               }
               const liveNode = pipelineResult.graph.getNode(embedding.nodeId);
