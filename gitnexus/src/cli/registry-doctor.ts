@@ -34,6 +34,7 @@ export interface RegistryCapabilityReport {
   graph: string | null;
   fts: string | null;
   vectorSearch: string | null;
+  vectorSearchReason: DoctorPoolProbe['vectorIndexReason'];
 }
 
 /**
@@ -328,6 +329,7 @@ const unavailableCapabilities = (): RegistryCapabilityReport => ({
   graph: null,
   fts: null,
   vectorSearch: null,
+  vectorSearchReason: 'pool-probe-unavailable',
 });
 
 const liveCapabilities = (probe: DoctorPoolProbe): RegistryCapabilityReport => {
@@ -342,7 +344,8 @@ const liveCapabilities = (probe: DoctorPoolProbe): RegistryCapabilityReport => {
     source: 'active-probe',
     graph: 'available',
     fts: probe.fts ? 'available' : 'unavailable',
-    vectorSearch: probe.vector ? 'vector-index' : 'unavailable',
+    vectorSearch: probe.vectorIndex ? 'vector-index' : 'unavailable',
+    vectorSearchReason: probe.vectorIndexReason,
   };
 };
 

@@ -184,6 +184,35 @@ describe('doctor current-repository VECTOR status', () => {
     ).toEqual({ status: 'vector-index (25 chunks)', detail: null });
   });
 
+  it('lets a failed live HNSW probe override optimistic persisted metadata', () => {
+    const result = repoVectorDoctorStatus(
+      {
+        stats: { embeddings: 25 },
+        capabilities: {
+          graph: { provider: 'ladybugdb', status: 'available' },
+          fts: { provider: 'ladybugdb-fts', status: 'available' },
+          vectorSearch: {
+            provider: 'ladybugdb-vector',
+            status: 'vector-index',
+            exactScanLimit: 10_000,
+          },
+        },
+      } as RepoMeta,
+      {
+        fts: true,
+        vector: true,
+        vectorIndex: false,
+        vectorIndexReason: 'vector-index-missing-or-unqueryable',
+        exercisedConnections: 8,
+        connectionCount: 8,
+        reason: null,
+      },
+    );
+
+    expect(result.status).toBe('unavailable (25 chunks)');
+    expect(result.detail).toContain('vector-index-missing-or-unqueryable');
+  });
+
   it('makes an exact-scan fallback and its current safety limit explicit', () => {
     const result = repoVectorDoctorStatus({
       stats: { embeddings: 25 },
