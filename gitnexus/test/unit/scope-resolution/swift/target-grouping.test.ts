@@ -20,8 +20,10 @@
  * (no `instanceof` on the config object) and returns `null` otherwise.
  */
 import { describe, it, expect } from 'vitest';
+import type { ParsedFile } from 'gitnexus-shared';
 import {
   groupSwiftFilesBySpmTarget,
+  groupParsedSwiftFilesBySpmTarget,
   coerceSwiftTargets,
 } from '../../../../src/core/ingestion/languages/swift/target-grouping.js';
 
@@ -136,5 +138,18 @@ describe('coerceSwiftTargets — duck-type the opaque resolutionConfig', () => {
     expect(coerceSwiftTargets({})).toBeNull();
     expect(coerceSwiftTargets({ targets: 'not-a-map' })).toBeNull();
     expect(coerceSwiftTargets({ goModule: { modulePath: 'x' } })).toBeNull();
+  });
+});
+
+describe('groupParsedSwiftFilesBySpmTarget — shared-pass cache', () => {
+  it('reuses one grouping for the same parsed-files and resolution-config identities', () => {
+    const parsedFiles = [{ filePath: 'Sources/App/User.swift' }] as ParsedFile[];
+    const resolutionConfig = { targets: new Map([['App', 'Sources/App']]) };
+
+    const first = groupParsedSwiftFilesBySpmTarget(parsedFiles, resolutionConfig);
+    const second = groupParsedSwiftFilesBySpmTarget(parsedFiles, resolutionConfig);
+
+    expect(second).toBe(first);
+    expect(first.get('App')).toEqual(parsedFiles);
   });
 });

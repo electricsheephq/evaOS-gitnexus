@@ -25,9 +25,17 @@
  * one bucket per file. Do not copy the import-config behavior here.
  */
 
+import type { ParsedFile, ScopeId } from 'gitnexus-shared';
 import type { SwiftPackageConfig } from '../../language-config.js';
 
 const DEFAULT_TARGET = '__default__';
+const parsedFileGroupsCache = new WeakMap<
+  readonly ParsedFile[],
+  {
+    readonly resolutionConfig: unknown;
+    readonly groups: ReadonlyMap<string, readonly ParsedFile[]>;
+  }
+>();
 
 /**
  * Group `items` by SPM target subtree, replicating legacy
@@ -101,4 +109,43 @@ export function coerceSwiftTargets(resolutionConfig: unknown): ReadonlyMap<strin
     return config.targets;
   }
   return null;
+}
+
+/**
+ * Group parsed Swift files once for the sibling-definition and sibling-type
+ * passes. Both passes receive the same parsed-files array and opaque resolution
+ * config during one workspace run, so a weak identity cache avoids rebuilding
+ * the target buckets while allowing the workspace objects to be collected.
+ */
+export function groupParsedSwiftFilesBySpmTarget(
+  parsedFiles: readonly ParsedFile[],
+  resolutionConfig: unknown,
+): ReadonlyMap<string, readonly ParsedFile[]> {
+  const cached = parsedFileGroupsCache.get(parsedFiles);
+  if (cached !== undefined && cached.resolutionConfig === resolutionConfig) return cached.groups;
+
+  const groups = groupSwiftFilesBySpmTarget(
+    parsedFiles,
+    (parsed) => parsed.filePath,
+    coerceSwiftTargets(resolutionConfig),
+  );
+  parsedFileGroupsCache.set(parsedFiles, { resolutionConfig, groups });
+  return groups;
+}
+
+export function swiftTargetNamespaceKey(targetName: string): string {
+  return `swift-target:${targetName}`;
+}
+
+export function registerSwiftTargetAccess(
+  accessibleTargets: Map<ScopeId, string[]>,
+  scopeId: ScopeId,
+  targetKey: string,
+): void {
+  const existing = accessibleTargets.get(scopeId);
+  if (existing === undefined) {
+    accessibleTargets.set(scopeId, [targetKey]);
+  } else if (!existing.includes(targetKey)) {
+    existing.push(targetKey);
+  }
 }

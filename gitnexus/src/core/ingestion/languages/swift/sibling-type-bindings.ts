@@ -12,10 +12,12 @@
  * to resolve `user.save()` cross-file, App.swift's scope chain must be
  * able to follow `getUser → User`. The function return-type binding
  * (`getUser → User`) lives on Models.swift's module scope, so we mirror
- * sibling module-scope typeBindings into the importer's module scope —
- * the same trick Go uses (`mirrorGoNamespaceTypeBindings`), but Swift has
- * no namespace-import edges, so module membership is the SPM target
- * subtree (`Sources/<Target>/…`): threaded in via the SPM target map
+ * sibling module-scope typeBindings once into the target's shared
+ * `namespaceTypeBindings` channel. Each module scope is gated to its target
+ * through `accessibleNamespacesByScope`, so lookup sees exactly its siblings
+ * without the old O(files x bindings) per-module copy. Swift has no
+ * namespace-import edges, so module membership is the SPM target subtree
+ * (`Sources/<Target>/…`): threaded in via the SPM target map
  * (`resolutionConfig` → `coerceSwiftTargets`) and grouped by
  * `groupSwiftFilesBySpmTarget` (replicating legacy `groupSwiftFilesByTarget`;
  * no-source-dir → all files form one `__default__` module).
@@ -29,11 +31,15 @@
  * sanctioned non-frozen Map cast (Contract Invariant I6).
  */
 
-import type { ParsedFile, TypeRef } from 'gitnexus-shared';
+import type { ParsedFile, ScopeId, TypeRef } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import type { WorkspaceResolutionIndex } from '../../scope-resolution/workspace-index.js';
 import { followChainPostFinalize } from '../../scope-resolution/passes/imported-return-types.js';
-import { coerceSwiftTargets, groupSwiftFilesBySpmTarget } from './target-grouping.js';
+import {
+  groupParsedSwiftFilesBySpmTarget,
+  registerSwiftTargetAccess,
+  swiftTargetNamespaceKey,
+} from './target-grouping.js';
 
 export function mirrorSwiftSiblingTypeBindings(
   parsedFiles: readonly ParsedFile[],
@@ -45,33 +51,28 @@ export function mirrorSwiftSiblingTypeBindings(
 
   // Group files by SPM target subtree (the module). No-source-dir → all
   // files in one `__default__` bucket.
-  const targets = coerceSwiftTargets(resolutionConfig);
-  const filesByTarget = groupSwiftFilesBySpmTarget(
-    parsedFiles,
-    (parsed) => parsed.filePath,
-    targets,
-  );
+  const filesByTarget = groupParsedSwiftFilesBySpmTarget(parsedFiles, resolutionConfig);
+  const sharedTypes = indexes.namespaceTypeBindings as Map<string, Map<string, TypeRef>>;
+  const accessibleTargets = indexes.accessibleNamespacesByScope as Map<ScopeId, string[]>;
 
-  for (const [, group] of filesByTarget) {
+  for (const [targetName, group] of filesByTarget) {
     if (group.length < 2) continue; // no siblings to mirror from
-    const files = group.map((parsed) => parsed.filePath);
-    for (const importerFile of files) {
-      const importerModule = moduleScopeByFile.get(importerFile);
-      if (importerModule === undefined) continue;
+    const targetKey = swiftTargetNamespaceKey(targetName);
+    let targetTypes = sharedTypes.get(targetKey);
+    if (targetTypes === undefined) {
+      targetTypes = new Map<string, TypeRef>();
+      sharedTypes.set(targetKey, targetTypes);
+    }
 
-      for (const sourceFile of files) {
-        if (sourceFile === importerFile) continue;
-        const sourceModule = moduleScopeByFile.get(sourceFile);
-        if (sourceModule === undefined) continue;
-
-        for (const [name, ref] of sourceModule.typeBindings) {
-          if (name.length === 0) continue;
-          // A local annotation on the importer must win over a sibling's.
-          if (importerModule.typeBindings.has(name)) continue;
-
-          const terminal = followChainPostFinalize(ref, sourceModule.id, indexes);
-          (importerModule.typeBindings as Map<string, TypeRef>).set(name, terminal);
-        }
+    for (const parsed of group) {
+      registerSwiftTargetAccess(accessibleTargets, parsed.moduleScope, targetKey);
+    }
+    for (const parsed of group) {
+      const sourceModule = moduleScopeByFile.get(parsed.filePath);
+      if (sourceModule === undefined) continue;
+      for (const [name, ref] of sourceModule.typeBindings) {
+        if (name.length === 0 || targetTypes.has(name)) continue;
+        targetTypes.set(name, followChainPostFinalize(ref, sourceModule.id, indexes));
       }
     }
   }
