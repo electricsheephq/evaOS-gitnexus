@@ -16,7 +16,9 @@ import {
   REL_TABLE_NAME,
   SCHEMA_QUERIES,
   EMBEDDING_TABLE_NAME,
+  EMBEDDING_INDEX_NAME,
   CREATE_VECTOR_INDEX_QUERY,
+  DROP_VECTOR_INDEX_QUERY,
   STALE_HASH_SENTINEL,
   NodeTableName,
 } from './schema.js';
@@ -2892,6 +2894,43 @@ export const createVectorIndex = async (): Promise<boolean> => {
     // Read-only DB (e.g. the MCP query pool): writable analyze owns creation.
     if (isReadOnlyDbError(e)) return false;
     throw e;
+  }
+};
+
+/**
+ * Drop the HNSW index before replacing rows from an interrupted staged
+ * embedding window. LadybugDB can keep a deleted primary key live in a loaded
+ * HNSW index long enough for an immediate same-key CREATE to fail. Removing the
+ * staged generation's index makes the bounded delete/reinsert window ordinary
+ * table mutation; the embedding pipeline rebuilds HNSW after all rows land.
+ *
+ * Returns true when the index is absent after the call (including when it was
+ * already absent), and false when VECTOR cannot be loaded or the DB is
+ * read-only. Other failures propagate so resume remains fail-closed.
+ */
+export const dropVectorIndex = async (): Promise<boolean> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  if (!(await loadVectorExtension())) return false;
+
+  const indexes = await executeQuery('CALL SHOW_INDEXES() RETURN *');
+  const exists = indexes.some(
+    (row: Record<string, unknown>) =>
+      row.index_name === EMBEDDING_INDEX_NAME && row.table_name === EMBEDDING_TABLE_NAME,
+  );
+  if (!exists) {
+    vectorIndexEnsured = false;
+    return true;
+  }
+
+  try {
+    await queryAndDrain(conn, DROP_VECTOR_INDEX_QUERY);
+    vectorIndexEnsured = false;
+    return true;
+  } catch (error) {
+    if (isReadOnlyDbError(error)) return false;
+    throw error;
   }
 };
 

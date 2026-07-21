@@ -40,7 +40,7 @@ import {
 } from './config.js';
 import { rankExactEmbeddingRows, type ExactEmbeddingRow } from './exact-search.js';
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME, STALE_HASH_SENTINEL } from '../lbug/schema.js';
-import { loadVectorExtension, createVectorIndex } from '../lbug/lbug-adapter.js';
+import { loadVectorExtension, createVectorIndex, dropVectorIndex } from '../lbug/lbug-adapter.js';
 import { escapeCypherString } from '../lbug/cypher-escape.js';
 import { isMissingColumnOrTableError } from '../lbug/schema-errors.js';
 import type { ExtensionInstallPolicy } from '../lbug/extension-loader.js';
@@ -364,6 +364,8 @@ export interface EmbeddingPipelineOptions {
   forceReembedNodeIds?: ReadonlySet<string>;
   /** Exact known row identities, keyed by owner node, for PK-safe stale deletion. */
   existingEmbeddingRowIds?: ReadonlyMap<string, readonly string[]>;
+  /** Drop staged HNSW before a checkpoint-window rewrite; rebuilt after inserts. */
+  rebuildVectorIndexBeforeMutation?: boolean;
   /** Load cached node identities for one page; callers must return at most the requested IDs. */
   loadExistingEmbeddingHashes?: (
     nodeIds: readonly string[],
@@ -462,6 +464,14 @@ export const runEmbeddingPipeline = async (
     throwIfCancelled();
     if (!vectorAvailable) {
       logger.warn(vectorUnavailableMessage);
+    }
+    if (pipelineOptions.rebuildVectorIndexBeforeMutation) {
+      if (!vectorAvailable || !(await dropVectorIndex())) {
+        throw new Error(
+          'Cannot safely resume the staged embedding checkpoint because its VECTOR index could not be dropped.',
+        );
+      }
+      throwIfCancelled();
     }
 
     // Phase 1: Load embedding model
