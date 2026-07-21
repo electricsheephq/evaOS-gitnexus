@@ -1,6 +1,11 @@
 import fs from 'fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getStoragePaths, saveMeta, type RepoMeta } from '../../src/storage/repo-manager.js';
+import {
+  getStoragePaths,
+  INCREMENTAL_SCHEMA_VERSION,
+  saveMeta,
+  type RepoMeta,
+} from '../../src/storage/repo-manager.js';
 import { EMBEDDING_DIMS } from '../../src/core/lbug/schema.js';
 import { createTempDir } from '../helpers/test-db.js';
 
@@ -815,14 +820,29 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
     }
   });
 
-  it('passes restored hashes and exact row identities to the embedding pipeline (#155)', async () => {
+  it('passes restored and skipped-pending exact row identities to the embedding pipeline (#155, #162)', async () => {
     const restoredNodeId = 'Function:src/app.ts:handler';
-    const stubNode = {
-      id: restoredNodeId,
-      label: 'Function',
-      name: 'handler',
-      properties: { filePath: 'src/app.ts' },
-    };
+    const pendingNodeId = 'Function:src/pending.ts:resume';
+    const stubNodes = new Map([
+      [
+        restoredNodeId,
+        {
+          id: restoredNodeId,
+          label: 'Function',
+          name: 'handler',
+          properties: { filePath: 'src/app.ts' },
+        },
+      ],
+      [
+        pendingNodeId,
+        {
+          id: pendingNodeId,
+          label: 'Function',
+          name: 'resume',
+          properties: { filePath: 'src/pending.ts' },
+        },
+      ],
+    ]);
     const runEmbeddingPipeline = vi.fn(async () => ({
       nodesProcessed: 1,
       chunksProcessed: 1,
@@ -833,23 +853,25 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       initLbug: vi.fn(async () => undefined),
       loadGraphToLbug: vi.fn(async () => undefined),
-      getLbugStats: vi.fn(async () => ({ nodes: 1, edges: 0, communities: 0, processes: 0 })),
+      getLbugStats: vi.fn(async () => ({ nodes: 2, edges: 0, communities: 0, processes: 0 })),
       executeQuery: vi.fn(async (cypher: string) =>
-        /RETURN count\(e\) AS cnt/.test(cypher) ? [{ cnt: 2 }] : [],
+        /RETURN count\(e\) AS cnt/.test(cypher) ? [{ cnt: 4 }] : [],
       ),
       executeWithReusedStatement: vi.fn(async () => undefined),
       closeLbug: vi.fn(async () => undefined),
       wipeLbugDbFiles: vi.fn(async () => undefined),
       loadCachedEmbeddings: vi.fn(async () => ({
-        embeddingNodeIds: new Set([restoredNodeId]),
-        embeddings: [0, 1].map((chunkIndex) => ({
-          nodeId: restoredNodeId,
-          chunkIndex,
-          startLine: chunkIndex + 1,
-          endLine: chunkIndex + 2,
-          embedding: new Array(EMBEDDING_DIMS).fill(0),
-          contentHash: 'restored-hash',
-        })),
+        embeddingNodeIds: new Set([restoredNodeId, pendingNodeId]),
+        embeddings: [restoredNodeId, pendingNodeId].flatMap((nodeId) =>
+          [0, 1].map((chunkIndex) => ({
+            nodeId,
+            chunkIndex,
+            startLine: chunkIndex + 1,
+            endLine: chunkIndex + 2,
+            embedding: new Array(EMBEDDING_DIMS).fill(0),
+            contentHash: nodeId === restoredNodeId ? 'restored-hash' : 'pending-hash',
+          })),
+        ),
       })),
       fetchExistingEmbeddingHashesForNodeIds,
       deleteNodesForFiles: vi.fn(async () => undefined),
@@ -866,10 +888,12 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
     vi.doMock('../../src/core/ingestion/pipeline.js', () => ({
       runPipelineFromRepo: vi.fn(async (repoPath: string) => ({
         repoPath,
-        totalFileCount: 1,
+        totalFileCount: 2,
         graph: {
-          forEachNode: (fn: (node: typeof stubNode) => void) => fn(stubNode),
-          getNode: (id: string) => (id === restoredNodeId ? stubNode : undefined),
+          forEachNode: (
+            fn: (node: typeof stubNodes extends Map<string, infer T> ? T : never) => void,
+          ) => stubNodes.forEach((node) => fn(node)),
+          getNode: (id: string) => stubNodes.get(id),
         },
       })),
     }));
@@ -892,13 +916,28 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
         repoPath: tmpRepo.dbPath,
         lastCommit: '',
         indexedAt: new Date().toISOString(),
-        stats: { embeddings: 2 },
+        schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+        stats: { embeddings: 4 },
+        incrementalInProgress: {
+          startedAt: Date.now(),
+          toWriteCount: 2,
+          phase: 'embedding-window',
+        },
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 0,
+          totalNodes: 2,
+          chunksProcessed: 0,
+          model: 'Snowflake/snowflake-arctic-embed-xs',
+          dimensions: EMBEDDING_DIMS,
+          pendingNodeIds: [pendingNodeId],
+        },
       });
 
       const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
       await runFullAnalysis(
         tmpRepo.dbPath,
-        { force: true, embeddings: true, embeddingsNodeLimit: 0 },
+        { embeddings: true, embeddingsNodeLimit: 0 },
         { onProgress: () => {} },
       );
 
@@ -908,10 +947,19 @@ describe('runFullAnalysis wipe-and-restore vector-index stamp (tri-review 466951
         `${restoredNodeId}:0`,
         `${restoredNodeId}:1`,
       ]);
-      const hashes = await pipelineOptions.loadExistingEmbeddingHashes([restoredNodeId]);
+      expect(pipelineOptions.existingEmbeddingRowIds.get(pendingNodeId)).toEqual([
+        `${pendingNodeId}:0`,
+        `${pendingNodeId}:1`,
+      ]);
+      const hashes = await pipelineOptions.loadExistingEmbeddingHashes([
+        restoredNodeId,
+        pendingNodeId,
+      ]);
       expect(hashes.get(restoredNodeId)).toBe('restored-hash');
+      expect(hashes.has(pendingNodeId)).toBe(false);
       expect(fetchExistingEmbeddingHashesForNodeIds).toHaveBeenCalledWith(expect.any(Function), [
         restoredNodeId,
+        pendingNodeId,
       ]);
     } finally {
       await tmpRepo.cleanup();

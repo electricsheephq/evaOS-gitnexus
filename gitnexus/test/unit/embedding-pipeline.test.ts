@@ -639,6 +639,44 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(createCalls.length).toBeGreaterThanOrEqual(1);
   });
 
+  it('deletes a persisted pending-window row by exact primary key before regeneration (#162)', async () => {
+    mockEmbedderSetup();
+
+    const node = makeNode({
+      id: 'Function:pending:src/pending.ts',
+      name: 'pending',
+      filePath: 'src/pending.ts',
+    });
+    const existingEmbeddingRowIds = new Map<string, readonly string[]>([
+      [node.id, [`${node.id}:0`]],
+    ]);
+    const executeQuery = mockExecuteQuery([node]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      {},
+      undefined,
+      undefined,
+      {
+        forceReembedNodeIds: new Set([node.id]),
+        existingEmbeddingRowIds,
+      },
+    );
+
+    const mutationCalls = stmtCalls.filter(
+      (call) => call.cypher.includes('DELETE') || call.cypher.includes('CREATE'),
+    );
+    expect(mutationCalls[0].cypher).toContain('MATCH (e:CodeEmbedding {id: $id}) DELETE e');
+    expect(mutationCalls[0].params).toEqual([{ id: `${node.id}:0` }]);
+    expect(mutationCalls.some((call) => call.cypher.includes('CREATE'))).toBe(true);
+  });
+
   it('treats STALE_HASH_SENTINEL as stale — triggers re-embed', async () => {
     mockEmbedderSetup();
 
