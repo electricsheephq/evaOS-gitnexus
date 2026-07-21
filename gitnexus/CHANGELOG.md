@@ -4,6 +4,18 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.5] - 2026-07-21
+
+### Fixed
+
+- **Interrupted staged resumes delete exact pending-window rows before regeneration**, preventing a preserved LadybugDB primary key from colliding with the replacement `CodeEmbedding` row while keeping the delete/reinsert exposure bounded to the current batch (#162, #163)
+- **Registry doctor derives the HNSW query dimension from each database's stored vector column**, so a raw doctor invocation reports healthy 2,048-dimensional Voyage indexes truthfully without requiring provider-specific process environment (#164, #165)
+
+### Changed
+
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.2`, `.3`, and `.4` installations remain available for rollback.
+
 ## [1.6.10-electric.4] - 2026-07-21
 
 ### Fixed
