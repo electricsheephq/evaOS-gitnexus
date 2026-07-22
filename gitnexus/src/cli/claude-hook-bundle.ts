@@ -13,6 +13,17 @@ export const BEST_EFFORT_CLAUDE_HOOK_HELPERS = new Set<string>(['win-rm-list-jso
 export const CLAUDE_HOOK_CLI_PATH_LITERAL =
   "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');";
 
+export function formatHookCommand(
+  hookPath: string,
+  isWindows = process.platform === 'win32',
+): string {
+  if (isWindows) {
+    const escaped = hookPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    return `node "${escaped}"`;
+  }
+  return `node '${hookPath.replace(/'/g, "'\\''")}'`;
+}
+
 export function patchClaudeHookCliPath(
   source: string,
   absoluteCliPath: string,

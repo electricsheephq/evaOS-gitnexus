@@ -153,7 +153,8 @@ describe('setupCommand coding-agent selection', () => {
     const claudeJsonPath = path.join(tempHome, '.claude.json');
     const skillsPath = path.join(tempHome, '.claude', 'skills', 'keep', 'SKILL.md');
     const settingsPath = path.join(tempHome, '.claude', 'settings.json');
-    const claudeJson = '{"mcpServers":{"gitnexus":{"command":"curated-wrapper","env":{"KEEP":"1"}}}}\n';
+    const claudeJson =
+      '{"mcpServers":{"gitnexus":{"command":"curated-wrapper","env":{"KEEP":"1"}}}}\n';
     await fs.mkdir(path.dirname(skillsPath), { recursive: true });
     await fs.writeFile(claudeJsonPath, claudeJson);
     await fs.writeFile(skillsPath, 'keep me');
@@ -166,7 +167,15 @@ describe('setupCommand coding-agent selection', () => {
               { hooks: [{ type: 'command', command: 'node /old/gitnexus-hook.cjs' }] },
               { hooks: [{ type: 'command', command: 'echo keep-session' }] },
             ],
-            PreToolUse: [{ hooks: [{ type: 'command', command: 'echo keep-pre' }] }],
+            PreToolUse: [
+              {
+                hooks: [
+                  { type: 'command', command: 'echo keep-pre' },
+                  { type: 'command', command: 'node /old/gitnexus-hook.cjs' },
+                ],
+              },
+            ],
+            PostToolUse: [{ hooks: [{ type: 'command', command: 'node /old/gitnexus-hook.cjs' }] }],
           },
           permissions: { allow: ['Read'] },
         },
@@ -187,6 +196,7 @@ describe('setupCommand coding-agent selection', () => {
     expect(JSON.stringify(settings.hooks.PreToolUse)).toContain('keep-pre');
     expect(JSON.stringify(settings.hooks.PreToolUse)).toContain('gitnexus-hook');
     expect(JSON.stringify(settings.hooks.PostToolUse)).toContain('gitnexus-hook');
+    expect(JSON.stringify(settings.hooks)).not.toContain('/old/gitnexus-hook.cjs');
     for (const file of [
       'gitnexus-hook.cjs',
       'hook-lock.cjs',
@@ -200,6 +210,31 @@ describe('setupCommand coding-agent selection', () => {
     }
   });
 
+  it('hooks-only initializes a blank Claude settings file', async () => {
+    const settingsPath = path.join(tempHome, '.claude', 'settings.json');
+    await fs.writeFile(settingsPath, '  \n');
+    const { setupCommand } = await import('../../src/cli/setup.js');
+
+    await setupCommand({ codingAgent: ['claude'], hooksOnly: true });
+
+    expect(process.exitCode).not.toBe(1);
+    const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8'));
+    expect(JSON.stringify(settings.hooks.PreToolUse)).toContain('gitnexus-hook');
+    expect(JSON.stringify(settings.hooks.PostToolUse)).toContain('gitnexus-hook');
+  });
+
+  it('hooks-only fails when Claude is not installed', async () => {
+    await fs.rm(path.join(tempHome, '.claude'), { recursive: true, force: true });
+    const { setupCommand } = await import('../../src/cli/setup.js');
+
+    await setupCommand({ codingAgent: ['claude'], hooksOnly: true });
+
+    expect(process.exitCode).toBe(1);
+    expect(vi.mocked(console.log).mock.calls.flat().join('\n')).toContain(
+      'Claude config directory is missing',
+    );
+  });
+
   it('hooks-only requires exactly Claude and performs no writes on invalid selection', async () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const { setupCommand } = await import('../../src/cli/setup.js');
@@ -208,8 +243,6 @@ describe('setupCommand coding-agent selection', () => {
     expect(stderr).toHaveBeenCalledWith(
       '`--hooks-only` requires exactly `--coding-agent claude`.\n',
     );
-    await expect(
-      fs.access(path.join(tempHome, '.codex', 'hooks', 'gitnexus')),
-    ).rejects.toThrow();
+    await expect(fs.access(path.join(tempHome, '.codex', 'hooks', 'gitnexus'))).rejects.toThrow();
   });
 });

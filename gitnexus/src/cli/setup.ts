@@ -28,8 +28,10 @@ import {
   BEST_EFFORT_CLAUDE_HOOK_HELPERS,
   CLAUDE_HOOK_ADAPTER,
   CLAUDE_HOOK_HELPERS,
+  formatHookCommand,
   patchClaudeHookCliPath,
 } from './claude-hook-bundle.js';
+export { formatHookCommand } from './claude-hook-bundle.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -68,17 +70,6 @@ const MCP_PINNED_REF = `gitnexus@${_pkg.version}`;
  * is forward-slashed, so keep the double-quoted form with backslash-then-quote
  * escaping (CodeQL js/incomplete-sanitization safe ordering).
  */
-export function formatHookCommand(
-  hookPath: string,
-  isWindows = process.platform === 'win32',
-): string {
-  if (isWindows) {
-    const escaped = hookPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    return `node "${escaped}"`;
-  }
-  return `node '${hookPath.replace(/'/g, "'\\''")}'`;
-}
-
 // The exact source line each hook adapter ships, rewritten at install time to
 // point cliPath at the installed CLI. Kept as a named constant so the install
 // patch and its drift guard reference one string — if the adapter source ever
@@ -447,6 +438,59 @@ async function mergeHooksJsonc(
   return true;
 }
 
+/** Replace only existing GitNexus hook commands, preserving matchers and unrelated hooks. */
+async function refreshGitnexusHookCommands(
+  filePath: string,
+  command: string,
+  commandFragment = 'gitnexus-hook',
+): Promise<boolean> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(filePath, 'utf-8');
+  } catch (error) {
+    if (isEnoent(error)) return true;
+    throw error;
+  }
+  if (raw.trim().length === 0) return true;
+  const errors: ParseError[] = [];
+  const parsed = parseJsonc(raw, errors);
+  if (errors.length > 0 || !parsed || typeof parsed !== 'object') return false;
+
+  const formattingOptions = detectIndentation(raw);
+  let current = raw;
+  for (const eventName of ['PreToolUse', 'PostToolUse']) {
+    const entries = parsed.hooks?.[eventName];
+    if (!Array.isArray(entries)) continue;
+    for (let entryIndex = entries.length - 1; entryIndex >= 0; entryIndex--) {
+      const hooks = entries[entryIndex]?.hooks;
+      if (!Array.isArray(hooks)) continue;
+      for (let hookIndex = hooks.length - 1; hookIndex >= 0; hookIndex--) {
+        const existing = hooks[hookIndex]?.command;
+        if (
+          typeof existing !== 'string' ||
+          !existing.includes(commandFragment) ||
+          existing === command
+        ) {
+          continue;
+        }
+        current = applyEdits(
+          current,
+          modify(
+            current,
+            ['hooks', eventName, entryIndex, 'hooks', hookIndex, 'command'],
+            command,
+            {
+              formattingOptions,
+            },
+          ),
+        );
+      }
+    }
+  }
+  if (current !== raw) await fs.writeFile(filePath, current, 'utf-8');
+  return true;
+}
+
 /** Remove only GitNexus commands from the obsolete Claude SessionStart event. */
 export async function removeObsoleteGitnexusSessionStart(
   settingsPath: string,
@@ -459,6 +503,8 @@ export async function removeObsoleteGitnexusSessionStart(
     if (isEnoent(error)) return true;
     throw error;
   }
+
+  if (raw.trim().length === 0) return true;
 
   const errors: ParseError[] = [];
   const parsed = parseJsonc(raw, errors);
@@ -612,6 +658,13 @@ async function installClaudeSchemaHooks(
 
     const hookPath = path.join(destHooksDir, 'gitnexus-hook.cjs').replace(/\\/g, '/');
     const hookCmd = formatHookCommand(hookPath);
+
+    if (!(await refreshGitnexusHookCommands(settingsPath, hookCmd, hookCfg.needle))) {
+      result.errors.push(
+        `${label}: ${path.basename(settingsPath)} is corrupt — existing hook commands were not changed`,
+      );
+      return;
+    }
 
     // Check which hook events need entries (idempotent: skip if already registered)
     const parsed = await (async () => {
@@ -1251,6 +1304,9 @@ export const setupCommand = async (options?: {
 
   if (options?.hooksOnly) {
     await installClaudeSchemaHooks(result, 'claude');
+    if (result.configured.length === 0 && result.errors.length === 0) {
+      result.errors.push('Claude Code hooks: Claude config directory is missing');
+    }
     if (result.configured.length > 0) {
       console.log('  Configured:');
       for (const name of result.configured) console.log(`    + ${name}`);

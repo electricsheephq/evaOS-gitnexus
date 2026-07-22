@@ -87,6 +87,30 @@ describe('doctor --integrations', () => {
     });
   });
 
+  it('reports stale when settings still invoke an old hook path', async () => {
+    await writeMatchingMcp();
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand({ codingAgent: ['claude'], hooksOnly: true });
+    const settingsPath = path.join(home, '.claude', 'settings.json');
+    const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8'));
+    settings.hooks.PreToolUse[0].hooks[0].command = 'node /old/gitnexus-hook.cjs';
+    await fs.writeFile(settingsPath, JSON.stringify(settings));
+    const { buildIntegrationDoctorReport } = await import('../../src/cli/integration-doctor.js');
+
+    await expect(buildIntegrationDoctorReport(home)).resolves.toMatchObject({
+      hooks: { claude: 'stale' },
+    });
+  });
+
+  it('treats an unrelated Codex config as a missing MCP integration', async () => {
+    await fs.writeFile(path.join(home, '.codex', 'config.toml'), 'model = "gpt-5"\n');
+    const { buildIntegrationDoctorReport } = await import('../../src/cli/integration-doctor.js');
+
+    await expect(buildIntegrationDoctorReport(home)).resolves.toMatchObject({
+      mcp: { status: 'missing', codexConfigured: false },
+    });
+  });
+
   it('reports a sanitized MCP mismatch without returning config values', async () => {
     await writeMatchingMcp();
     const claudePath = path.join(home, '.claude.json');

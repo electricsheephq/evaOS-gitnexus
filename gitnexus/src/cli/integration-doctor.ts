@@ -9,6 +9,7 @@ import { getEditorTargets, hookTarget, mcpTarget } from './editor-targets.js';
 import {
   CLAUDE_HOOK_ADAPTER,
   CLAUDE_HOOK_HELPERS,
+  formatHookCommand,
   patchClaudeHookCliPath,
 } from './claude-hook-bundle.js';
 
@@ -103,26 +104,32 @@ const codexMcpFingerprint = (raw: string): string | null => {
   return entryFingerprint({ command, args });
 };
 
-const hookCommandPresent = (hooks: unknown, eventName: string): boolean => {
-  if (!hooks || typeof hooks !== 'object') return false;
+const hasCodexGitnexusSection = (raw: string): boolean =>
+  /(?:^|\n)\[mcp_servers\.gitnexus\]\s*(?:\n|$)/.test(raw);
+
+const gitnexusHookCommands = (hooks: unknown, eventName: string): string[] => {
+  if (!hooks || typeof hooks !== 'object') return [];
   const entries = (hooks as Record<string, unknown>)[eventName];
-  if (!Array.isArray(entries)) return false;
-  return entries.some(
-    (entry) =>
-      entry &&
-      typeof entry === 'object' &&
-      Array.isArray((entry as { hooks?: unknown }).hooks) &&
-      ((entry as { hooks: unknown[] }).hooks as unknown[]).some(
-        (hook) =>
-          hook &&
-          typeof hook === 'object' &&
-          typeof (hook as { command?: unknown }).command === 'string' &&
-          (hook as { command: string }).command.includes('gitnexus-hook'),
-      ),
-  );
+  if (!Array.isArray(entries)) return [];
+  const commands: string[] = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+    const nested = (entry as { hooks?: unknown }).hooks;
+    if (!Array.isArray(nested)) continue;
+    for (const hook of nested) {
+      if (!hook || typeof hook !== 'object') continue;
+      const command = (hook as { command?: unknown }).command;
+      if (typeof command === 'string' && command.includes('gitnexus-hook')) {
+        commands.push(command);
+      }
+    }
+  }
+  return commands;
 };
 
-const claudeHookStatus = async (home: string): Promise<{
+const claudeHookStatus = async (
+  home: string,
+): Promise<{
   status: HookStatus;
   obsoleteSessionStart: boolean;
 }> => {
@@ -135,9 +142,20 @@ const claudeHookStatus = async (home: string): Promise<{
     return { status: 'missing', obsoleteSessionStart: false };
   }
   const hooks = (settings as { hooks?: unknown }).hooks;
-  const obsoleteSessionStart = hookCommandPresent(hooks, 'SessionStart');
-  if (!hookCommandPresent(hooks, 'PreToolUse') || !hookCommandPresent(hooks, 'PostToolUse')) {
+  const obsoleteSessionStart = gitnexusHookCommands(hooks, 'SessionStart').length > 0;
+  const preCommands = gitnexusHookCommands(hooks, 'PreToolUse');
+  const postCommands = gitnexusHookCommands(hooks, 'PostToolUse');
+  if (preCommands.length === 0 || postCommands.length === 0) {
     return { status: 'missing', obsoleteSessionStart };
+  }
+
+  const expectedHookPath = path.join(target.scriptDir, CLAUDE_HOOK_ADAPTER).replace(/\\/g, '/');
+  const expectedCommand = formatHookCommand(expectedHookPath);
+  if (
+    preCommands.some((command) => command !== expectedCommand) ||
+    postCommands.some((command) => command !== expectedCommand)
+  ) {
+    return { status: 'stale', obsoleteSessionStart };
   }
 
   const sourceDir = path.join(__dirname, '..', '..', 'hooks', 'claude');
@@ -177,7 +195,7 @@ export async function buildIntegrationDoctorReport(
   const claudeFingerprints = claudeEntries.map(entryFingerprint);
   invalid ||=
     (claudeEntries.length > 0 && claudeFingerprints.some((fingerprint) => fingerprint === null)) ||
-    (codexRaw !== null && codexFingerprint === null);
+    (codexRaw !== null && hasCodexGitnexusSection(codexRaw) && codexFingerprint === null);
   if (invalid) {
     status = 'invalid';
   } else if (codexFingerprint && claudeFingerprints.length > 0) {
