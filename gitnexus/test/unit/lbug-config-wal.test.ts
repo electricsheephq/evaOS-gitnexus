@@ -222,8 +222,9 @@ describe('createLbugDatabase bounded buffer pool', () => {
   });
 
   it.each([
-    ['tiny graph uses the analyze-safe floor', 41, 128 * MiB],
-    ['mid graph scales linearly', 100_000, 100_000 * 4 * 1024],
+    ['tiny graph uses the analyze-safe floor', 41, 512 * MiB],
+    ['mid graph below the floor stays analyze-safe', 100_000, 512 * MiB],
+    ['larger graph scales linearly', 200_000, 200_000 * 4 * 1024],
     ['huge graph caps at 2 GiB', 10_000_000, 2 * GiB],
   ])('%s', (_label, elements, expected) => {
     const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
@@ -240,7 +241,7 @@ describe('createLbugDatabase bounded buffer pool', () => {
       setBufferPoolSizeHint(128 * MiB);
       const hinted = vi.fn(function (this: any) {});
       createLbugDatabase({ Database: hinted } as any, '/tmp/lbug-hint');
-      expect(bufferPoolArg(hinted)).toBe(128 * MiB);
+      expect(bufferPoolArg(hinted)).toBe(512 * MiB);
 
       vi.stubEnv('GITNEXUS_LBUG_BUFFER_POOL_SIZE', '0');
       const overridden = vi.fn(function (this: any) {});

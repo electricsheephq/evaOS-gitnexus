@@ -43,6 +43,16 @@ export interface EmbeddingSnapshotInfo {
   duplicateRows?: number;
 }
 
+export interface EmbeddingSnapshotValidationOptions {
+  /**
+   * A staged checkpoint restamps metadata after the preservation snapshot is
+   * written. Only that resume path may ignore the old indexedAt value; the
+   * source commit, payload checksum, row count, dimensions, and identity
+   * digest remain mandatory.
+   */
+  allowSourceIndexedAtDriftForCheckpointResume?: boolean;
+}
+
 export const embeddingSnapshotMatchesIdentityDigest = (
   info: EmbeddingSnapshotInfo,
   identitySha256: string,
@@ -196,6 +206,7 @@ export const validateEmbeddingSnapshot = async (
   snapshotPath: string,
   source: EmbeddingSnapshotSource,
   expectedCount?: number,
+  options: EmbeddingSnapshotValidationOptions = {},
 ): Promise<EmbeddingSnapshotInfo | undefined> => {
   let input: ReturnType<typeof createReadStream>;
   try {
@@ -257,7 +268,8 @@ export const validateEmbeddingSnapshot = async (
     footer.dimensions !== dimensions ||
     footer.sha256 !== digest.digest('hex') ||
     footer.sourceLastCommit !== source.lastCommit ||
-    footer.sourceIndexedAt !== source.indexedAt ||
+    (!options.allowSourceIndexedAtDriftForCheckpointResume &&
+      footer.sourceIndexedAt !== source.indexedAt) ||
     (expectedCount !== undefined && uniqueCount !== expectedCount)
   ) {
     return undefined;
@@ -274,8 +286,9 @@ export const readEmbeddingSnapshot = async (
   source: EmbeddingSnapshotSource,
   onBatch: (batch: readonly CachedEmbedding[]) => Promise<void>,
   expectedCount?: number,
+  options: EmbeddingSnapshotValidationOptions = {},
 ): Promise<EmbeddingSnapshotInfo> => {
-  const info = await validateEmbeddingSnapshot(snapshotPath, source, expectedCount);
+  const info = await validateEmbeddingSnapshot(snapshotPath, source, expectedCount, options);
   if (!info) throw new Error('Embedding preservation snapshot failed validation');
 
   const input = createReadStream(snapshotPath, { encoding: 'utf8' });
