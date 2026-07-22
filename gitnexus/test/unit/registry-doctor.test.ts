@@ -391,6 +391,39 @@ describe('doctor --registry read-only report (#133)', () => {
     });
   });
 
+  it('reports a readable zero-embedding database as not-indexed', async () => {
+    const indexed = await createEntry(
+      fixture.dbPath,
+      'zero-embeddings',
+      'ZeroEmbeddings',
+      'https://github.com/owner/zero-embeddings.git',
+      { nodes: 1, edges: 0, embeddings: 0 },
+    );
+    const capabilityProbe = vi.fn(async () => ({
+      fts: true,
+      vector: true,
+      vectorIndex: false,
+      vectorIndexReason: 'vector-index-missing-or-unqueryable' as const,
+      exercisedConnections: 8,
+      connectionCount: 8,
+      reason: null,
+    }));
+
+    const report = await buildRegistryDoctorReport({
+      entries: [indexed.entry],
+      databaseProbe: async () => ({ nodes: 1, edges: 0, embeddings: 0 }),
+      capabilityProbe,
+    });
+
+    expect(report.entries[0]?.capabilities).toEqual({
+      source: 'active-probe',
+      graph: 'available',
+      fts: 'available',
+      vectorSearch: 'not-indexed',
+      vectorSearchReason: null,
+    });
+  });
+
   it('lets a failed default live probe override optimistic recorded metadata', async () => {
     const indexed = await createEntry(
       fixture.dbPath,

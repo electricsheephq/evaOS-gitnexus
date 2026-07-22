@@ -169,7 +169,7 @@ export function repoVectorDoctorStatus(
   const rawEmbeddingCount = Number(meta.stats?.embeddings ?? 0);
   const embeddingCount =
     Number.isFinite(rawEmbeddingCount) && rawEmbeddingCount > 0 ? Math.floor(rawEmbeddingCount) : 0;
-  if (embeddingCount <= 0) return { status: 'no embeddings', detail: null };
+  if (embeddingCount <= 0) return { status: 'not-indexed', detail: null };
 
   if (liveProbe) {
     if (liveProbe.vectorIndex) {

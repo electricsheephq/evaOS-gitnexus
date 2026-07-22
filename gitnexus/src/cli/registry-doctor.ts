@@ -332,13 +332,25 @@ const unavailableCapabilities = (): RegistryCapabilityReport => ({
   vectorSearchReason: 'pool-probe-unavailable',
 });
 
-const liveCapabilities = (probe: DoctorPoolProbe): RegistryCapabilityReport => {
+const liveCapabilities = (
+  probe: DoctorPoolProbe,
+  embeddingCount: number,
+): RegistryCapabilityReport => {
   if (
     probe.reason ||
     probe.connectionCount !== EXPECTED_POOL_CONNECTIONS ||
     probe.exercisedConnections !== EXPECTED_POOL_CONNECTIONS
   ) {
     return unavailableCapabilities();
+  }
+  if (embeddingCount === 0) {
+    return {
+      source: 'active-probe',
+      graph: 'available',
+      fts: probe.fts ? 'available' : 'unavailable',
+      vectorSearch: 'not-indexed',
+      vectorSearchReason: null,
+    };
   }
   return {
     source: 'active-probe',
@@ -497,7 +509,10 @@ const inspectEntry = async (
   let capabilities = unavailableCapabilities();
   if (availableCounts) {
     try {
-      capabilities = liveCapabilities(await (options.capabilityProbe ?? probeDoctorPool)(lbugPath));
+      capabilities = liveCapabilities(
+        await (options.capabilityProbe ?? probeDoctorPool)(lbugPath),
+        availableCounts.embeddings,
+      );
     } catch {
       capabilities = unavailableCapabilities();
     }
