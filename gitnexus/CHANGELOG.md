@@ -4,6 +4,21 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.8] - 2026-07-23
+
+### Fixed
+
+- **Staged embedding recovery is reduced to a fail-closed containment boundary**: unjournaled staged generations are preserved but never resumed or promoted automatically, and replacing one requires an explicit clean isolated rebuild with `--staged --drop-embeddings` (#162, #180)
+- **Journal recovery is terminal and truthful**: CLI callers receive a distinct recovery-only result stating that the current checkout was not analyzed, while server callers fail closed with the exact forced-clean retry requirements (#180)
+- **Recovery completes canonical bookkeeping without starting a second analysis**, and conflicting `--incremental-only --drop-embeddings` requests are rejected before storage or ownership-lock mutation (#180)
+
+### Changed
+
+- Generic dirty-stage resume and unjournaled completed-stage promotion are no longer supported production paths. Preserved artifacts remain available for forensics; recovery proceeds through a new clean isolated generation.
+- Fleet writers and onboarding remain disabled for this containment release. Existing healthy canonical indexes continue to serve read-only MCP, query, and doctor traffic.
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.7` remains installed as the immediate rollback runtime.
+
 ## [1.6.10-electric.7] - 2026-07-22
 
 ### Added
