@@ -360,6 +360,11 @@ const assertEmbeddingIntegrity = (
   }
 };
 
+export const shouldRecreateStagedEmbeddingTableForResume = (
+  rebuild: boolean,
+  snapshotInfo: EmbeddingSnapshotInfo | undefined,
+): snapshotInfo is EmbeddingSnapshotInfo => rebuild && snapshotInfo !== undefined;
+
 const pathKind = (state: Awaited<ReturnType<typeof fs.lstat>>): string => {
   if (state.isSymbolicLink()) return 'a symbolic link';
   if (state.isDirectory()) return 'a directory';
@@ -2472,17 +2477,20 @@ const runFullAnalysisImpl = async (
     const restoredEmbeddingHashes = new Map<string, string>();
     const restoredEmbeddingRowIds = new Map<string, string[]>();
     if (
-      rebuildStagedEmbeddingTableForResume &&
-      embeddingSnapshotInfo &&
-      embeddingSnapshotInfo.count > 0
+      shouldRecreateStagedEmbeddingTableForResume(
+        rebuildStagedEmbeddingTableForResume,
+        embeddingSnapshotInfo,
+      )
     ) {
-      const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
-      if (embeddingSnapshotInfo.dimensions !== EMBEDDING_DIMS) {
-        throw new Error(
-          `Cannot recreate the staged embedding table from a ` +
-            `${embeddingSnapshotInfo.dimensions}-dimensional snapshot; this run requires ` +
-            `${EMBEDDING_DIMS} dimensions.`,
-        );
+      if (embeddingSnapshotInfo.count > 0) {
+        const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
+        if (embeddingSnapshotInfo.dimensions !== EMBEDDING_DIMS) {
+          throw new Error(
+            `Cannot recreate the staged embedding table from a ` +
+              `${embeddingSnapshotInfo.dimensions}-dimensional snapshot; this run requires ` +
+              `${EMBEDDING_DIMS} dimensions.`,
+          );
+        }
       }
       progress('embeddings', 87, 'Recreating the isolated staged embedding table...');
       const { resolveEmbeddingInstallPolicy } = await import('./embeddings/embedding-pipeline.js');

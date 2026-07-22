@@ -32,6 +32,17 @@ describe('run-analyze module', () => {
     expect(mod.PHASE_LABELS.parsing).toBe('Parsing code');
   });
 
+  it('recreates an authorized staged embedding table even when its snapshot has zero rows', async () => {
+    const mod = await import('../../src/core/run-analyze.js');
+    expect(
+      mod.shouldRecreateStagedEmbeddingTableForResume(true, {
+        count: 0,
+        dimensions: 0,
+        identitySha256: '0'.repeat(64),
+      }),
+    ).toBe(true);
+  });
+
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-fast-path-');
     try {
