@@ -42,9 +42,9 @@ describe('Claude hook machine-global concurrency cap', () => {
       const waitForGate = () => {
         if (!fs.existsSync(process.argv[3])) { setTimeout(waitForGate, 10); return; }
         const release = acquireHookSlot(process.argv[1]);
-        if (!release) { process.stdout.write('denied\\n'); process.exit(0); }
+        if (!release) { process.stdout.write('denied\\n'); return; }
         process.stdout.write('acquired\\n');
-        setTimeout(() => { release(); process.exit(0); }, 2000);
+        setTimeout(() => { release(); }, 2000);
       };
       waitForGate();
     `;
@@ -66,7 +66,7 @@ describe('Claude hook machine-global concurrency cap', () => {
           child.stdout.on('data', (chunk) => (stdout += String(chunk)));
           child.stderr.on('data', (chunk) => (stderr += String(chunk)));
           child.on('error', reject);
-          child.on('exit', (code) => {
+          child.on('close', (code) => {
             if (code !== 0) reject(new Error(stderr || `child exited ${code}`));
             else resolve(stdout.trim());
           });

@@ -1202,10 +1202,14 @@ const analyzeCommandImpl = async (
 
   if (
     options.incrementalOnly &&
-    (options.force || options.repairFts || options.repairVector || options.skills)
+    (options.force ||
+      options.repairFts ||
+      options.repairVector ||
+      options.dropEmbeddings ||
+      options.skills)
   ) {
     cliError(
-      '  Cannot combine `--incremental-only` with `--force`, `--repair-fts`, `--repair-vector`, or `--skills`. ' +
+      '  Cannot combine `--incremental-only` with `--force`, `--repair-fts`, `--repair-vector`, `--drop-embeddings`, or `--skills`. ' +
         'The preservation contract refuses every option that can require a full rebuild.\n',
     );
     process.exitCode = 1;
@@ -1467,6 +1471,27 @@ const analyzeCommandImpl = async (
         onLog: barLog,
       },
     );
+
+    if (result.recoveredPromotionOnly) {
+      await assertAnalysisFinalized(repoPath);
+      clearInterval(elapsedTimer);
+      process.removeListener('SIGINT', sigintHandler);
+      process.removeListener('SIGTERM', sigtermHandler);
+      await emitResourceEvent('complete', 'recovered-promotion-only', 100);
+      await closeResourceLog();
+      console.log = origLog;
+      // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
+      console.warn = origWarn;
+      // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
+      console.error = origError;
+      bar.stop();
+      console.log('  Recovered the previous staged promotion.');
+      console.log('  The current checkout was not analyzed in this recovery-only run.');
+      console.log(
+        '  Run `gitnexus analyze --staged --drop-embeddings` to build and promote a clean generation for the current checkout.\n',
+      );
+      return;
+    }
 
     if (result.alreadyUpToDate) {
       // Even the fast path must prove the repo is discoverable. A prior

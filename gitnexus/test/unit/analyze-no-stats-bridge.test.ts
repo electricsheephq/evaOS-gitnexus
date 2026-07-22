@@ -200,6 +200,18 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     expect(opts.incrementalOnly).toBe(true);
   });
 
+  it('rejects combining --incremental-only with --drop-embeddings', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { incrementalOnly: true, dropEmbeddings: true });
+
+    expect(process.exitCode).toBe(1);
+    expect(cliErrorMock).toHaveBeenCalledWith(
+      expect.stringMatching(/cannot combine `--incremental-only`.*`--drop-embeddings`/i),
+    );
+    expect(runFullAnalysisMock).not.toHaveBeenCalled();
+  });
+
   it('passes --staged through to runFullAnalysis', async () => {
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 

@@ -25,6 +25,7 @@ import {
 import { logger } from '../core/logger.js';
 import type { JobManager } from './analyze-job.js';
 import type { WorkerMessage } from './analyze-worker.js';
+import type { AnalyzeResultIpc } from './analyze-worker-ipc.js';
 
 const _require = createRequire(import.meta.url);
 
@@ -49,6 +50,24 @@ export interface LaunchOptions {
 }
 
 const MAX_WORKER_RETRIES = 2;
+
+const RECOVERY_ONLY_ERROR =
+  'Recovered a previous staged promotion, but the current checkout was not analyzed. ' +
+  'Start a new analysis with force=true and dropEmbeddings=true ' +
+  '(CLI: `gitnexus analyze --staged --drop-embeddings`).';
+
+/**
+ * Translate the worker's successful terminal result into the server job
+ * contract. Recovery-only is deliberately a failed analyze request: the prior
+ * promotion is durable, but reporting ordinary completion would claim that the
+ * current checkout was indexed when it was not.
+ */
+export const completionUpdateForWorkerResult = (
+  result: AnalyzeResultIpc,
+): { status: 'complete' | 'failed'; repoName: string; error?: string } =>
+  result.recoveredPromotionOnly
+    ? { status: 'failed', repoName: result.repoName, error: RECOVERY_ONLY_ERROR }
+    : { status: 'complete', repoName: result.repoName };
 
 /**
  * The worker reports `complete` over IPC before its on-disk finalization
@@ -182,19 +201,28 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           });
         } else if (msg.type === 'complete') {
           releaseRepoLock(analyzeLockKey);
-          // Before marking complete: (1) wait for the worker's on-disk
+          const terminalUpdate = completionUpdateForWorkerResult(msg.result);
+          // Before recording the terminal result: (1) wait for the worker's on-disk
           // finalization to settle (see waitForSettledIndex), (2) evict the
           // cached DB handle — same invalidation DELETE /api/repo performs, a
           // handle opened before the rewrite reads pre-rewrite state — and
           // only then (3) reinitialize the backend. This makes the ordering
           // comment below true in practice: the repo is actually queryable
           // when the client receives the SSE complete event.
-          waitForSettledIndex(targetPath, jobStartMs)
+          // A recovery-only result may merely clean a committed journal without
+          // rewriting the canonical DB/meta, so the normal mtime gate cannot
+          // prove this job's write and would wait the full timeout. The worker
+          // has already completed the journal transaction; evict/reload now,
+          // then fail the analyze request with explicit retry guidance.
+          const settle = msg.result.recoveredPromotionOnly
+            ? Promise.resolve()
+            : waitForSettledIndex(targetPath, jobStartMs);
+          settle
             .then(() => closeDbHandle())
             .catch(() => {}) // best-effort: eviction failure must not fail the job
             .then(() => backend.init())
             .then(() => {
-              jobManager.updateJob(job.id, { status: 'complete', repoName: msg.result.repoName });
+              jobManager.updateJob(job.id, terminalUpdate);
             })
             .catch((err) => {
               logger.error({ err }, 'backend.init() failed after analyze:');
