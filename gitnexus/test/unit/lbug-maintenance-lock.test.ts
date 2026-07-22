@@ -22,6 +22,7 @@ describe('LadybugDB maintenance open', () => {
     const preflightLbugSidecars = vi.fn(async () => {
       const record = JSON.parse(await fs.readFile(lockPath, 'utf8'));
       expect(record.pid).toBe(process.pid);
+      return { kind: 'clean' as const };
     });
     const closeLbugConnection = vi.fn(async () => undefined);
 
