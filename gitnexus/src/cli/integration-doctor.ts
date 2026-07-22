@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
 import { getEditorTargets, hookTarget, mcpTarget } from './editor-targets.js';
 import {
+  BEST_EFFORT_CLAUDE_HOOK_HELPERS,
   CLAUDE_HOOK_ADAPTER,
   CLAUDE_HOOK_HELPERS,
   formatHookCommand,
@@ -119,7 +120,11 @@ const gitnexusHookCommands = (hooks: unknown, eventName: string): string[] => {
     for (const hook of nested) {
       if (!hook || typeof hook !== 'object') continue;
       const command = (hook as { command?: unknown }).command;
-      if (typeof command === 'string' && command.includes('gitnexus-hook')) {
+      if (
+        typeof command === 'string' &&
+        (command.includes('gitnexus-hook') ||
+          (eventName === 'SessionStart' && command.includes('gitnexus session-context')))
+      ) {
         commands.push(command);
       }
     }
@@ -160,7 +165,11 @@ const claudeHookStatus = async (
 
   const sourceDir = path.join(__dirname, '..', '..', 'hooks', 'claude');
   const cliPath = path.resolve(path.join(__dirname, '..', 'cli', 'index.js'));
-  for (const fileName of [CLAUDE_HOOK_ADAPTER, ...CLAUDE_HOOK_HELPERS]) {
+  const freshnessFiles = [
+    CLAUDE_HOOK_ADAPTER,
+    ...CLAUDE_HOOK_HELPERS.filter((fileName) => !BEST_EFFORT_CLAUDE_HOOK_HELPERS.has(fileName)),
+  ];
+  for (const fileName of freshnessFiles) {
     const source = await readOptional(path.join(sourceDir, fileName));
     const installed = await readOptional(path.join(target.scriptDir, fileName));
     if (source === null || installed === null) return { status: 'missing', obsoleteSessionStart };
@@ -184,7 +193,7 @@ export async function buildIntegrationDoctorReport(
   let codexFingerprint: string | null = null;
   let invalid = false;
 
-  if (claudeRaw !== null) {
+  if (claudeRaw !== null && claudeRaw.trim().length > 0) {
     const errors: ParseError[] = [];
     const parsed = parseJsonc(claudeRaw, errors);
     invalid ||= errors.length > 0 || !parsed;

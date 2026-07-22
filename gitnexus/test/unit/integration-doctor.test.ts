@@ -102,12 +102,52 @@ describe('doctor --integrations', () => {
     });
   });
 
+  it('detects the legacy session-context hook while current tool hooks are installed', async () => {
+    await writeMatchingMcp();
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand({ codingAgent: ['claude'], hooksOnly: true });
+    const settingsPath = path.join(home, '.claude', 'settings.json');
+    const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8'));
+    settings.hooks.SessionStart = [
+      { hooks: [{ type: 'command', command: 'gitnexus session-context' }] },
+    ];
+    await fs.writeFile(settingsPath, JSON.stringify(settings));
+    const { buildIntegrationDoctorReport } = await import('../../src/cli/integration-doctor.js');
+
+    await expect(buildIntegrationDoctorReport(home)).resolves.toMatchObject({
+      hooks: { claude: 'current', obsoleteSessionStart: true },
+    });
+  });
+
+  it('ignores a missing best-effort hook helper when judging freshness', async () => {
+    await writeMatchingMcp();
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand({ codingAgent: ['claude'], hooksOnly: true });
+    await fs.rm(path.join(home, '.claude', 'hooks', 'gitnexus', 'win-rm-list-json.ps1'), {
+      force: true,
+    });
+    const { buildIntegrationDoctorReport } = await import('../../src/cli/integration-doctor.js');
+
+    await expect(buildIntegrationDoctorReport(home)).resolves.toMatchObject({
+      hooks: { claude: 'current' },
+    });
+  });
+
   it('treats an unrelated Codex config as a missing MCP integration', async () => {
     await fs.writeFile(path.join(home, '.codex', 'config.toml'), 'model = "gpt-5"\n');
     const { buildIntegrationDoctorReport } = await import('../../src/cli/integration-doctor.js');
 
     await expect(buildIntegrationDoctorReport(home)).resolves.toMatchObject({
       mcp: { status: 'missing', codexConfigured: false },
+    });
+  });
+
+  it('treats an empty Claude config as a missing MCP integration', async () => {
+    await fs.writeFile(path.join(home, '.claude.json'), '  \n');
+    const { buildIntegrationDoctorReport } = await import('../../src/cli/integration-doctor.js');
+
+    await expect(buildIntegrationDoctorReport(home)).resolves.toMatchObject({
+      mcp: { status: 'missing', claudeConfiguredEntries: 0 },
     });
   });
 

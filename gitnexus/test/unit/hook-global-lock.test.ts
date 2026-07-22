@@ -5,6 +5,15 @@ import { spawn } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const helperPath = path.resolve(__dirname, '..', '..', 'hooks', 'claude', 'hook-lock.cjs');
+const pluginHelperPath = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  'gitnexus-claude-plugin',
+  'hooks',
+  'hook-lock.js',
+);
 
 describe('Claude hook machine-global concurrency cap', () => {
   const roots: string[] = [];
@@ -90,4 +99,42 @@ describe('Claude hook machine-global concurrency cap', () => {
       expect(orphaned).toEqual([]);
     }
   }, 30_000);
+
+  it('applies the same eight-slot global cap to the standalone Claude plugin helper', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-plugin-hook-global-cap-'));
+    roots.push(root);
+    const globalDir = path.join(root, 'global-locks');
+    const script = `
+      const fs = require('fs');
+      const path = require('path');
+      const { acquireHookSlot } = require(${JSON.stringify(pluginHelperPath)});
+      const releases = [];
+      for (let index = 0; index < 9; index++) {
+        const repo = path.join(process.argv[1], 'repo-' + index, '.gitnexus');
+        fs.mkdirSync(repo, { recursive: true });
+        const release = acquireHookSlot(repo);
+        if (release) releases.push(release);
+      }
+      process.stdout.write(String(releases.length));
+      for (const release of releases) release();
+    `;
+    const outcome = await new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ['-e', script, root], {
+        env: { ...process.env, GITNEXUS_HOOK_GLOBAL_LOCK_DIR: globalDir },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => (stdout += String(chunk)));
+      child.stderr.on('data', (chunk) => (stderr += String(chunk)));
+      child.on('error', reject);
+      child.on('exit', (code) => {
+        if (code !== 0) reject(new Error(stderr || `child exited ${code}`));
+        else resolve(stdout.trim());
+      });
+    });
+
+    expect(outcome).toBe('8');
+    expect(fs.readdirSync(globalDir).filter((entry) => entry.endsWith('.lock'))).toEqual([]);
+  });
 });
