@@ -1125,20 +1125,58 @@ const runFullAnalysisImpl = async (
     }
     progress('lbug', 1, 'Recovering staged promotion...');
     await validatePendingPromotionEmbeddingCandidate(promotionPaths);
-    await promoteStagedGeneration(promotionPaths, commitStagedMetadataAndRegistry, {
-      readRepositoryIdentity,
-    });
+    const recoveredPromotion = await promoteStagedGeneration(
+      promotionPaths,
+      commitStagedMetadataAndRegistry,
+      {
+        readRepositoryIdentity,
+      },
+    );
     log('Recovered and completed the previous staged promotion.');
     const recoveredMeta = await loadMeta(canonicalMetaDir);
     if (!recoveredMeta) {
       throw new Error('Recovered staged promotion is missing canonical metadata.');
     }
+    const recoveredRepoName =
+      recoveredPromotion.projectName ??
+      options.registryName ??
+      getInferredRepoName(repoPath) ??
+      path.basename(resolveRepoIdentityRoot(repoPath));
+
+    // Recovery completes the same canonical promotion as the normal finalize
+    // path, so finish its source-side bookkeeping before returning the explicit
+    // recovery-only result. Context generation is best-effort, matching the
+    // ordinary successful path.
+    await ensureGitNexusIgnored(repoPath);
+    if (!placement.branch) {
+      try {
+        await generateAIContextFiles(
+          repoPath,
+          storagePath,
+          recoveredRepoName,
+          {
+            files: recoveredMeta.stats?.files,
+            nodes: recoveredMeta.stats?.nodes,
+            edges: recoveredMeta.stats?.edges,
+            communities: recoveredMeta.stats?.communities,
+            processes: recoveredMeta.stats?.processes,
+          },
+          undefined,
+          {
+            skipAgentsMd: options.skipAgentsMd,
+            skipSkills: options.skipSkills,
+            noStats: options.noStats,
+            defaultBranch: options.defaultBranch,
+            hasPdg: recoveredMeta.pdg !== undefined,
+          },
+        );
+      } catch {
+        // Best-effort — the recovered canonical index remains valid.
+      }
+    }
     progress('done', 100, 'Recovered staged promotion');
     return {
-      repoName:
-        options.registryName ??
-        getInferredRepoName(repoPath) ??
-        path.basename(resolveRepoIdentityRoot(repoPath)),
+      repoName: recoveredRepoName,
       repoPath,
       stats: recoveredMeta.stats ?? {},
       recoveredPromotionOnly: true,
@@ -3224,6 +3262,12 @@ export async function runFullAnalysis(
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
 ): Promise<AnalyzeResult> {
+  if (options.incrementalOnly && options.dropEmbeddings) {
+    throw new Error(
+      'Cannot combine `--incremental-only` with `--drop-embeddings`. ' +
+        'The preservation contract refuses every option that can require a clean rebuild.',
+    );
+  }
   if (options.repairVector) {
     const conflicts = [
       options.force && '--force',

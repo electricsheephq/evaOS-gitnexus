@@ -57,6 +57,28 @@ describe('runFullAnalysis --staged', () => {
     );
   });
 
+  it('rejects incremental-only drop before creating staged storage', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-conflict-'));
+    tempDirs.push(repo);
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+
+    await expect(
+      runFullAnalysis(
+        repo,
+        { staged: true, incrementalOnly: true, dropEmbeddings: true },
+        { onProgress: () => {} },
+      ),
+    ).rejects.toThrow(/cannot combine `--incremental-only` with `--drop-embeddings`/i);
+    await expect(fs.access(path.join(repo, '.gitnexus'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('refuses a full staged write when metadata hides physical embeddings', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-no-restore-'));
     tempDirs.push(repo);
@@ -538,16 +560,27 @@ describe('runFullAnalysis --staged', () => {
         },
       }),
     ).rejects.toThrow('simulated crash');
+    await fs.rm(path.join(canonical.storagePath, '.gitignore'), { force: true });
+    await fs.rm(path.join(repo, 'AGENTS.md'), { force: true });
+    await fs.rm(path.join(repo, 'CLAUDE.md'), { force: true });
 
     const result = await runFullAnalysis(
       repo,
-      { staged: true, skipAgentsMd: true, skipSkills: true },
+      { staged: true, skipSkills: true },
       { onProgress: () => {} },
     );
 
     expect(result.recoveredPromotionOnly).toBe(true);
     expect(result.alreadyUpToDate).not.toBe(true);
     expect((await loadMeta(canonical.storagePath))?.indexedAt).toBe(recoveredAt);
+    await expect(fs.readFile(path.join(canonical.storagePath, '.gitignore'), 'utf8')).resolves.toBe(
+      '*\n',
+    );
+    await expect(fs.readFile(path.join(repo, '.git', 'info', 'exclude'), 'utf8')).resolves.toMatch(
+      /\.gitnexus\//,
+    );
+    await expect(fs.access(path.join(repo, 'AGENTS.md'))).resolves.toBeUndefined();
+    await expect(fs.access(path.join(repo, 'CLAUDE.md'))).resolves.toBeUndefined();
     await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });

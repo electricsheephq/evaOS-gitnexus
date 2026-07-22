@@ -1202,10 +1202,14 @@ const analyzeCommandImpl = async (
 
   if (
     options.incrementalOnly &&
-    (options.force || options.repairFts || options.repairVector || options.skills)
+    (options.force ||
+      options.repairFts ||
+      options.repairVector ||
+      options.dropEmbeddings ||
+      options.skills)
   ) {
     cliError(
-      '  Cannot combine `--incremental-only` with `--force`, `--repair-fts`, `--repair-vector`, or `--skills`. ' +
+      '  Cannot combine `--incremental-only` with `--force`, `--repair-fts`, `--repair-vector`, `--drop-embeddings`, or `--skills`. ' +
         'The preservation contract refuses every option that can require a full rebuild.\n',
     );
     process.exitCode = 1;
