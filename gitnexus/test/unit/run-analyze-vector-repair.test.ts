@@ -1,11 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
-  getStoragePaths,
-  saveMeta,
-  type RepoMeta,
-} from '../../src/storage/repo-manager.js';
+import { getStoragePaths, saveMeta, type RepoMeta } from '../../src/storage/repo-manager.js';
 import { createTempDir } from '../helpers/test-db.js';
 
 const healthyProbe = {
@@ -53,6 +49,7 @@ async function importRepairSubject(options: {
   probes?: Array<typeof healthyProbe | typeof brokenProbe>;
   vectorAvailable?: boolean;
   createError?: Error;
+  afterInitialPreflight?: () => Promise<void> | void;
 }) {
   const counts = [...(options.counts ?? [3, 3])];
   const probes = [...(options.probes ?? [brokenProbe, healthyProbe])];
@@ -85,6 +82,16 @@ async function importRepairSubject(options: {
     EXPECTED_POOL_CONNECTIONS: 8,
     probeDoctorPool,
   }));
+  vi.doMock('../../src/core/staged-promotion.js', async (importActual) => {
+    const actual = await importActual<typeof import('../../src/core/staged-promotion.js')>();
+    return {
+      ...actual,
+      withAnalyzeOwnershipLock: vi.fn(async (_storagePath, callback) => {
+        await options.afterInitialPreflight?.();
+        return callback();
+      }),
+    };
+  });
   vi.doMock('../../src/storage/repo-manager.js', async (importActual) => ({
     ...(await importActual<typeof import('../../src/storage/repo-manager.js')>()),
     registerRepo,
@@ -110,6 +117,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
   afterEach(() => {
     vi.doUnmock('../../src/core/lbug/lbug-adapter.js');
     vi.doUnmock('../../src/cli/doctor-pool-probe.js');
+    vi.doUnmock('../../src/core/staged-promotion.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
     vi.resetModules();
     vi.clearAllMocks();
@@ -161,7 +169,9 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       expect(mocks.dropVectorIndex).not.toHaveBeenCalled();
       expect(mocks.createVectorIndex).not.toHaveBeenCalled();
       expect(mocks.registerRepo).not.toHaveBeenCalled();
-      expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(before);
+      expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(
+        before,
+      );
     } finally {
       await indexed.fixture.cleanup();
     }
@@ -173,16 +183,14 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       const before = await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'));
       const { runFullAnalysis, mocks } = await importRepairSubject({ vectorAvailable: false });
       await expect(
-        runFullAnalysis(
-          indexed.fixture.dbPath,
-          { repairVector: true },
-          { onProgress: () => {} },
-        ),
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
       ).rejects.toThrow(/VECTOR extension is unavailable/i);
       expect(mocks.dropVectorIndex).not.toHaveBeenCalled();
       expect(mocks.createVectorIndex).not.toHaveBeenCalled();
       expect(mocks.registerRepo).not.toHaveBeenCalled();
-      expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(before);
+      expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(
+        before,
+      );
     } finally {
       await indexed.fixture.cleanup();
     }
@@ -196,14 +204,12 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
         createError: new Error('simulated HNSW failure'),
       });
       await expect(
-        runFullAnalysis(
-          indexed.fixture.dbPath,
-          { repairVector: true },
-          { onProgress: () => {} },
-        ),
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
       ).rejects.toThrow(/simulated HNSW failure/);
       expect(mocks.registerRepo).not.toHaveBeenCalled();
-      expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(before);
+      expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(
+        before,
+      );
     } finally {
       await indexed.fixture.cleanup();
     }
@@ -235,11 +241,24 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       await fs.writeFile(`${indexed.paths.lbugPath}.wal`, 'unresolved');
       const { runFullAnalysis, mocks } = await importRepairSubject({});
       await expect(
-        runFullAnalysis(
-          indexed.fixture.dbPath,
-          { repairVector: true },
-          { onProgress: () => {} },
-        ),
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/lock or recovery state is present/i);
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('rechecks recovery state after acquiring analyze ownership', async () => {
+    const indexed = await createIndexedFixture();
+    try {
+      const { runFullAnalysis, mocks } = await importRepairSubject({
+        afterInitialPreflight: async () => {
+          await fs.writeFile(`${indexed.paths.lbugPath}.wal`, 'intervening-writer');
+        },
+      });
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
       ).rejects.toThrow(/lock or recovery state is present/i);
       expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
     } finally {

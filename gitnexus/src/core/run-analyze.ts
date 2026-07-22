@@ -787,9 +787,8 @@ const runFullAnalysisImpl = async (
     const existingMeta = await loadMeta(canonicalMetaDir);
     if (!existingMeta) throw new Error('Cannot repair VECTOR: index metadata is missing.');
 
-    const { probeDoctorPool, EXPECTED_POOL_CONNECTIONS } = await import(
-      '../cli/doctor-pool-probe.js'
-    );
+    const { probeDoctorPool, EXPECTED_POOL_CONNECTIONS } =
+      await import('../cli/doctor-pool-probe.js');
     const beforeProbe = await probeDoctorPool(canonicalPaths.lbugPath);
     let stats: { nodes: number; edges: number } = { nodes: 0, edges: 0 };
     let embeddingCountBefore = 0;
@@ -798,9 +797,7 @@ const runFullAnalysisImpl = async (
     try {
       await initLbugForMaintenance(canonicalPaths.lbugPath);
       stats = await getLbugStats();
-      const rows = await executeQuery(
-        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
-      );
+      const rows = await executeQuery(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`);
       const row = rows[0];
       embeddingCountBefore = Number(row?.cnt ?? row?.[0] ?? 0);
       if (!Number.isSafeInteger(embeddingCountBefore) || embeddingCountBefore < 0) {
@@ -2906,10 +2903,14 @@ export async function runFullAnalysis(
   if (options.repairVector) await assertVectorRepairPreflight(repoPath);
 
   const { storagePath } = getStoragePaths(repoPath);
-  return withAnalyzeOwnershipLock(storagePath, () =>
-    runFullAnalysisImpl(repoPath, options, callbacks, {
+  return withAnalyzeOwnershipLock(storagePath, async () => {
+    // The first preflight avoids creating an ownership lock for a known-dirty
+    // index. Repeat it after lock acquisition because a writer may have run
+    // while this command was waiting and left new recovery or dirty state.
+    if (options.repairVector) await assertVectorRepairPreflight(repoPath);
+    return runFullAnalysisImpl(repoPath, options, callbacks, {
       repoHasGit,
       remoteUrl: repositoryRemoteUrl,
-    }),
-  );
+    });
+  });
 }

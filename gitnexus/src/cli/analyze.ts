@@ -1184,7 +1184,7 @@ const analyzeCommandImpl = async (
       options.staged && '--staged',
       options.incrementalOnly && '--incremental-only',
       options.repairFts && '--repair-fts',
-      options.embeddings !== undefined && '--embeddings',
+      options.embeddings === true && '--embeddings',
       options.dropEmbeddings && '--drop-embeddings',
       options.skills && '--skills',
       options.pdg && '--pdg',
@@ -1544,7 +1544,9 @@ const analyzeCommandImpl = async (
       console.error = origError;
       bar.stop();
       if (result.vectorRepairStatus === 'not-indexed') {
-        console.log('  VECTOR: not-indexed (database has zero embeddings; no mutation performed)\n');
+        console.log(
+          '  VECTOR: not-indexed (database has zero embeddings; no mutation performed)\n',
+        );
       } else if (result.vectorRepairStatus === 'healthy') {
         console.log('  VECTOR index already healthy; counts reconciled successfully\n');
       } else {

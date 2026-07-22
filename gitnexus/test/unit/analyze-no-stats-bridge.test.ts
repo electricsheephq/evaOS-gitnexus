@@ -137,6 +137,19 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     expect(opts.repairVector).toBe(true);
   });
 
+  it('allows --repair-vector when repository config disables embeddings', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { repairVector: true, embeddings: false });
+
+    expect(process.exitCode).not.toBe(1);
+    expect(runFullAnalysisMock).toHaveBeenCalledOnce();
+    expect(runFullAnalysisMock.mock.calls[0][1]).toMatchObject({
+      repairVector: true,
+      embeddings: false,
+    });
+  });
+
   it.each([
     ['--force', { force: true }],
     ['--staged', { staged: true }],
