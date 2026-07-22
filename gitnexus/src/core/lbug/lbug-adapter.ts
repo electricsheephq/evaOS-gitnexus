@@ -696,22 +696,22 @@ export const initLbug = async (dbPath: string) => {
  */
 export const initLbugForMaintenance = async (dbPath: string) =>
   runWithSessionLock(async () => {
-    if (conn || db) await safeClose();
-    resetOpenConnectionState();
-
-    const state = await fs.lstat(dbPath);
-    if (!state.isFile() || state.isSymbolicLink()) {
-      throw new Error(`Maintenance requires a regular, non-symlink database file at ${dbPath}`);
-    }
-
-    await preflightLbugSidecars(dbPath, {
-      mode: 'write',
-      logger,
-      allowQuarantine: false,
-    });
-
     const releaseInitLock = await acquireInitLock(dbPath);
     try {
+      if (conn || db) await safeClose();
+      resetOpenConnectionState();
+
+      const state = await fs.lstat(dbPath);
+      if (!state.isFile() || state.isSymbolicLink()) {
+        throw new Error(`Maintenance requires a regular, non-symlink database file at ${dbPath}`);
+      }
+
+      await preflightLbugSidecars(dbPath, {
+        mode: 'write',
+        logger,
+        allowQuarantine: false,
+      });
+
       const opened = await openLbugConnection(lbug, dbPath);
       db = opened.db;
       conn = opened.conn;

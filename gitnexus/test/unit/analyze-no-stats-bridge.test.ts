@@ -1,21 +1,28 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runFullAnalysisMock, generateAIContextFilesMock, generateSkillFilesMock, cliErrorMock } =
-  vi.hoisted(() => {
-    const runFullAnalysisMock = vi.fn();
-    const generateAIContextFilesMock = vi.fn(async () => ({ files: [] as string[] }));
-    const generateSkillFilesMock = vi.fn(async () => ({
-      skills: [{ name: 'c', label: 'Community', symbolCount: 1, fileCount: 1 }],
-      outputPath: '/repo/.claude/skills/generated',
-    }));
-    const cliErrorMock = vi.fn();
-    return {
-      runFullAnalysisMock,
-      generateAIContextFilesMock,
-      generateSkillFilesMock,
-      cliErrorMock,
-    };
-  });
+const {
+  runFullAnalysisMock,
+  generateAIContextFilesMock,
+  generateSkillFilesMock,
+  cliErrorMock,
+  installEmbeddingRuntimeMock,
+} = vi.hoisted(() => {
+  const runFullAnalysisMock = vi.fn();
+  const generateAIContextFilesMock = vi.fn(async () => ({ files: [] as string[] }));
+  const generateSkillFilesMock = vi.fn(async () => ({
+    skills: [{ name: 'c', label: 'Community', symbolCount: 1, fileCount: 1 }],
+    outputPath: '/repo/.claude/skills/generated',
+  }));
+  const cliErrorMock = vi.fn();
+  const installEmbeddingRuntimeMock = vi.fn();
+  return {
+    runFullAnalysisMock,
+    generateAIContextFilesMock,
+    generateSkillFilesMock,
+    cliErrorMock,
+    installEmbeddingRuntimeMock,
+  };
+});
 
 vi.mock('../../src/core/run-analyze.js', () => ({
   runFullAnalysis: runFullAnalysisMock,
@@ -31,6 +38,15 @@ vi.mock('../../src/cli/skill-gen.js', () => ({
 
 vi.mock('../../src/cli/cli-message.js', () => ({
   cliError: cliErrorMock,
+}));
+
+vi.mock('../../src/core/embeddings/runtime-install.js', () => ({
+  ANALYZE_EMBEDDING_INSTALL_TIMEOUT_MS: 30_000,
+  getEmbeddingInstallTimeoutMs: vi.fn(() => 30_000),
+  getEmbeddingRuntimeDir: vi.fn(() => '/tmp/gitnexus-embedding-runtime'),
+  installEmbeddingRuntime: installEmbeddingRuntimeMock,
+  isPrefixRuntimeLoadable: vi.fn(() => true),
+  resolveEmbeddingRuntime: vi.fn(() => null),
 }));
 
 vi.mock('../../src/core/lbug/lbug-adapter.js', () => ({
@@ -77,6 +93,7 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
       outputPath: '/repo/.claude/skills/generated',
     });
     cliErrorMock.mockReset();
+    installEmbeddingRuntimeMock.mockReset();
     process.exitCode = undefined;
     process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ?? ''} --max-old-space-size=8192`.trim();
   });
@@ -156,6 +173,7 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     ['--incremental-only', { incrementalOnly: true }],
     ['--repair-fts', { repairFts: true }],
     ['--embeddings', { embeddings: true }],
+    ['--embeddings 100', { embeddings: '100' }],
     ['--drop-embeddings', { dropEmbeddings: true }],
     ['--skills', { skills: true }],
     ['--pdg', { pdg: true }],
@@ -170,6 +188,7 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
       expect.stringMatching(/cannot combine `--repair-vector`/i),
     );
     expect(runFullAnalysisMock).not.toHaveBeenCalled();
+    expect(installEmbeddingRuntimeMock).not.toHaveBeenCalled();
   });
 
   it('passes --incremental-only through to runFullAnalysis', async () => {

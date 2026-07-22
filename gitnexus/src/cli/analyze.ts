@@ -896,6 +896,28 @@ const analyzeCommandImpl = async (
     return;
   }
 
+  // Reject repair-only conflicts before any embedding runtime setup or
+  // endpoint mutation. Commander represents --embeddings N as a string, so
+  // every defined value except explicit false is a conflicting request.
+  if (options.repairVector) {
+    const conflicts = [
+      options.force && '--force',
+      options.staged && '--staged',
+      options.incrementalOnly && '--incremental-only',
+      options.repairFts && '--repair-fts',
+      options.embeddings !== undefined && options.embeddings !== false && '--embeddings',
+      options.dropEmbeddings && '--drop-embeddings',
+      options.skills && '--skills',
+      options.pdg && '--pdg',
+      options.branch && '--branch',
+    ].filter((value): value is string => typeof value === 'string');
+    if (conflicts.length > 0) {
+      cliError(`  Cannot combine \`--repair-vector\` with ${conflicts.join(', ')}.\n`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   if (options.verbose) {
     process.env.GITNEXUS_VERBOSE = '1';
   }
@@ -1176,25 +1198,6 @@ const analyzeCommandImpl = async (
     );
     process.exitCode = 1;
     return;
-  }
-
-  if (options.repairVector) {
-    const conflicts = [
-      options.force && '--force',
-      options.staged && '--staged',
-      options.incrementalOnly && '--incremental-only',
-      options.repairFts && '--repair-fts',
-      options.embeddings === true && '--embeddings',
-      options.dropEmbeddings && '--drop-embeddings',
-      options.skills && '--skills',
-      options.pdg && '--pdg',
-      options.branch && '--branch',
-    ].filter((value): value is string => typeof value === 'string');
-    if (conflicts.length > 0) {
-      cliError(`  Cannot combine \`--repair-vector\` with ${conflicts.join(', ')}.\n`);
-      process.exitCode = 1;
-      return;
-    }
   }
 
   if (

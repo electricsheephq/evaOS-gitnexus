@@ -348,7 +348,10 @@ const lstatIfPresent = async (targetPath: string) => {
  * stale state. A second writer that appears after this check is still excluded
  * by the ownership/init/database locks.
  */
-export const assertVectorRepairPreflight = async (repoPath: string): Promise<RepoMeta> => {
+export const assertVectorRepairPreflight = async (
+  repoPath: string,
+  options: { allowAnalyzeOwnershipLock?: boolean } = {},
+): Promise<RepoMeta> => {
   const paths = getStoragePaths(repoPath);
   const storageState = await lstatIfPresent(paths.storagePath);
   if (!storageState) {
@@ -374,7 +377,7 @@ export const assertVectorRepairPreflight = async (repoPath: string): Promise<Rep
 
   const promotion = getStagedAnalyzePaths(paths.lbugPath, path.dirname(paths.metaPath));
   const blockedArtifacts = [
-    path.join(paths.storagePath, 'analyze-staged.lock'),
+    !options.allowAnalyzeOwnershipLock && path.join(paths.storagePath, 'analyze-staged.lock'),
     `${paths.lbugPath}.init.lock`,
     `${paths.lbugPath}.lock`,
     `${paths.lbugPath}.wal`,
@@ -384,7 +387,7 @@ export const assertVectorRepairPreflight = async (repoPath: string): Promise<Rep
     promotion.stageIntentPath,
     promotion.stageRoot,
     promotion.backupLbugPath,
-  ];
+  ].filter((artifact): artifact is string => typeof artifact === 'string');
   for (const artifact of blockedArtifacts) {
     if (await lstatIfPresent(artifact)) {
       throw new Error(
@@ -2907,7 +2910,9 @@ export async function runFullAnalysis(
     // The first preflight avoids creating an ownership lock for a known-dirty
     // index. Repeat it after lock acquisition because a writer may have run
     // while this command was waiting and left new recovery or dirty state.
-    if (options.repairVector) await assertVectorRepairPreflight(repoPath);
+    if (options.repairVector) {
+      await assertVectorRepairPreflight(repoPath, { allowAnalyzeOwnershipLock: true });
+    }
     return runFullAnalysisImpl(repoPath, options, callbacks, {
       repoHasGit,
       remoteUrl: repositoryRemoteUrl,

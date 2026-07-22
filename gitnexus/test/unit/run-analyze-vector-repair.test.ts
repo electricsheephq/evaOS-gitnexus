@@ -87,8 +87,14 @@ async function importRepairSubject(options: {
     return {
       ...actual,
       withAnalyzeOwnershipLock: vi.fn(async (_storagePath, callback) => {
-        await options.afterInitialPreflight?.();
-        return callback();
+        const ownershipLock = path.join(_storagePath, 'analyze-staged.lock');
+        await fs.writeFile(ownershipLock, 'owned-by-test');
+        try {
+          await options.afterInitialPreflight?.();
+          return await callback();
+        } finally {
+          await fs.rm(ownershipLock, { force: true });
+        }
       }),
     };
   });
