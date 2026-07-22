@@ -62,6 +62,19 @@ describe('#2112: analyze-worker IPC projection', () => {
     expect(roundTripped.stats.nodes).toBe(1);
   });
 
+  it('preserves the recovery-only discriminator across the worker IPC boundary', () => {
+    const projected = projectAnalyzeResultForIpc({
+      repoName: 'demo',
+      repoPath: '/repos/demo',
+      stats: {},
+      recoveredPromotionOnly: true,
+    });
+    expect(JSON.parse(JSON.stringify(projected))).toMatchObject({
+      repoName: 'demo',
+      recoveredPromotionOnly: true,
+    });
+  });
+
   it('anchors the hazard: serializing the RAW result throws (the bug the projection prevents)', () => {
     // Without the projection, `send({type:'complete', result})` would throw a
     // TypeError in the worker, get caught, and mis-report this success as a
