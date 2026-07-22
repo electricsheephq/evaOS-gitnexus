@@ -110,9 +110,7 @@ const codexMcpFingerprint = (raw: string): string | null => {
     }
   }
   const env: Record<string, string> = {};
-  const envMatch = raw.match(
-    /(?:^|\n)\[mcp_servers\.gitnexus\.env\]\s*\n([\s\S]*?)(?=\n\[|$)/,
-  );
+  const envMatch = raw.match(/(?:^|\n)\[mcp_servers\.gitnexus\.env\]\s*\n([\s\S]*?)(?=\n\[|$)/);
   if (envMatch) {
     for (const line of envMatch[1].split('\n')) {
       if (/^\s*(?:#.*)?$/.test(line)) continue;
@@ -120,9 +118,7 @@ const codexMcpFingerprint = (raw: string): string | null => {
         /^\s*([A-Za-z_][A-Za-z0-9_]*|"(?:[^"\\]|\\.)*")\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/,
       );
       if (!assignment) return null;
-      const key = assignment[1].startsWith('"')
-        ? parseTomlString(assignment[1])
-        : assignment[1];
+      const key = assignment[1].startsWith('"') ? parseTomlString(assignment[1]) : assignment[1];
       const value = parseTomlString(assignment[2]);
       if (key === null || value === null) return null;
       env[key] = value;
