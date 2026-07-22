@@ -35,6 +35,7 @@ import {
   LbugWipeError,
   DELETE_FILES_CHUNK_SIZE,
 } from './lbug/lbug-adapter.js';
+import { estimateBufferPool, setBufferPoolSizeHint } from './lbug/lbug-config.js';
 import { escapeCypherString } from './lbug/cypher-escape.js';
 import {
   createSearchFTSIndexes,
@@ -676,6 +677,9 @@ const runFullAnalysisImpl = async (
   const branchLabel = options.branch ?? checkedOutBranch;
   const placement = options.branch ? await resolveBranchPlacement(repoPath, branchLabel) : {};
   const canonicalPaths = getStoragePaths(repoPath, placement.branch);
+  // Prevent a previous analyze in the same process from leaking its graph hint
+  // into any pre-pipeline database open in this run.
+  setBufferPoolSizeHint(undefined);
   const canonicalMetaDir = path.dirname(canonicalPaths.metaPath);
   const promotionPaths = getStagedAnalyzePaths(canonicalPaths.lbugPath, canonicalMetaDir);
   const stagedPaths: StagedAnalyzePaths | undefined = options.staged ? promotionPaths : undefined;
@@ -1551,6 +1555,10 @@ const runFullAnalysisImpl = async (
     // a still-populated DB this run believes it wiped.
     await wipeLbugDbFiles(lbugPath);
   }
+
+  setBufferPoolSizeHint(
+    estimateBufferPool(pipelineResult.graph.nodeCount + pipelineResult.graph.relationshipCount),
+  );
 
   if (options.incrementalOnly) {
     await withLbugDb(lbugPath, async () => undefined, { readOnly: true });
