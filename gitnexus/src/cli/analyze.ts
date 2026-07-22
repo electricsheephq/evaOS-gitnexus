@@ -1468,6 +1468,27 @@ const analyzeCommandImpl = async (
       },
     );
 
+    if (result.recoveredPromotionOnly) {
+      await assertAnalysisFinalized(repoPath);
+      clearInterval(elapsedTimer);
+      process.removeListener('SIGINT', sigintHandler);
+      process.removeListener('SIGTERM', sigtermHandler);
+      await emitResourceEvent('complete', 'recovered-promotion-only', 100);
+      await closeResourceLog();
+      console.log = origLog;
+      // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
+      console.warn = origWarn;
+      // eslint-disable-next-line no-console -- restoring after intentional progress-bar routing
+      console.error = origError;
+      bar.stop();
+      console.log('  Recovered the previous staged promotion.');
+      console.log('  The current checkout was not analyzed in this recovery-only run.');
+      console.log(
+        '  Run `gitnexus analyze --staged --drop-embeddings` to build and promote a clean generation for the current checkout.\n',
+      );
+      return;
+    }
+
     if (result.alreadyUpToDate) {
       // Even the fast path must prove the repo is discoverable. A prior
       // run can write meta.json and then fail before registerRepo(); in

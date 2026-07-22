@@ -46,6 +46,7 @@ describe('#2112: analyze-worker IPC projection', () => {
       repoPath: '/repos/demo',
       stats: { files: 3, nodes: 1, edges: 0 },
       alreadyUpToDate: false,
+      recoveredPromotionOnly: undefined,
       ftsRepairedOnly: undefined,
       ftsSkipped: true,
     });

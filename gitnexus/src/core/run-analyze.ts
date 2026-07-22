@@ -463,6 +463,12 @@ export interface AnalyzeResult {
     embeddings?: number;
   };
   alreadyUpToDate?: boolean;
+  /**
+   * True when this invocation only completed a previously journaled staged
+   * promotion. The recovered generation is durable and registered, but the
+   * current checkout was deliberately not analyzed in the same invocation.
+   */
+  recoveredPromotionOnly?: boolean;
   /** The raw pipeline result — only populated when needed by callers (e.g. skill generation). */
   pipelineResult?: any;
   /** True when analyze only repaired FTS indexes and skipped pipeline re-analysis. */
@@ -1111,7 +1117,6 @@ const runFullAnalysisImpl = async (
   // promotion journal before any fast path can report success. In particular,
   // a crash at old-backed-up may leave the canonical pathname temporarily
   // absent even when metadata still looks current.
-  let recoveredPendingPromotion = false;
   if (await hasPendingPromotion(promotionPaths)) {
     if (options.incrementalOnly) {
       throw new Error(
@@ -1123,26 +1128,7 @@ const runFullAnalysisImpl = async (
     await promoteStagedGeneration(promotionPaths, commitStagedMetadataAndRegistry, {
       readRepositoryIdentity,
     });
-    recoveredPendingPromotion = true;
     log('Recovered and completed the previous staged promotion.');
-  }
-
-  // Analyze indexes the working tree, not an arbitrary ref. Recover a pending
-  // staged promotion first so a crash cannot leave the canonical pathname
-  // absent merely because the user switched branches before retrying. Once
-  // recovery is complete, refuse to start a new build for a mismatched label.
-  if (options.branch && checkedOutBranch && options.branch !== checkedOutBranch) {
-    throw new Error(
-      `--branch "${options.branch}" does not match the checked-out branch "${checkedOutBranch}". ` +
-        `Check out "${options.branch}" before indexing it, or omit --branch to index the current branch.`,
-    );
-  }
-
-  if (stagedPaths && options.repairFts) {
-    throw new Error('`--staged` cannot be combined with `--repair-fts`; repair is in-place only.');
-  }
-
-  if (recoveredPendingPromotion) {
     const recoveredMeta = await loadMeta(canonicalMetaDir);
     if (!recoveredMeta) {
       throw new Error('Recovered staged promotion is missing canonical metadata.');
@@ -1155,14 +1141,27 @@ const runFullAnalysisImpl = async (
         path.basename(resolveRepoIdentityRoot(repoPath)),
       repoPath,
       stats: recoveredMeta.stats ?? {},
-      alreadyUpToDate: true,
+      recoveredPromotionOnly: true,
       isPrimaryBranch: !placement.branch,
     };
   }
 
-  let stagedWorkspaceResumed = false;
+  // Analyze indexes the working tree, not an arbitrary ref. A journal recovery
+  // above is intentionally terminal: combining crash recovery with a second
+  // source build recreates the ambiguous lifecycle that staged mode is meant to
+  // avoid. The caller must start a fresh explicit analyze for the current tree.
+  if (options.branch && checkedOutBranch && options.branch !== checkedOutBranch) {
+    throw new Error(
+      `--branch "${options.branch}" does not match the checked-out branch "${checkedOutBranch}". ` +
+        `Check out "${options.branch}" before indexing it, or omit --branch to index the current branch.`,
+    );
+  }
+
+  if (stagedPaths && options.repairFts) {
+    throw new Error('`--staged` cannot be combined with `--repair-fts`; repair is in-place only.');
+  }
+
   let stagedWorkspaceExisted = false;
-  let promoteCompletedStageFastPath = false;
   let canonicalDatabaseExistedAtStageStart = false;
   let canonicalMetaAtStageStart: RepoMeta | null = null;
   if (stagedPaths) {
@@ -1177,20 +1176,11 @@ const runFullAnalysisImpl = async (
     canonicalDatabaseExistedAtStageStart = canonicalDatabaseStateAtStart !== null;
 
     if (stagedWorkspaceExisted && !options.dropEmbeddings) {
-      const stagedMetaAtStart = await loadMeta(stagedPaths.stagedMetaDir);
-      const mayBeCompletedCandidate =
-        stagedSourceAtStart.matchesSource &&
-        !!stagedMetaAtStart &&
-        !stagedMetaAtStart.incrementalInProgress &&
-        !stagedMetaAtStart.embeddingCheckpoint &&
-        stagedMetaAtStart.lastCommit === currentCommit;
-      if (!mayBeCompletedCandidate) {
-        throw new Error(
-          'An incomplete or source-mismatched staged generation already exists. It was left ' +
-            'untouched for forensics. Re-run with `--drop-embeddings` only when replacing that ' +
-            'derived stage with a clean isolated generation is intentional.',
-        );
-      }
+      throw new Error(
+        'An unjournaled staged generation already exists. It was left untouched for forensics ' +
+          'and will not be promoted or resumed automatically. Re-run with `--drop-embeddings` ' +
+          'only when replacing that derived stage with a clean isolated generation is intentional.',
+      );
     }
     if (
       !stagedWorkspaceExisted &&
@@ -1209,7 +1199,6 @@ const runFullAnalysisImpl = async (
       canonicalMetaAtStageStart,
       repositorySource,
     );
-    stagedWorkspaceResumed = prepared.resumed;
     log(
       prepared.resumed
         ? 'Resuming the existing staged generation; the canonical index remains untouched.'
@@ -1229,45 +1218,15 @@ const runFullAnalysisImpl = async (
   // needed for a surgical incremental write is established.
   let existingMeta = await loadMeta(metaDir);
   if (stagedPaths) {
-    const stagedCompletedCandidate =
-      !options.dropEmbeddings &&
-      stagedWorkspaceResumed &&
-      !!existingMeta &&
-      !existingMeta.incrementalInProgress &&
-      !existingMeta.embeddingCheckpoint &&
-      existingMeta.lastCommit === currentCommit &&
-      (!canonicalMetaAtStageStart ||
-        canonicalMetaAtStageStart.lastCommit !== existingMeta.lastCommit ||
-        canonicalMetaAtStageStart.indexedAt !== existingMeta.indexedAt);
-
     // electric.4-.7 proved that restoring or resuming embedding rows inside a
     // staged copy is not a safe compatibility surface. Keep the useful part of
-    // staged analyze (isolated full generation + validated promotion), but make
-    // every semantic refresh choose an empty-table rebuild explicitly. A clean,
-    // already-finalized stage remains eligible for the fast-path promotion
-    // below; it is complete derived state, not an embedding checkpoint.
-    if (stagedCompletedCandidate) {
-      // A complete stage that died immediately before promotion should be
-      // promoted, even when the original invocation included --force. It is
-      // immutable validated output, not a cache/resume surface.
-      promoteCompletedStageFastPath = true;
-    } else {
-      if (
-        !options.dropEmbeddings &&
-        (stagedWorkspaceExisted || canonicalDatabaseExistedAtStageStart)
-      ) {
-        throw new Error(
-          'Staged generation did not qualify for completed-stage promotion and was left ' +
-            'untouched. Re-run with explicit `--drop-embeddings` to replace it with a clean ' +
-            'isolated generation.',
-        );
-      }
-      if (options.dropEmbeddings || (options.embeddings && !existingMeta)) {
-        // The target is the isolated staged DB. Forcing a full write wipes only
-        // that disposable copy; the canonical generation stays readable until
-        // the final integrity scan and journaled promotion both succeed.
-        options = { ...options, force: true };
-      }
+    // staged analyze (isolated full generation + validated promotion). Every
+    // replacement of existing derived state is explicit and starts clean.
+    if (options.dropEmbeddings || (options.embeddings && !existingMeta)) {
+      // The target is the isolated staged DB. Forcing a full write wipes only
+      // that disposable copy; the canonical generation stays readable until
+      // the final integrity scan and journaled promotion both succeed.
+      options = { ...options, force: true };
     }
   }
   if (options.incrementalOnly) {
@@ -1649,7 +1608,7 @@ const runFullAnalysisImpl = async (
   if (
     existingMeta &&
     !existingMeta.embeddingCheckpoint &&
-    (!options.force || promoteCompletedStageFastPath) &&
+    !options.force &&
     existingMeta.lastCommit === currentCommit
   ) {
     // Non-git folders have currentCommit = '' — always rebuild since we can't detect changes
@@ -1696,14 +1655,6 @@ const runFullAnalysisImpl = async (
           return true; // conservative on git failure
         }
       })();
-      if (dirty && stagedPaths && promoteCompletedStageFastPath) {
-        throw new Error(
-          'A completed staged generation cannot be resumed against a dirty working tree. ' +
-            'It was left untouched for forensics. Commit or discard the source changes to ' +
-            'promote it unchanged, or re-run with explicit `--drop-embeddings` to replace it ' +
-            'with a clean isolated generation.',
-        );
-      }
       // Registration wrinkle around the fast path (#2264). A prior
       // `analyze --name X` that hit a name collision writes meta.json (meta-save
       // runs before registerRepo) then fails before registering, leaving the
@@ -1719,7 +1670,6 @@ const runFullAnalysisImpl = async (
       const healUnregistered =
         options.allowDuplicateName === true && !(await isRepoRegistered(repoPath));
       if (!dirty && !healUnregistered) {
-        let promotedProjectName: string | undefined;
         // ── #2354: restamp the workspace label on a same-commit branch flip ──
         // The flat slot follows the checked-out working tree; a branch switch
         // at the SAME commit with a clean tree changes nothing the pipeline
@@ -1762,21 +1712,7 @@ const runFullAnalysisImpl = async (
           }
         }
         if (stagedPaths) {
-          const canonicalMeta = await loadMeta(canonicalMetaDir);
-          const stageWasFinalizedAfterItsCanonicalSource =
-            !canonicalMeta ||
-            canonicalMeta.lastCommit !== existingMeta.lastCommit ||
-            canonicalMeta.indexedAt !== existingMeta.indexedAt;
-          if (stageWasFinalizedAfterItsCanonicalSource) {
-            // The prior process can die after finalizing the staged DB/meta but
-            // before writing the promotion journal. A resumed run then reaches
-            // this same-commit fast path. Promote that validated generation
-            // instead of silently discarding completed work.
-            progress('lbug', 99, 'Promoting completed staged generation...');
-            promotedProjectName = await promoteValidatedStage(stagedPaths);
-          } else {
-            await discardStagedWorkspace(stagedPaths);
-          }
+          await discardStagedWorkspace(stagedPaths);
         } else if (!options.incrementalOnly) {
           await ensureGitNexusIgnored(repoPath);
         }
@@ -1785,7 +1721,6 @@ const runFullAnalysisImpl = async (
           // canonical repo basename (#1259) but leaves arbitrary subdirs
           // and `--skip-git` paths unchanged (#1232/#1233 intent preserved).
           repoName:
-            promotedProjectName ??
             options.registryName ??
             getInferredRepoName(repoPath) ??
             path.basename(resolveRepoIdentityRoot(repoPath)),

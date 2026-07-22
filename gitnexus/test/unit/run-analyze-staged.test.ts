@@ -245,7 +245,7 @@ describe('runFullAnalysis --staged', () => {
         { staged: true, embeddings: true, skipAgentsMd: true, skipSkills: true },
         { onProgress: () => {} },
       ),
-    ).rejects.toThrow(/incomplete or source-mismatched staged generation/i);
+    ).rejects.toThrow(/unjournaled staged generation already exists/i);
     expect((await fs.stat(canonical.lbugPath)).ino).toBe(canonicalBefore.ino);
     const stagedAfter = await fs.stat(staged.stagedLbugPath);
     expect(stagedAfter.ino).toBe(stagedBefore.ino);
@@ -356,7 +356,7 @@ describe('runFullAnalysis --staged', () => {
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('promotes a completed resumed stage when the process died before journaling', async () => {
+  it('refuses an unjournaled completed stage instead of auto-promoting it', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-prejournal-'));
     tempDirs.push(repo);
     const registryHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-registry-'));
@@ -375,25 +375,27 @@ describe('runFullAnalysis --staged', () => {
     const canonical = getStoragePaths(repo);
     const canonicalMeta = await loadMeta(canonical.storagePath);
     if (!canonicalMeta) throw new Error('expected canonical metadata');
-    const before = await fs.stat(canonical.lbugPath);
+    const canonicalBefore = await fs.stat(canonical.lbugPath);
     const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
     await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
     await saveMeta(staged.stagedMetaDir, {
       ...canonicalMeta,
       indexedAt: '2026-07-20T12:00:00.000Z',
     });
+    const stagedBefore = await fs.stat(staged.stagedLbugPath);
 
-    const result = await runFullAnalysis(
-      repo,
-      { staged: true, force: true, skipAgentsMd: true, skipSkills: true },
-      { onProgress: () => {} },
-    );
+    await expect(
+      runFullAnalysis(
+        repo,
+        { staged: true, force: true, skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      ),
+    ).rejects.toThrow(/unjournaled staged generation already exists/i);
 
-    expect(result.alreadyUpToDate).toBe(true);
-    expect((await fs.stat(canonical.lbugPath)).ino).not.toBe(before.ino);
-    expect((await loadMeta(canonical.storagePath))?.indexedAt).toBe('2026-07-20T12:00:00.000Z');
-    await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(fs.access(staged.backupLbugPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await fs.stat(canonical.lbugPath)).ino).toBe(canonicalBefore.ino);
+    expect((await fs.stat(staged.stagedLbugPath)).ino).toBe(stagedBefore.ino);
+    expect((await loadMeta(staged.stagedMetaDir))?.indexedAt).toBe('2026-07-20T12:00:00.000Z');
+    await expect(fs.access(staged.stageRoot)).resolves.toBeUndefined();
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -455,9 +457,7 @@ describe('runFullAnalysis --staged', () => {
         { staged: true, force: true, skipAgentsMd: true, skipSkills: true },
         { onProgress: () => {} },
       ),
-    ).rejects.toThrow(
-      /completed staged generation cannot be resumed against a dirty working tree/i,
-    );
+    ).rejects.toThrow(/unjournaled staged generation already exists/i);
 
     const after = await fs.stat(staged.stagedLbugPath);
     expect(after.ino).toBe(before.ino);
@@ -545,7 +545,8 @@ describe('runFullAnalysis --staged', () => {
       { onProgress: () => {} },
     );
 
-    expect(result.alreadyUpToDate).toBe(true);
+    expect(result.recoveredPromotionOnly).toBe(true);
+    expect(result.alreadyUpToDate).not.toBe(true);
     expect((await loadMeta(canonical.storagePath))?.indexedAt).toBe(recoveredAt);
     await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
@@ -589,13 +590,30 @@ describe('runFullAnalysis --staged', () => {
     await fs.rm(staged.stageRoot, { recursive: true, force: true });
     await expect(fs.access(staged.journalPath)).resolves.toBeUndefined();
 
-    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 2;\n');
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'advanced'],
+      { cwd: repo },
+    );
 
+    const result = await runFullAnalysis(
+      repo,
+      { skipAgentsMd: true, skipSkills: true },
+      { onProgress: () => {} },
+    );
+
+    expect(result.recoveredPromotionOnly).toBe(true);
+    expect(result.alreadyUpToDate).not.toBe(true);
+    expect((await loadMeta(canonical.storagePath))?.lastCommit).not.toBe(
+      execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim(),
+    );
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.access(staged.backupLbugPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('refuses malformed staged embeddings before the first promotion journal', async () => {
+  it('refuses malformed staged embeddings while recovering a prepared promotion', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-integrity-'));
     const registryHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-registry-'));
     tempDirs.push(repo, registryHome);
@@ -644,14 +662,23 @@ describe('runFullAnalysis --staged', () => {
     }
 
     await expect(
+      promoteStagedGeneration(staged, async () => 'repo', {
+        afterBoundary: (boundary) => {
+          if (boundary === 'prepared') throw new Error('simulated crash');
+        },
+      }),
+    ).rejects.toThrow('simulated crash');
+    await expect(fs.access(staged.journalPath)).resolves.toBeUndefined();
+
+    await expect(
       runFullAnalysis(
         repo,
         { staged: true, skipAgentsMd: true, skipSkills: true },
         { onProgress: () => {} },
       ),
-    ).rejects.toThrow(/staged DB validation failed embedding integrity/i);
+    ).rejects.toThrow(/pending staged promotion candidate.*embedding integrity/i);
     expect((await fs.stat(canonical.lbugPath)).ino).toBe(canonicalBefore.ino);
-    await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(staged.journalPath)).resolves.toBeUndefined();
   });
 
   it('recovers an old-backed-up journal during plain analyze before its fast path', async () => {
@@ -703,7 +730,8 @@ describe('runFullAnalysis --staged', () => {
       { onProgress: () => {} },
     );
 
-    expect(result.alreadyUpToDate).toBe(true);
+    expect(result.recoveredPromotionOnly).toBe(true);
+    expect(result.alreadyUpToDate).not.toBe(true);
     await expect(fs.access(canonical.lbugPath)).resolves.toBeUndefined();
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
