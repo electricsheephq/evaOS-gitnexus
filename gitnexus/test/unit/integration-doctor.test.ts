@@ -162,4 +162,17 @@ describe('doctor --integrations', () => {
     expect(report.mcp.status).toBe('mismatch');
     expect(JSON.stringify(report)).not.toContain('/other-runtime');
   });
+
+  it('detects environment-only MCP mismatches without exposing their values', async () => {
+    await writeMatchingMcp();
+    const claudePath = path.join(home, '.claude.json');
+    const config = JSON.parse(await fs.readFile(claudePath, 'utf8'));
+    config.projects['/repo'].mcpServers.gitnexus.env.SECRET = 'different-secret';
+    await fs.writeFile(claudePath, JSON.stringify(config));
+    const { buildIntegrationDoctorReport } = await import('../../src/cli/integration-doctor.js');
+    const report = await buildIntegrationDoctorReport(home);
+    expect(report.mcp.status).toBe('mismatch');
+    expect(JSON.stringify(report)).not.toContain('different-secret');
+    expect(JSON.stringify(report)).not.toContain('hidden');
+  });
 });

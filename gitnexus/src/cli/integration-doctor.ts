@@ -49,11 +49,18 @@ const readOptional = async (filePath: string): Promise<string | null> => {
 
 const entryFingerprint = (entry: unknown): string | null => {
   if (!entry || typeof entry !== 'object') return null;
-  const record = entry as { command?: unknown; args?: unknown };
+  const record = entry as { command?: unknown; args?: unknown; env?: unknown };
   if (typeof record.command !== 'string') return null;
   const args = Array.isArray(record.args) ? record.args : [];
   if (!args.every((arg) => typeof arg === 'string')) return null;
-  return JSON.stringify({ command: record.command, args });
+  const envValue = record.env ?? {};
+  if (!envValue || typeof envValue !== 'object' || Array.isArray(envValue)) return null;
+  const envEntries = Object.entries(envValue as Record<string, unknown>);
+  if (envEntries.some(([, value]) => typeof value !== 'string')) return null;
+  const env = Object.fromEntries(
+    envEntries.sort(([left], [right]) => left.localeCompare(right)) as Array<[string, string]>,
+  );
+  return JSON.stringify({ command: record.command, args, env });
 };
 
 const collectClaudeMcpEntries = (root: unknown): unknown[] => {
@@ -102,7 +109,26 @@ const codexMcpFingerprint = (raw: string): string | null => {
       return null;
     }
   }
-  return entryFingerprint({ command, args });
+  const env: Record<string, string> = {};
+  const envMatch = raw.match(
+    /(?:^|\n)\[mcp_servers\.gitnexus\.env\]\s*\n([\s\S]*?)(?=\n\[|$)/,
+  );
+  if (envMatch) {
+    for (const line of envMatch[1].split('\n')) {
+      if (/^\s*(?:#.*)?$/.test(line)) continue;
+      const assignment = line.match(
+        /^\s*([A-Za-z_][A-Za-z0-9_]*|"(?:[^"\\]|\\.)*")\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/,
+      );
+      if (!assignment) return null;
+      const key = assignment[1].startsWith('"')
+        ? parseTomlString(assignment[1])
+        : assignment[1];
+      const value = parseTomlString(assignment[2]);
+      if (key === null || value === null) return null;
+      env[key] = value;
+    }
+  }
+  return entryFingerprint({ command, args, env });
 };
 
 const hasCodexGitnexusSection = (raw: string): boolean =>
