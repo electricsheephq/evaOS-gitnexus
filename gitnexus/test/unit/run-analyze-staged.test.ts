@@ -57,7 +57,7 @@ describe('runFullAnalysis --staged', () => {
     );
   });
 
-  it('refuses staged embedding preservation unless clean regeneration is explicit', async () => {
+  it('refuses a full staged write when metadata hides physical embeddings', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-no-restore-'));
     tempDirs.push(repo);
     process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
@@ -74,19 +74,45 @@ describe('runFullAnalysis --staged', () => {
     const canonical = getStoragePaths(repo);
     const meta = await loadMeta(canonical.storagePath);
     if (!meta) throw new Error('expected canonical metadata');
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    await adapter.initLbug(canonical.lbugPath);
+    try {
+      const [owner] = await adapter.executeQuery(
+        'MATCH (n) WHERE n.id IS NOT NULL RETURN n.id AS id LIMIT 1',
+      );
+      const nodeId = String(owner?.id ?? owner?.[0] ?? '');
+      if (!nodeId) throw new Error('expected a graph node for the embedding fixture');
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, ' +
+          'startLine: 1, endLine: 1, embedding: $embedding, contentHash: $contentHash})',
+        [
+          {
+            id: `${nodeId}:0`,
+            nodeId,
+            chunkIndex: 0,
+            embedding: new Array(EMBEDDING_DIMS).fill(0.25),
+            contentHash: 'hidden-by-stale-meta',
+          },
+        ],
+      );
+    } finally {
+      await adapter.closeLbug();
+    }
     await saveMeta(canonical.storagePath, {
       ...meta,
-      stats: { ...meta.stats, embeddings: 1 },
+      // Reproduce the observed stale-metadata shape: the database has one
+      // physical vector while metadata claims zero.
+      stats: { ...meta.stats, embeddings: 0 },
     });
     const before = await fs.stat(canonical.lbugPath);
 
     await expect(
       runFullAnalysis(
         repo,
-        { staged: true, embeddings: true, skipAgentsMd: true, skipSkills: true },
+        { staged: true, force: true, skipAgentsMd: true, skipSkills: true },
         { onProgress: () => {} },
       ),
-    ).rejects.toThrow(/--staged --embeddings --drop-embeddings/);
+    ).rejects.toThrow(/requires explicit `--drop-embeddings`/);
 
     const after = await fs.stat(canonical.lbugPath);
     expect(after.ino).toBe(before.ino);
@@ -202,6 +228,16 @@ describe('runFullAnalysis --staged', () => {
         pendingNodeIds: ['Function:pending'],
       },
     });
+    const stagedBefore = await fs.stat(staged.stagedLbugPath);
+    const stagedMetaPath = path.join(staged.stagedMetaDir, 'gitnexus.json');
+    const stagedMetaBefore = await fs.readFile(stagedMetaPath);
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 2;\n');
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'advance-source'],
+      { cwd: repo },
+    );
 
     await expect(
       runFullAnalysis(
@@ -209,9 +245,12 @@ describe('runFullAnalysis --staged', () => {
         { staged: true, embeddings: true, skipAgentsMd: true, skipSkills: true },
         { onProgress: () => {} },
       ),
-    ).rejects.toThrow(/checkpoint resume is disabled/i);
+    ).rejects.toThrow(/incomplete or source-mismatched staged generation/i);
     expect((await fs.stat(canonical.lbugPath)).ino).toBe(canonicalBefore.ino);
-    expect((await loadMeta(staged.stagedMetaDir))?.embeddingCheckpoint).toBeDefined();
+    const stagedAfter = await fs.stat(staged.stagedLbugPath);
+    expect(stagedAfter.ino).toBe(stagedBefore.ino);
+    expect(stagedAfter.mtimeMs).toBe(stagedBefore.mtimeMs);
+    await expect(fs.readFile(stagedMetaPath)).resolves.toEqual(stagedMetaBefore);
   });
 
   it('keeps the canonical DB inode unchanged until validated promotion', async () => {
@@ -242,7 +281,7 @@ describe('runFullAnalysis --staged', () => {
     let sawPrePromotion = false;
     const result = await runFullAnalysis(
       repo,
-      { staged: true, skipAgentsMd: true, skipSkills: true },
+      { staged: true, dropEmbeddings: true, skipAgentsMd: true, skipSkills: true },
       {
         onProgress: (_phase, percent) => {
           if (percent >= 99) return;

@@ -378,6 +378,42 @@ export const withAnalyzeOwnershipLock = async <T>(
 export const withStagedAnalyzeLock = withAnalyzeOwnershipLock;
 
 /**
+ * Read-only preflight used by callers that must preserve a prior staged
+ * artifact instead of letting preparation replace source-mismatched derived
+ * state. A legacy manifest without complete source identity never matches.
+ */
+export const inspectStagedWorkspaceSource = async (
+  paths: StagedAnalyzePaths,
+  canonicalMeta: RepoMeta | null,
+  sourceRepo: RepositorySourceIdentity,
+): Promise<{ exists: boolean; matchesSource: boolean }> => {
+  let exists = false;
+  try {
+    await fs.lstat(paths.stageRoot);
+    exists = true;
+  } catch (error) {
+    if (!isMissingFilesystemError(error)) throw error;
+  }
+  if (!exists) return { exists: false, matchesSource: false };
+
+  const manifest = await readManifest(paths);
+  if (!manifest?.sourceMetaFiles || !manifest.sourceRepo) {
+    return { exists: true, matchesSource: false };
+  }
+  const canonicalDb = await statRegularFile(paths.canonicalLbugPath);
+  const sourceMeta = canonicalMeta ? metaIdentity(canonicalMeta) : undefined;
+  const sourceMetaFiles = await statMetadataFiles(paths.canonicalMetaDir);
+  return {
+    exists: true,
+    matchesSource:
+      identitiesEqual(manifest.sourceMeta, sourceMeta) &&
+      identitiesEqual(manifest.sourceMetaFiles, sourceMetaFiles) &&
+      identitiesEqual(manifest.sourceDb, canonicalDb) &&
+      identitiesEqual(manifest.sourceRepo, sourceRepo),
+  };
+};
+
+/**
  * Create or resume the isolated build workspace. A stage tree is removed only
  * when a complete canonical generation or a durable stage intent/manifest
  * proves that the tree is disposable derived state.

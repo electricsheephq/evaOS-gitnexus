@@ -147,6 +147,7 @@ import {
   discardStagedWorkspace,
   getStagedAnalyzePaths,
   hasPendingPromotion,
+  inspectStagedWorkspaceSource,
   prepareStagedWorkspace,
   promoteStagedGeneration,
   validateStagedGeneration,
@@ -1140,9 +1141,48 @@ const runFullAnalysisImpl = async (
   }
 
   let stagedWorkspaceResumed = false;
+  let stagedWorkspaceExisted = false;
+  let canonicalDatabaseExistedAtStageStart = false;
   let canonicalMetaAtStageStart: RepoMeta | null = null;
   if (stagedPaths) {
     canonicalMetaAtStageStart = await loadMeta(canonicalMetaDir);
+    const stagedSourceAtStart = await inspectStagedWorkspaceSource(
+      stagedPaths,
+      canonicalMetaAtStageStart,
+      repositorySource,
+    );
+    const canonicalDatabaseStateAtStart = await lstatIfPresent(canonicalPaths.lbugPath);
+    stagedWorkspaceExisted = stagedSourceAtStart.exists;
+    canonicalDatabaseExistedAtStageStart = canonicalDatabaseStateAtStart !== null;
+
+    if (stagedWorkspaceExisted && !options.dropEmbeddings) {
+      const stagedMetaAtStart = await loadMeta(stagedPaths.stagedMetaDir);
+      const mayBeCompletedCandidate =
+        stagedSourceAtStart.matchesSource &&
+        !!stagedMetaAtStart &&
+        !stagedMetaAtStart.incrementalInProgress &&
+        !stagedMetaAtStart.embeddingCheckpoint &&
+        stagedMetaAtStart.lastCommit === currentCommit;
+      if (!mayBeCompletedCandidate) {
+        throw new Error(
+          'An incomplete or source-mismatched staged generation already exists. It was left ' +
+            'untouched for forensics. Re-run with `--drop-embeddings` only when replacing that ' +
+            'derived stage with a clean isolated generation is intentional.',
+        );
+      }
+    }
+    if (
+      !stagedWorkspaceExisted &&
+      canonicalDatabaseExistedAtStageStart &&
+      !options.dropEmbeddings
+    ) {
+      throw new Error(
+        'Starting staged work from an existing canonical database requires explicit ' +
+          '`--drop-embeddings`. The canonical index is unchanged. Semantic refreshes must use ' +
+          '`--staged --embeddings --drop-embeddings`; graph-only rebuilds must use ' +
+          '`--staged --drop-embeddings`.',
+      );
+    }
     const prepared = await prepareStagedWorkspace(
       stagedPaths,
       canonicalMetaAtStageStart,
@@ -1190,29 +1230,14 @@ const runFullAnalysisImpl = async (
       // immutable validated output, not a cache/resume surface.
       options = { ...options, force: false };
     } else {
-      if (existingMeta?.embeddingCheckpoint && !options.dropEmbeddings) {
-        throw new Error(
-          'Staged embedding checkpoint resume is disabled. The canonical index is unchanged. ' +
-            'Preserve the staged artifact for forensics, or restart it as a clean isolated ' +
-            'generation with `--staged --embeddings --drop-embeddings`.',
-        );
-      }
-      if (existingMeta && options.embeddings && !options.dropEmbeddings) {
-        throw new Error(
-          'Staged semantic refresh cannot reuse an existing embedding table. The canonical ' +
-            'index is unchanged. Re-run with `--staged --embeddings --drop-embeddings` to ' +
-            'regenerate embeddings from an empty isolated table.',
-        );
-      }
       if (
-        (existingMeta?.stats?.embeddings ?? 0) > 0 &&
-        !options.embeddings &&
-        !options.dropEmbeddings
+        !options.dropEmbeddings &&
+        (stagedWorkspaceExisted || canonicalDatabaseExistedAtStageStart)
       ) {
         throw new Error(
-          'Staged analyze cannot preserve an existing embedding corpus safely. The canonical ' +
-            'index is unchanged. Choose `--staged --embeddings --drop-embeddings` for a clean ' +
-            'semantic regeneration, or `--staged --drop-embeddings` to build graph and FTS only.',
+          'Staged generation did not qualify for completed-stage promotion and was left ' +
+            'untouched. Re-run with explicit `--drop-embeddings` to replace it with a clean ' +
+            'isolated generation.',
         );
       }
       if (options.dropEmbeddings || (options.embeddings && !existingMeta)) {
