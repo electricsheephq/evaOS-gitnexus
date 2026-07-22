@@ -49,9 +49,10 @@ async function importRepairSubject(options: {
   probes?: Array<typeof healthyProbe | typeof brokenProbe>;
   vectorAvailable?: boolean;
   createError?: Error;
+  missingEmbeddingTable?: boolean;
   afterInitialPreflight?: () => Promise<void> | void;
 }) {
-  const counts = [...(options.counts ?? [3, 3])];
+  const counts = [...(options.counts ?? [3, 3, 3])];
   const probes = [...(options.probes ?? [brokenProbe, healthyProbe])];
   const initLbugForMaintenance = vi.fn(async () => undefined);
   const loadVectorExtension = vi.fn(async () => options.vectorAvailable ?? true);
@@ -61,8 +62,13 @@ async function importRepairSubject(options: {
     return true;
   });
   const closeLbug = vi.fn(async () => undefined);
+  let embeddingCountQueries = 0;
   const executeQuery = vi.fn(async (query: string) => {
     if (!query.includes('CodeEmbedding')) return [];
+    embeddingCountQueries++;
+    if (options.missingEmbeddingTable && embeddingCountQueries === 1) {
+      throw new Error('Binder exception: Table CodeEmbedding does not exist.');
+    }
     return [{ cnt: counts.shift() ?? 0 }];
   });
   const registerRepo = vi.fn(async () => 'fixture-repo');
@@ -146,6 +152,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       expect(mocks.executeQuery.mock.calls.map(([query]) => query)).toEqual([
         expect.stringMatching(/MATCH \(e:CodeEmbedding\).*count/i),
         expect.stringMatching(/MATCH \(e:CodeEmbedding\).*count/i),
+        expect.stringMatching(/MATCH \(e:CodeEmbedding\).*count/i),
       ]);
       expect(mocks.registerRepo).toHaveBeenCalledOnce();
 
@@ -178,6 +185,51 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(
         before,
       );
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('treats a missing CodeEmbedding table as not indexed without mutation', async () => {
+    const indexed = await createIndexedFixture(0);
+    try {
+      const before = await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'));
+      const { runFullAnalysis, mocks } = await importRepairSubject({
+        missingEmbeddingTable: true,
+      });
+      const result = await runFullAnalysis(
+        indexed.fixture.dbPath,
+        { repairVector: true },
+        { onProgress: () => {} },
+      );
+      expect(result.vectorRepairStatus).toBe('not-indexed');
+      expect(mocks.dropVectorIndex).not.toHaveBeenCalled();
+      expect(mocks.registerRepo).not.toHaveBeenCalled();
+      expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(
+        before,
+      );
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('fails closed when the production pool cannot prove VECTOR before repair', async () => {
+    const indexed = await createIndexedFixture();
+    try {
+      const unavailableProbe = {
+        ...brokenProbe,
+        vector: false,
+        reason: 'vector-extension-unavailable',
+      };
+      const { runFullAnalysis, mocks } = await importRepairSubject({
+        probes: [unavailableProbe],
+      });
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/could not prove VECTOR availability/i);
+      expect(mocks.dropVectorIndex).not.toHaveBeenCalled();
+      expect(mocks.createVectorIndex).not.toHaveBeenCalled();
+      expect(mocks.registerRepo).not.toHaveBeenCalled();
     } finally {
       await indexed.fixture.cleanup();
     }

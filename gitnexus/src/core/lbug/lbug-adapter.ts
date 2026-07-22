@@ -706,11 +706,17 @@ export const initLbugForMaintenance = async (dbPath: string) =>
         throw new Error(`Maintenance requires a regular, non-symlink database file at ${dbPath}`);
       }
 
-      await preflightLbugSidecars(dbPath, {
+      const sidecarState = await preflightLbugSidecars(dbPath, {
         mode: 'write',
         logger,
         allowQuarantine: false,
       });
+      if (sidecarState.kind !== 'clean') {
+        throw new Error(
+          `Maintenance refused: LadybugDB sidecar state is ${sidecarState.kind}; ` +
+            'close the active writer or recover the index before retrying.',
+        );
+      }
 
       const opened = await openLbugConnection(lbug, dbPath);
       db = opened.db;

@@ -130,6 +130,7 @@ import {
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME, STALE_HASH_SENTINEL } from './lbug/schema.js';
+import { isMissingColumnOrTableError } from './lbug/schema-errors.js';
 import {
   discardStagedWorkspace,
   getStagedAnalyzePaths,
@@ -793,6 +794,24 @@ const runFullAnalysisImpl = async (
     const { probeDoctorPool, EXPECTED_POOL_CONNECTIONS } =
       await import('../cli/doctor-pool-probe.js');
     const beforeProbe = await probeDoctorPool(canonicalPaths.lbugPath);
+    const readEmbeddingCount = async (): Promise<number> => {
+      let rows: Awaited<ReturnType<typeof executeQuery>>;
+      try {
+        rows = await executeQuery(
+          `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isMissingColumnOrTableError(message)) return 0;
+        throw error;
+      }
+      const row = rows[0];
+      const count = Number(row?.cnt ?? row?.[0] ?? 0);
+      if (!Number.isSafeInteger(count) || count < 0) {
+        throw new Error('Cannot repair VECTOR: database returned an invalid embedding count.');
+      }
+      return count;
+    };
     let stats: { nodes: number; edges: number } = { nodes: 0, edges: 0 };
     let embeddingCountBefore = 0;
     let repairStatus: AnalyzeResult['vectorRepairStatus'] = 'healthy';
@@ -800,12 +819,7 @@ const runFullAnalysisImpl = async (
     try {
       await initLbugForMaintenance(canonicalPaths.lbugPath);
       stats = await getLbugStats();
-      const rows = await executeQuery(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`);
-      const row = rows[0];
-      embeddingCountBefore = Number(row?.cnt ?? row?.[0] ?? 0);
-      if (!Number.isSafeInteger(embeddingCountBefore) || embeddingCountBefore < 0) {
-        throw new Error('Cannot repair VECTOR: database returned an invalid embedding count.');
-      }
+      embeddingCountBefore = await readEmbeddingCount();
 
       if (embeddingCountBefore === 0) {
         progress('done', 100, 'No embeddings are indexed; VECTOR repair was not needed.');
@@ -818,6 +832,13 @@ const runFullAnalysisImpl = async (
           stats: { ...existingMeta.stats, nodes: stats.nodes, edges: stats.edges, embeddings: 0 },
           vectorRepairStatus: 'not-indexed',
         };
+      }
+
+      if (beforeProbe.reason || !beforeProbe.vector) {
+        throw new Error(
+          'Cannot repair VECTOR: the production pool could not prove VECTOR availability ' +
+            `(${beforeProbe.vectorIndexReason ?? beforeProbe.reason ?? 'vector-extension-unavailable'}).`,
+        );
       }
 
       const vectorAvailable = await loadVectorExtension(undefined, {
@@ -843,11 +864,7 @@ const runFullAnalysisImpl = async (
         repairStatus = 'repaired';
       }
 
-      const afterRows = await executeQuery(
-        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
-      );
-      const afterRow = afterRows[0];
-      const embeddingCountAfter = Number(afterRow?.cnt ?? afterRow?.[0] ?? 0);
+      const embeddingCountAfter = await readEmbeddingCount();
       if (embeddingCountAfter !== embeddingCountBefore) {
         throw new Error(
           `VECTOR repair changed embedding rows (${embeddingCountBefore} before, ` +
@@ -874,34 +891,49 @@ const runFullAnalysisImpl = async (
 
     const { getRuntimeCapabilities } = await import('./platform/capabilities.js');
     const runtimeCapabilities = getRuntimeCapabilities();
-    const repairedMeta: RepoMeta = {
-      ...existingMeta,
-      repoPath,
-      remoteUrl: repositoryRemoteUrl ?? existingMeta.remoteUrl,
-      stats: {
-        ...existingMeta.stats,
-        nodes: stats.nodes,
-        edges: stats.edges,
-        embeddings: embeddingCountBefore,
-      },
-      capabilities: {
-        graph: { provider: 'ladybugdb', status: 'available' },
-        fts: {
-          provider: 'ladybugdb-fts',
-          status: afterProbe.fts ? 'available' : 'unavailable',
+    let repairedMeta: RepoMeta;
+    let projectName: string;
+    await initLbugForMaintenance(canonicalPaths.lbugPath);
+    try {
+      const committedStats = await getLbugStats();
+      const committedEmbeddingCount = await readEmbeddingCount();
+      if (committedEmbeddingCount !== embeddingCountBefore) {
+        throw new Error(
+          `VECTOR repair database changed before metadata commit (${embeddingCountBefore} ` +
+            `verified, ${committedEmbeddingCount} current); metadata and registry were not updated.`,
+        );
+      }
+      repairedMeta = {
+        ...existingMeta,
+        repoPath,
+        remoteUrl: repositoryRemoteUrl ?? existingMeta.remoteUrl,
+        stats: {
+          ...existingMeta.stats,
+          nodes: committedStats.nodes,
+          edges: committedStats.edges,
+          embeddings: committedEmbeddingCount,
         },
-        vectorSearch: {
-          provider: 'ladybugdb-vector',
-          status: 'vector-index',
-          exactScanLimit: runtimeCapabilities.exactScanLimit,
+        capabilities: {
+          graph: { provider: 'ladybugdb', status: 'available' },
+          fts: {
+            provider: 'ladybugdb-fts',
+            status: afterProbe.fts ? 'available' : 'unavailable',
+          },
+          vectorSearch: {
+            provider: 'ladybugdb-vector',
+            status: 'vector-index',
+            exactScanLimit: runtimeCapabilities.exactScanLimit,
+          },
         },
-      },
-    };
-    await saveMeta(canonicalMetaDir, repairedMeta);
-    const projectName = await registerRepo(repoPath, repairedMeta, {
-      name: options.registryName,
-      allowDuplicateName: options.allowDuplicateName,
-    });
+      };
+      await saveMeta(canonicalMetaDir, repairedMeta);
+      projectName = await registerRepo(repoPath, repairedMeta, {
+        name: options.registryName,
+        allowDuplicateName: options.allowDuplicateName,
+      });
+    } finally {
+      await closeLbug().catch(() => {});
+    }
     progress('done', 100, 'VECTOR index verified through all eight pooled connections.');
     return {
       repoName: projectName,
