@@ -224,21 +224,48 @@ export const doctorCommand = async (
     recoveryPlan?: boolean;
     mcpConfig?: boolean;
     registry?: boolean;
+    integrations?: boolean;
     json?: boolean;
     showPaths?: boolean;
   } = {},
 ) => {
-  const selectedModes = [options.recoveryPlan, options.mcpConfig, options.registry].filter(
-    Boolean,
-  ).length;
+  const selectedModes = [
+    options.recoveryPlan,
+    options.mcpConfig,
+    options.registry,
+    options.integrations,
+  ].filter(Boolean).length;
   if (selectedModes > 1) {
-    throw new Error('--recovery-plan, --mcp-config, and --registry are mutually exclusive');
+    throw new Error(
+      '--recovery-plan, --mcp-config, --registry, and --integrations are mutually exclusive',
+    );
   }
   if (options.showPaths && !options.registry) {
     throw new Error('--show-paths may only be used with --registry');
   }
-  if (options.json && !options.mcpConfig && !options.registry) {
-    throw new Error('--json may only be used with --mcp-config or --registry');
+  if (options.json && !options.mcpConfig && !options.registry && !options.integrations) {
+    throw new Error('--json may only be used with --mcp-config, --registry, or --integrations');
+  }
+
+  if (options.integrations) {
+    const { buildIntegrationDoctorReport } = await import('./integration-doctor.js');
+    const report = await buildIntegrationDoctorReport();
+    if (options.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log('GitNexus integration doctor (read-only)');
+      console.log(`  selected CLI:         ${report.selectedCli.version}`);
+      console.log(`  Codex/Claude MCP:     ${report.mcp.status}`);
+      console.log(`  Claude MCP entries:   ${report.mcp.claudeConfiguredEntries}`);
+      console.log(`  Claude hooks:         ${report.hooks.claude}`);
+      console.log(
+        `  legacy SessionStart:  ${report.hooks.obsoleteSessionStart ? 'present' : 'absent'}`,
+      );
+    }
+    if (report.mcp.status !== 'consistent' || report.hooks.claude !== 'current') {
+      process.exitCode = 1;
+    }
+    return;
   }
 
   if (options.recoveryPlan) {
