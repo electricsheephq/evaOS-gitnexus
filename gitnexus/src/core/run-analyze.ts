@@ -797,9 +797,7 @@ const runFullAnalysisImpl = async (
     const readEmbeddingCount = async (): Promise<number> => {
       let rows: Awaited<ReturnType<typeof executeQuery>>;
       try {
-        rows = await executeQuery(
-          `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
-        );
+        rows = await executeQuery(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (isMissingColumnOrTableError(message)) return 0;
