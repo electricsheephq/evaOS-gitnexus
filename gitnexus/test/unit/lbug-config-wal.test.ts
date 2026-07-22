@@ -222,7 +222,7 @@ describe('createLbugDatabase bounded buffer pool', () => {
   });
 
   it.each([
-    ['tiny graph uses the floor', 41, 64 * MiB],
+    ['tiny graph uses the analyze-safe floor', 41, 128 * MiB],
     ['mid graph scales linearly', 100_000, 100_000 * 4 * 1024],
     ['huge graph caps at 2 GiB', 10_000_000, 2 * GiB],
   ])('%s', (_label, elements, expected) => {

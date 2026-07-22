@@ -301,6 +301,7 @@ const resolveCheckpointThreshold = (): number => {
 
 const DEFAULT_BUFFER_POOL_CAP = 2 * 1024 * 1024 * 1024;
 const BUFFER_POOL_FLOOR = 64 * 1024 * 1024;
+const ANALYZE_BUFFER_POOL_FLOOR = 128 * 1024 * 1024;
 
 const parseBufferPoolSize = (raw: string | undefined): number | undefined => {
   if (raw === undefined) return undefined;
@@ -315,7 +316,7 @@ const defaultBufferPoolSize = (): number =>
   Math.min(DEFAULT_BUFFER_POOL_CAP, Math.max(BUFFER_POOL_FLOOR, Math.floor(os.totalmem() * 0.8)));
 
 const clampBufferPool = (bytes: number): number =>
-  Math.min(defaultBufferPoolSize(), Math.max(BUFFER_POOL_FLOOR, Math.floor(bytes)));
+  Math.min(defaultBufferPoolSize(), Math.max(ANALYZE_BUFFER_POOL_FLOOR, Math.floor(bytes)));
 
 const POOL_BYTES_PER_ELEMENT = 4 * 1024;
 

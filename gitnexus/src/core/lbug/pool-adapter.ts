@@ -672,11 +672,12 @@ export const initLbug = async (repoId: string, dbPath: string): Promise<boolean>
     existing.lastUsed = Date.now();
     const currentIdentity = await statDbIdentity(dbPath);
     if (!dbIdentityChanged(existing.dbIdentity, currentIdentity)) return false;
-    // Never retire the shared native Database under an in-flight connection.
-    // Keep serving the complete old generation and retry rollover on a later
-    // initialization once the pool becomes idle.
-    if (existing.checkedOut > 0) return false;
-    closeOne(repoId);
+    const aliases = [...pool.entries()].filter(([, entry]) => entry.dbPath === dbPath);
+    // Never retire a shared native Database under any in-flight alias.
+    // Keep serving the complete old generation and retry rollover once every
+    // pool entry for this physical path becomes idle.
+    if (aliases.some(([, entry]) => entry.checkedOut > 0)) return false;
+    for (const [aliasId] of aliases) closeOne(aliasId);
   }
 
   // Deduplicate concurrent init calls for the same repoId —

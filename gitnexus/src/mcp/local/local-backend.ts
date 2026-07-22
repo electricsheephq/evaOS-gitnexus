@@ -1510,11 +1510,15 @@ export class LocalBackend {
         // Reading the flat meta for a branch handle would compare the branch
         // index's indexedAt against the primary's and thrash the pool (#2106).
         const meta = await loadMeta(path.dirname(repo.lbugPath));
+        // Analyze writes the dirty marker before touching the live database.
+        // Continue serving the complete old read pool until final metadata
+        // clears it; never reopen onto a partial in-place generation.
+        if (!meta || meta.incrementalInProgress) return;
         // Compare against the last indexedAt OBSERVED for this pool (keyed by
         // lbugPath), not the handle's — branch handles are fresh spreads so a
         // handle mutation would not persist and would reinit on every check.
         const observed = this.lastObservedIndexedAt.get(poolKey) ?? repo.indexedAt;
-        const stampChanged = !!meta?.indexedAt && meta.indexedAt !== observed;
+        const stampChanged = !!meta.indexedAt && meta.indexedAt !== observed;
         const currentIdentity = await statDbIdentity(repo.lbugPath);
         const identityChanged = dbIdentityChanged(
           this.lastObservedDbIdentity.get(poolKey) ?? null,
@@ -1527,7 +1531,7 @@ export class LocalBackend {
           // callers both detect staleness and double-close the pool.
           const reinit = (async () => {
             try {
-              if (meta?.indexedAt) this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
+              if (meta.indexedAt) this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
               const reopened = await initLbug(poolKey, repo.lbugPath);
               if (reopened) {
                 this.lastObservedDbIdentity.set(poolKey, await statDbIdentity(repo.lbugPath));

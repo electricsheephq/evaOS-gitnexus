@@ -1556,8 +1556,16 @@ const runFullAnalysisImpl = async (
     await wipeLbugDbFiles(lbugPath);
   }
 
+  const streamedPdgRows = pipelineResult.pdgEmitManifest
+    ? [
+        ...pipelineResult.pdgEmitManifest.nodeFiles.values(),
+        ...pipelineResult.pdgEmitManifest.relsByPair.values(),
+      ].reduce((total, entry) => total + entry.rows, 0)
+    : 0;
   setBufferPoolSizeHint(
-    estimateBufferPool(pipelineResult.graph.nodeCount + pipelineResult.graph.relationshipCount),
+    estimateBufferPool(
+      pipelineResult.graph.nodeCount + pipelineResult.graph.relationshipCount + streamedPdgRows,
+    ),
   );
 
   if (options.incrementalOnly) {
