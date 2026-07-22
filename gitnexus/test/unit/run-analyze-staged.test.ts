@@ -226,11 +226,7 @@ describe('runFullAnalysis --staged', () => {
     await fs.rm(staged.stageRoot, { recursive: true, force: true });
     await expect(fs.access(staged.journalPath)).resolves.toBeUndefined();
 
-    await runFullAnalysis(
-      repo,
-      { skipAgentsMd: true, skipSkills: true },
-      { onProgress: () => {} },
-    );
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
 
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.access(staged.backupLbugPath)).rejects.toMatchObject({ code: 'ENOENT' });
