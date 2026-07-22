@@ -3166,8 +3166,6 @@ export const dropVectorIndex = async (opts: ExtensionEnsureOptions = {}): Promis
   if (!conn) {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
   }
-  if (!(await loadVectorExtension(undefined, opts))) return false;
-
   const indexes = await executeQuery('CALL SHOW_INDEXES() RETURN *');
   const exists = indexes.some(
     (row: Record<string, unknown>) =>
@@ -3177,6 +3175,7 @@ export const dropVectorIndex = async (opts: ExtensionEnsureOptions = {}): Promis
     vectorIndexEnsured = false;
     return true;
   }
+  if (!(await loadVectorExtension(undefined, opts))) return false;
 
   try {
     await queryAndDrain(conn, DROP_VECTOR_INDEX_QUERY);

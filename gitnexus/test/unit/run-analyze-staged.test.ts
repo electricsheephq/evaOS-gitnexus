@@ -188,6 +188,54 @@ describe('runFullAnalysis --staged', () => {
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('finishes committed promotion cleanup after the staged metadata directory is gone', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-committed-cleanup-'));
+    tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+
+    const canonical = getStoragePaths(repo);
+    const canonicalMeta = await loadMeta(canonical.storagePath);
+    if (!canonicalMeta) throw new Error('expected canonical metadata');
+    const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
+    await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
+    await saveMeta(staged.stagedMetaDir, canonicalMeta);
+
+    await expect(
+      promoteStagedGeneration(
+        staged,
+        async (meta) => {
+          await saveMeta(canonical.storagePath, meta);
+          return 'repo';
+        },
+        {
+          afterBoundary: (boundary) => {
+            if (boundary === 'metadata/registry-committed') throw new Error('simulated crash');
+          },
+        },
+      ),
+    ).rejects.toThrow('simulated crash');
+    await fs.rm(staged.stageRoot, { recursive: true, force: true });
+    await expect(fs.access(staged.journalPath)).resolves.toBeUndefined();
+
+    await runFullAnalysis(
+      repo,
+      { skipAgentsMd: true, skipSkills: true },
+      { onProgress: () => {} },
+    );
+
+    await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(staged.backupLbugPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('refuses malformed staged embeddings before the first promotion journal', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-integrity-'));
     tempDirs.push(repo);

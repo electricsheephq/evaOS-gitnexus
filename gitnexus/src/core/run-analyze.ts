@@ -999,11 +999,21 @@ const runFullAnalysisImpl = async (
 
   const promoteValidatedStage = async (paths: StagedAnalyzePaths): Promise<string | undefined> => {
     const stagedMeta = await validateStagedGeneration(paths);
-    const stagedValidation = await withLbugDb(
-      paths.stagedLbugPath,
-      async () => ({ stats: await getLbugStats(), integrity: await inspectEmbeddingIntegrity() }),
-      { readOnly: true },
-    );
+    let stagedValidation: {
+      stats: Awaited<ReturnType<typeof getLbugStats>>;
+      integrity: EmbeddingIntegrityReport;
+    };
+    try {
+      stagedValidation = await withLbugDb(
+        paths.stagedLbugPath,
+        async () => ({ stats: await getLbugStats(), integrity: await inspectEmbeddingIntegrity() }),
+        { readOnly: true },
+      );
+    } finally {
+      // Promotion renames this file. Windows refuses the rename while the
+      // singleton read-only handle remains open.
+      await closeLbug().catch(() => {});
+    }
     const stagedStats = stagedValidation.stats;
     if (
       (stagedMeta.stats?.nodes !== undefined && stagedMeta.stats.nodes !== stagedStats.nodes) ||
@@ -1038,18 +1048,25 @@ const runFullAnalysisImpl = async (
         'Pending staged promotion has no unambiguous regular candidate database; refusing recovery.',
       );
     }
-    const stagedMeta = await loadMeta(paths.stagedMetaDir);
-    if (!stagedMeta) {
+    const stagedRootState = await lstatIfPresent(paths.stageRoot);
+    const candidateMeta = await loadMeta(
+      stagedRootState ? paths.stagedMetaDir : paths.canonicalMetaDir,
+    );
+    if (!candidateMeta) {
       throw new Error('Pending staged promotion has no readable candidate metadata.');
     }
-    const integrity = await withLbugDb(candidatePath, inspectEmbeddingIntegrity, {
-      readOnly: true,
-    });
-    assertEmbeddingIntegrity(
-      integrity,
-      'Pending staged promotion candidate',
-      stagedMeta.stats?.embeddings,
-    );
+    try {
+      const integrity = await withLbugDb(candidatePath, inspectEmbeddingIntegrity, {
+        readOnly: true,
+      });
+      assertEmbeddingIntegrity(
+        integrity,
+        'Pending staged promotion candidate',
+        candidateMeta.stats?.embeddings,
+      );
+    } finally {
+      await closeLbug().catch(() => {});
+    }
   };
 
   // Every analyze mode owns the same canonical slot and must resolve its
