@@ -301,7 +301,10 @@ const resolveCheckpointThreshold = (): number => {
 
 const DEFAULT_BUFFER_POOL_CAP = 2 * 1024 * 1024 * 1024;
 const BUFFER_POOL_FLOOR = 64 * 1024 * 1024;
-const ANALYZE_BUFFER_POOL_FLOOR = 128 * 1024 * 1024;
+// Real staged resumes build graph/FTS state before restoring vectors. A 128 MiB
+// hint can exhaust LadybugDB even for a ~21k-element repository, so keep the
+// analyze floor at the smallest value proven by the copied ClawSweeper corpus.
+const ANALYZE_BUFFER_POOL_FLOOR = 512 * 1024 * 1024;
 
 const parseBufferPoolSize = (raw: string | undefined): number | undefined => {
   if (raw === undefined) return undefined;

@@ -1664,6 +1664,10 @@ const runFullAnalysisImpl = async (
     lastCommit: existingMeta?.lastCommit,
     indexedAt: resumeEmbeddingCheckpoint ? undefined : existingMeta?.indexedAt,
   };
+  const embeddingSnapshotValidationOptions =
+    stagedPaths && resumeEmbeddingCheckpoint
+      ? { allowSourceIndexedAtDriftForCheckpointResume: true as const }
+      : undefined;
   let embeddingSnapshotInfo: EmbeddingSnapshotInfo | undefined;
   let embeddingSnapshotAvailable = false;
   let embeddingTableRebuildStarted = false;
@@ -1721,6 +1725,7 @@ const runFullAnalysisImpl = async (
         embeddingSnapshotPath,
         embeddingSnapshotSource,
         expectedSnapshotCount,
+        embeddingSnapshotValidationOptions,
       );
       if (stagedPaths && resumeEmbeddingCheckpoint) {
         embeddingTableRebuildStarted = await validateEmbeddingTableRebuildMarker(
@@ -2613,6 +2618,7 @@ const runFullAnalysisImpl = async (
             }
           },
           resumeEmbeddingCheckpoint ? undefined : existingEmbeddingCount,
+          embeddingSnapshotValidationOptions,
         );
         if (skippedPendingEmbeddingRows > 0) {
           log(

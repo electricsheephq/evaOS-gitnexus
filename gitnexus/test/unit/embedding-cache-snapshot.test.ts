@@ -205,16 +205,30 @@ describe('bounded embedding preservation snapshot', () => {
 
   it('keeps checkpoint-resume snapshots valid across metadata timestamp rewrites', async () => {
     const snapshotPath = await makePath();
-    const source = { lastCommit: 'abc', indexedAt: undefined };
+    const source = { lastCommit: 'abc', indexedAt: '2026-07-22T00:00:00.000Z' };
     await createEmbeddingSnapshot(snapshotPath, source, async (emit) => emit(makeRows(1)));
 
     const checkpointMetadata = { lastCommit: 'abc', indexedAt: '2026-07-22T01:23:45.000Z' };
+    const resumeSource = {
+      lastCommit: checkpointMetadata.lastCommit,
+      indexedAt: undefined,
+    };
+    await expect(validateEmbeddingSnapshot(snapshotPath, resumeSource)).resolves.toBeUndefined();
     await expect(
-      validateEmbeddingSnapshot(snapshotPath, {
-        lastCommit: checkpointMetadata.lastCommit,
-        indexedAt: undefined,
+      validateEmbeddingSnapshot(snapshotPath, resumeSource, undefined, {
+        allowSourceIndexedAtDriftForCheckpointResume: true,
       }),
     ).resolves.toMatchObject({ count: 1, dimensions: 4 });
+
+    const restored: CachedEmbedding[] = [];
+    await readEmbeddingSnapshot(
+      snapshotPath,
+      resumeSource,
+      async (batch) => restored.push(...batch),
+      undefined,
+      { allowSourceIndexedAtDriftForCheckpointResume: true },
+    );
+    expect(restored).toHaveLength(1);
   });
 
   it('rejects a producer batch above the 256-vector cap and removes its temp file', async () => {
