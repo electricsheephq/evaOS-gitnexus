@@ -53,8 +53,9 @@ async function importRepairSubject(options: {
   malformedEmbeddingTable?: boolean;
   afterInitialPreflight?: () => Promise<void> | void;
 }) {
-  const counts = [...(options.counts ?? [3, 3, 3])];
+  const counts = [...(options.counts ?? [3, 3, 3, 3])];
   const probes = [...(options.probes ?? [brokenProbe, healthyProbe])];
+  const initLbugReadOnlyNonRecovering = vi.fn(async () => undefined);
   const initLbugForMaintenance = vi.fn(async () => undefined);
   const loadVectorExtension = vi.fn(async () => options.vectorAvailable ?? true);
   const dropVectorIndex = vi.fn(async () => true);
@@ -94,9 +95,9 @@ async function importRepairSubject(options: {
   }));
   const registerRepo = vi.fn(async () => 'fixture-repo');
   const probeDoctorPool = vi.fn(async () => probes.shift() ?? healthyProbe);
-
   vi.doMock('../../src/core/lbug/lbug-adapter.js', async (importActual) => ({
     ...(await importActual<typeof import('../../src/core/lbug/lbug-adapter.js')>()),
+    initLbugReadOnlyNonRecovering,
     initLbugForMaintenance,
     loadVectorExtension,
     dropVectorIndex,
@@ -135,6 +136,7 @@ async function importRepairSubject(options: {
   return {
     ...subject,
     mocks: {
+      initLbugReadOnlyNonRecovering,
       initLbugForMaintenance,
       loadVectorExtension,
       dropVectorIndex,
@@ -176,7 +178,9 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
         expect.stringMatching(/MATCH \(e:CodeEmbedding\).*count/i),
         expect.stringMatching(/MATCH \(e:CodeEmbedding\).*count/i),
         expect.stringMatching(/MATCH \(e:CodeEmbedding\).*count/i),
+        expect.stringMatching(/MATCH \(e:CodeEmbedding\).*count/i),
       ]);
+      expect(mocks.initLbugReadOnlyNonRecovering).toHaveBeenCalledWith(indexed.paths.lbugPath);
       expect(mocks.registerRepo).toHaveBeenCalledOnce();
 
       const repaired = JSON.parse(
@@ -205,6 +209,7 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       expect(mocks.dropVectorIndex).not.toHaveBeenCalled();
       expect(mocks.createVectorIndex).not.toHaveBeenCalled();
       expect(mocks.registerRepo).not.toHaveBeenCalled();
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
       expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(
         before,
       );
@@ -226,6 +231,8 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
       expect(mocks.dropVectorIndex).not.toHaveBeenCalled();
       expect(mocks.createVectorIndex).not.toHaveBeenCalled();
       expect(mocks.registerRepo).not.toHaveBeenCalled();
+      expect(mocks.probeDoctorPool).not.toHaveBeenCalled();
+      expect(mocks.initLbugForMaintenance).not.toHaveBeenCalled();
       expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(
         before,
       );
