@@ -31,6 +31,7 @@ import {
   deleteAllInjects,
   queryImportersBatch,
   loadFTSExtension,
+  recreateCodeEmbeddingTable,
   wipeLbugDbFiles,
   LbugWipeError,
   DELETE_FILES_CHUNK_SIZE,
@@ -1306,6 +1307,8 @@ const runFullAnalysisImpl = async (
   };
   let embeddingSnapshotInfo: EmbeddingSnapshotInfo | undefined;
   let embeddingSnapshotAvailable = false;
+  const rebuildStagedEmbeddingTableForResume =
+    Boolean(stagedPaths) && resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.size > 0;
 
   const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
   const {
@@ -1354,11 +1357,16 @@ const runFullAnalysisImpl = async (
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       const expectedSnapshotCount = resumeEmbeddingCheckpoint ? undefined : existingEmbeddingCount;
-      embeddingSnapshotInfo = await validateEmbeddingSnapshot(
-        embeddingSnapshotPath,
-        embeddingSnapshotSource,
-        expectedSnapshotCount,
-      );
+      // A checkpointed staged generation may contain completed rows written
+      // after the original preservation snapshot. Refresh from the actual
+      // staged table so recreating it below cannot discard those rows.
+      embeddingSnapshotInfo = rebuildStagedEmbeddingTableForResume
+        ? undefined
+        : await validateEmbeddingSnapshot(
+            embeddingSnapshotPath,
+            embeddingSnapshotSource,
+            expectedSnapshotCount,
+          );
       if (embeddingSnapshotInfo) {
         embeddingSnapshotAvailable = true;
         log(
@@ -1366,6 +1374,9 @@ const runFullAnalysisImpl = async (
             `(${embeddingSnapshotInfo.count} vectors).`,
         );
       } else {
+        if (rebuildStagedEmbeddingTableForResume) {
+          log('Refreshing the staged embedding snapshot before checkpoint resume.');
+        }
         embeddingSnapshotInfo = await createEmbeddingSnapshot(
           embeddingSnapshotPath,
           embeddingSnapshotSource,
@@ -2055,6 +2066,25 @@ const runFullAnalysisImpl = async (
     // row that already exists and fail with a duplicate primary key (#155).
     const restoredEmbeddingHashes = new Map<string, string>();
     const restoredEmbeddingRowIds = new Map<string, string[]>();
+    if (
+      rebuildStagedEmbeddingTableForResume &&
+      embeddingSnapshotInfo &&
+      embeddingSnapshotInfo.count > 0
+    ) {
+      const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
+      if (embeddingSnapshotInfo.dimensions !== EMBEDDING_DIMS) {
+        throw new Error(
+          `Cannot recreate the staged embedding table from a ` +
+            `${embeddingSnapshotInfo.dimensions}-dimensional snapshot; this run requires ` +
+            `${EMBEDDING_DIMS} dimensions.`,
+        );
+      }
+      progress('embeddings', 87, 'Recreating the isolated staged embedding table...');
+      await recreateCodeEmbeddingTable();
+      // The table is now empty even if graph writeback was surgical. Restore
+      // every live non-pending snapshot row, not only changed-file rows.
+      deletedFilePathsForRestore = null;
+    }
     if (embeddingSnapshotInfo && embeddingSnapshotInfo.count > 0) {
       const cachedDims = embeddingSnapshotInfo.dimensions;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');

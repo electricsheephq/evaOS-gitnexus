@@ -17,6 +17,7 @@ import {
   SCHEMA_QUERIES,
   EMBEDDING_TABLE_NAME,
   EMBEDDING_INDEX_NAME,
+  EMBEDDING_SCHEMA,
   CREATE_VECTOR_INDEX_QUERY,
   DROP_VECTOR_INDEX_QUERY,
   STALE_HASH_SENTINEL,
@@ -2932,6 +2933,29 @@ export const dropVectorIndex = async (): Promise<boolean> => {
     if (isReadOnlyDbError(error)) return false;
     throw error;
   }
+};
+
+/**
+ * Recreate the embedding table after taking a complete, validated snapshot of
+ * an interrupted staged generation. This is intentionally a low-level helper:
+ * callers must prove they are operating on disposable staged storage and must
+ * restore the snapshot before promotion.
+ */
+export const recreateCodeEmbeddingTable = async (): Promise<void> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  if (!(await dropVectorIndex())) {
+    throw new Error('Cannot recreate CodeEmbedding because its VECTOR index could not be dropped.');
+  }
+
+  try {
+    await queryAndDrain(conn, `DROP TABLE ${EMBEDDING_TABLE_NAME}`);
+  } catch (error) {
+    if (!isMissingEmbeddingTableError(error)) throw error;
+  }
+  await queryAndDrain(conn, EMBEDDING_SCHEMA);
+  vectorIndexEnsured = false;
 };
 
 /**
