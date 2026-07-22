@@ -32,12 +32,16 @@ import {
   deleteAllInjects,
   queryImportersBatch,
   loadFTSExtension,
+  recreateCodeEmbeddingTable,
   loadVectorExtension,
   createVectorIndex,
   dropVectorIndex,
   wipeLbugDbFiles,
   LbugWipeError,
   DELETE_FILES_CHUNK_SIZE,
+  inspectEmbeddingIntegrity,
+  embeddingIntegrityFailures,
+  type EmbeddingIntegrityReport,
 } from './lbug/lbug-adapter.js';
 import { estimateBufferPool, setBufferPoolSizeHint } from './lbug/lbug-config.js';
 import { escapeCypherString } from './lbug/cypher-escape.js';
@@ -126,8 +130,14 @@ import {
   readEmbeddingSnapshot,
   removeEmbeddingSnapshot,
   validateEmbeddingSnapshot,
+  embeddingSnapshotMatchesIdentityDigest,
   type EmbeddingSnapshotInfo,
 } from './embeddings/cache-snapshot.js';
+import {
+  removeEmbeddingTableRebuildMarker,
+  validateEmbeddingTableRebuildMarker,
+  writeEmbeddingTableRebuildMarker,
+} from './embeddings/rebuild-marker.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME, STALE_HASH_SENTINEL } from './lbug/schema.js';
@@ -324,6 +334,36 @@ const resolveEmbeddingIdentity = async (): Promise<EmbeddingIdentity> => {
     dimensions: getEmbeddingDimensions(),
   };
 };
+
+const embeddingIntegrityIsClean = (report: EmbeddingIntegrityReport): boolean =>
+  embeddingIntegrityFailures(report) === 0 && report.physicalRows === report.validRows;
+
+const embeddingIntegritySummary = (report: EmbeddingIntegrityReport): string =>
+  `physical=${report.physicalRows}, valid=${report.validRows}, recoverable=${report.recoverableRows}, ` +
+  `empty-id=${report.emptyIdRows}, empty-owner=${report.emptyNodeIdRows}, ` +
+  `invalid-chunk=${report.invalidChunkRows}, noncanonical-id=${report.noncanonicalIdRows}, ` +
+  `duplicate-id=${report.duplicateIdRows}, duplicate-owner-chunk=${report.duplicateSemanticRows}, ` +
+  `orphan=${report.orphanRows}, wrong-dimension=${report.wrongDimensionRows}`;
+
+const assertEmbeddingIntegrity = (
+  report: EmbeddingIntegrityReport,
+  context: string,
+  expectedCount?: number,
+): void => {
+  if (
+    !embeddingIntegrityIsClean(report) ||
+    (expectedCount !== undefined && report.physicalRows !== expectedCount)
+  ) {
+    throw new Error(
+      `${context} failed embedding integrity validation (${embeddingIntegritySummary(report)}).`,
+    );
+  }
+};
+
+export const shouldRecreateStagedEmbeddingTableForResume = (
+  rebuild: boolean,
+  snapshotInfo: EmbeddingSnapshotInfo | undefined,
+): snapshotInfo is EmbeddingSnapshotInfo => rebuild && snapshotInfo !== undefined;
 
 const pathKind = (state: Awaited<ReturnType<typeof fs.lstat>>): string => {
   if (state.isSymbolicLink()) return 'a symbolic link';
@@ -822,6 +862,7 @@ const runFullAnalysisImpl = async (
       await initLbugForMaintenance(canonicalPaths.lbugPath);
       stats = await getLbugStats();
       embeddingCountBefore = await readEmbeddingCount();
+      const integrityBefore = await inspectEmbeddingIntegrity();
 
       if (embeddingCountBefore === 0) {
         progress('done', 100, 'No embeddings are indexed; VECTOR repair was not needed.');
@@ -835,6 +876,12 @@ const runFullAnalysisImpl = async (
           vectorRepairStatus: 'not-indexed',
         };
       }
+
+      assertEmbeddingIntegrity(
+        integrityBefore,
+        'Cannot repair VECTOR: source table',
+        embeddingCountBefore,
+      );
 
       if (beforeProbe.reason || !beforeProbe.vector) {
         throw new Error(
@@ -905,6 +952,11 @@ const runFullAnalysisImpl = async (
             `verified, ${committedEmbeddingCount} current); metadata and registry were not updated.`,
         );
       }
+      assertEmbeddingIntegrity(
+        await inspectEmbeddingIntegrity(),
+        'Cannot commit VECTOR repair metadata: repaired table',
+        committedEmbeddingCount,
+      );
       repairedMeta = {
         ...existingMeta,
         repoPath,
@@ -947,9 +999,22 @@ const runFullAnalysisImpl = async (
 
   const promoteValidatedStage = async (paths: StagedAnalyzePaths): Promise<string | undefined> => {
     const stagedMeta = await validateStagedGeneration(paths);
-    const stagedStats = await withLbugDb(paths.stagedLbugPath, getLbugStats, {
-      readOnly: true,
-    });
+    let stagedValidation: {
+      stats: Awaited<ReturnType<typeof getLbugStats>>;
+      integrity: EmbeddingIntegrityReport;
+    };
+    try {
+      stagedValidation = await withLbugDb(
+        paths.stagedLbugPath,
+        async () => ({ stats: await getLbugStats(), integrity: await inspectEmbeddingIntegrity() }),
+        { readOnly: true },
+      );
+    } finally {
+      // Promotion renames this file. Windows refuses the rename while the
+      // singleton read-only handle remains open.
+      await closeLbug().catch(() => {});
+    }
+    const stagedStats = stagedValidation.stats;
     if (
       (stagedMeta.stats?.nodes !== undefined && stagedMeta.stats.nodes !== stagedStats.nodes) ||
       (stagedMeta.stats?.edges !== undefined && stagedMeta.stats.edges !== stagedStats.edges)
@@ -960,11 +1025,48 @@ const runFullAnalysisImpl = async (
           `but the readable DB contains ${stagedStats.nodes} nodes/${stagedStats.edges} edges.`,
       );
     }
+    assertEmbeddingIntegrity(
+      stagedValidation.integrity,
+      'Staged DB validation',
+      stagedMeta.stats?.embeddings,
+    );
     return (
       await promoteStagedGeneration(paths, commitStagedMetadataAndRegistry, {
         readRepositoryIdentity,
       })
     ).projectName;
+  };
+
+  const validatePendingPromotionEmbeddingCandidate = async (
+    paths: StagedAnalyzePaths,
+  ): Promise<void> => {
+    const stagedState = await lstatIfPresent(paths.stagedLbugPath);
+    const candidatePath = stagedState?.isFile() ? paths.stagedLbugPath : paths.canonicalLbugPath;
+    const candidateState = await lstatIfPresent(candidatePath);
+    if (!candidateState?.isFile() || candidateState.isSymbolicLink()) {
+      throw new Error(
+        'Pending staged promotion has no unambiguous regular candidate database; refusing recovery.',
+      );
+    }
+    const stagedRootState = await lstatIfPresent(paths.stageRoot);
+    const candidateMeta = await loadMeta(
+      stagedRootState ? paths.stagedMetaDir : paths.canonicalMetaDir,
+    );
+    if (!candidateMeta) {
+      throw new Error('Pending staged promotion has no readable candidate metadata.');
+    }
+    try {
+      const integrity = await withLbugDb(candidatePath, inspectEmbeddingIntegrity, {
+        readOnly: true,
+      });
+      assertEmbeddingIntegrity(
+        integrity,
+        'Pending staged promotion candidate',
+        candidateMeta.stats?.embeddings,
+      );
+    } finally {
+      await closeLbug().catch(() => {});
+    }
   };
 
   // Every analyze mode owns the same canonical slot and must resolve its
@@ -978,6 +1080,7 @@ const runFullAnalysisImpl = async (
       );
     }
     progress('lbug', 1, 'Recovering staged promotion...');
+    await validatePendingPromotionEmbeddingCandidate(promotionPaths);
     await promoteStagedGeneration(promotionPaths, commitStagedMetadataAndRegistry, {
       readRepositoryIdentity,
     });
@@ -1556,12 +1659,16 @@ const runFullAnalysisImpl = async (
   // post-commit hook) safe: a multi-minute embedding pass is no longer
   // silently dropped just because the caller omitted `--embeddings`.
   const embeddingSnapshotPath = path.join(metaDir, EMBEDDING_SNAPSHOT_FILE);
+  const embeddingTableRebuildMarkerPath = path.join(metaDir, 'embedding-table-rebuild.json');
   const embeddingSnapshotSource = {
     lastCommit: existingMeta?.lastCommit,
-    indexedAt: existingMeta?.indexedAt,
+    indexedAt: resumeEmbeddingCheckpoint ? undefined : existingMeta?.indexedAt,
   };
   let embeddingSnapshotInfo: EmbeddingSnapshotInfo | undefined;
   let embeddingSnapshotAvailable = false;
+  let embeddingTableRebuildStarted = false;
+  let rebuildStagedEmbeddingTableForResume =
+    Boolean(stagedPaths) && resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.size > 0;
 
   const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
   const {
@@ -1615,6 +1722,52 @@ const runFullAnalysisImpl = async (
         embeddingSnapshotSource,
         expectedSnapshotCount,
       );
+      if (stagedPaths && resumeEmbeddingCheckpoint) {
+        embeddingTableRebuildStarted = await validateEmbeddingTableRebuildMarker(
+          embeddingTableRebuildMarkerPath,
+          embeddingSnapshotSource,
+          embeddingSnapshotInfo,
+        );
+        if (embeddingTableRebuildStarted) rebuildStagedEmbeddingTableForResume = true;
+        // Once a matching marker exists, the validated snapshot is the only
+        // authority: the table may already be empty or partially restored.
+        // Before the first destructive rebuild, prefer a clean live table so a
+        // checkpoint row written after an older snapshot is not lost. A known
+        // malformed native table is recoverable only when the pre-existing,
+        // checksummed snapshot covers every unique live-owner identity and has
+        // no duplicates. That is the narrow ClawSweeper recovery seam.
+        if (!embeddingTableRebuildStarted && embeddingSnapshotInfo) {
+          const sourceIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
+            readOnly: true,
+          });
+          if (embeddingIntegrityIsClean(sourceIntegrity)) {
+            embeddingSnapshotInfo = undefined;
+          } else {
+            const snapshotAuthorizesRecovery =
+              (embeddingSnapshotInfo.duplicateRows ?? 0) === 0 &&
+              embeddingSnapshotInfo.count === sourceIntegrity.recoverableRows &&
+              embeddingSnapshotMatchesIdentityDigest(
+                embeddingSnapshotInfo,
+                sourceIntegrity.recoverableIdentitySha256,
+              ) &&
+              sourceIntegrity.orphanRows === 0 &&
+              sourceIntegrity.invalidChunkRows === 0 &&
+              sourceIntegrity.wrongDimensionRows === 0;
+            if (!snapshotAuthorizesRecovery) {
+              throw new Error(
+                `Interrupted staged table is malformed and its preservation snapshot ` +
+                  `does not cover every recoverable identity (${embeddingIntegritySummary(sourceIntegrity)}).`,
+              );
+            }
+            rebuildStagedEmbeddingTableForResume = true;
+            log(
+              `The interrupted staged embedding table is malformed; its validated ` +
+                `${embeddingSnapshotInfo.count}-row preservation snapshot will be made ` +
+                `authoritative before isolated recreation.`,
+            );
+          }
+        }
+      }
       if (embeddingSnapshotInfo) {
         embeddingSnapshotAvailable = true;
         log(
@@ -1622,6 +1775,15 @@ const runFullAnalysisImpl = async (
             `(${embeddingSnapshotInfo.count} vectors).`,
         );
       } else {
+        if (rebuildStagedEmbeddingTableForResume) {
+          log('Refreshing the staged embedding snapshot before checkpoint resume.');
+        }
+        if (stagedPaths && resumeEmbeddingCheckpoint) {
+          const sourceIntegrity = await withLbugDb(lbugPath, inspectEmbeddingIntegrity, {
+            readOnly: true,
+          });
+          assertEmbeddingIntegrity(sourceIntegrity, 'Embedding preservation source');
+        }
         embeddingSnapshotInfo = await createEmbeddingSnapshot(
           embeddingSnapshotPath,
           embeddingSnapshotSource,
@@ -1645,6 +1807,14 @@ const runFullAnalysisImpl = async (
         );
         embeddingSnapshotAvailable = true;
         await closeLbug();
+      }
+      if (rebuildStagedEmbeddingTableForResume && !embeddingTableRebuildStarted) {
+        await writeEmbeddingTableRebuildMarker(
+          embeddingTableRebuildMarkerPath,
+          embeddingSnapshotSource,
+          embeddingSnapshotInfo,
+        );
+        embeddingTableRebuildStarted = true;
       }
       if (
         !resumeEmbeddingCheckpoint &&
@@ -2323,6 +2493,29 @@ const runFullAnalysisImpl = async (
     // row that already exists and fail with a duplicate primary key (#155).
     const restoredEmbeddingHashes = new Map<string, string>();
     const restoredEmbeddingRowIds = new Map<string, string[]>();
+    if (
+      shouldRecreateStagedEmbeddingTableForResume(
+        rebuildStagedEmbeddingTableForResume,
+        embeddingSnapshotInfo,
+      )
+    ) {
+      if (embeddingSnapshotInfo.count > 0) {
+        const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
+        if (embeddingSnapshotInfo.dimensions !== EMBEDDING_DIMS) {
+          throw new Error(
+            `Cannot recreate the staged embedding table from a ` +
+              `${embeddingSnapshotInfo.dimensions}-dimensional snapshot; this run requires ` +
+              `${EMBEDDING_DIMS} dimensions.`,
+          );
+        }
+      }
+      progress('embeddings', 87, 'Recreating the isolated staged embedding table...');
+      const { resolveEmbeddingInstallPolicy } = await import('./embeddings/embedding-pipeline.js');
+      await recreateCodeEmbeddingTable({ policy: resolveEmbeddingInstallPolicy() });
+      // The table is now empty even if graph writeback was surgical. Restore
+      // every live non-pending snapshot row, not only changed-file rows.
+      deletedFilePathsForRestore = null;
+    }
     if (embeddingSnapshotInfo && embeddingSnapshotInfo.count > 0) {
       const cachedDims = embeddingSnapshotInfo.dimensions;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
@@ -2800,7 +2993,17 @@ const runFullAnalysisImpl = async (
     // reclaim (#2264). Long-lived callers close for real.
     await (options.skipNativeCloseOnExit && !stagedPaths ? closeLbugBeforeExit() : closeLbug());
 
-    if (embeddingSnapshotAvailable) {
+    let embeddingTableRebuildMarkerRemoved = true;
+    if (embeddingTableRebuildStarted) {
+      await removeEmbeddingTableRebuildMarker(embeddingTableRebuildMarkerPath).catch((error) => {
+        embeddingTableRebuildMarkerRemoved = false;
+        log(
+          `Warning: could not remove completed embedding table rebuild marker ` +
+            `(${(error as Error).message}); the validated snapshot remains authoritative.`,
+        );
+      });
+    }
+    if (embeddingSnapshotAvailable && embeddingTableRebuildMarkerRemoved) {
       await removeEmbeddingSnapshot(embeddingSnapshotPath).catch((error) => {
         log(
           `Warning: could not remove completed embedding preservation snapshot ` +

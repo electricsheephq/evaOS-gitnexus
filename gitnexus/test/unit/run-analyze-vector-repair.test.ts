@@ -50,6 +50,7 @@ async function importRepairSubject(options: {
   vectorAvailable?: boolean;
   createError?: Error;
   missingEmbeddingTable?: boolean;
+  malformedEmbeddingTable?: boolean;
   afterInitialPreflight?: () => Promise<void> | void;
 }) {
   const counts = [...(options.counts ?? [3, 3, 3])];
@@ -63,14 +64,34 @@ async function importRepairSubject(options: {
   });
   const closeLbug = vi.fn(async () => undefined);
   let embeddingCountQueries = 0;
+  let lastEmbeddingCount = counts[0] ?? 0;
   const executeQuery = vi.fn(async (query: string) => {
     if (!query.includes('CodeEmbedding')) return [];
     embeddingCountQueries++;
     if (options.missingEmbeddingTable && embeddingCountQueries === 1) {
       throw new Error('Binder exception: Table CodeEmbedding does not exist.');
     }
-    return [{ cnt: counts.shift() ?? 0 }];
+    lastEmbeddingCount = counts.shift() ?? 0;
+    return [{ cnt: lastEmbeddingCount }];
   });
+  const inspectEmbeddingIntegrity = vi.fn(async () => ({
+    tablePresent: true,
+    physicalRows: lastEmbeddingCount,
+    validRows: options.malformedEmbeddingTable
+      ? Math.max(0, lastEmbeddingCount - 1)
+      : lastEmbeddingCount,
+    recoverableRows: options.malformedEmbeddingTable
+      ? Math.max(0, lastEmbeddingCount - 1)
+      : lastEmbeddingCount,
+    emptyIdRows: options.malformedEmbeddingTable ? 1 : 0,
+    emptyNodeIdRows: 0,
+    invalidChunkRows: 0,
+    noncanonicalIdRows: 0,
+    duplicateIdRows: 0,
+    duplicateSemanticRows: 0,
+    orphanRows: 0,
+    wrongDimensionRows: 0,
+  }));
   const registerRepo = vi.fn(async () => 'fixture-repo');
   const probeDoctorPool = vi.fn(async () => probes.shift() ?? healthyProbe);
 
@@ -83,6 +104,7 @@ async function importRepairSubject(options: {
     closeLbug,
     getLbugStats: vi.fn(async () => ({ nodes: 5, edges: 4 })),
     executeQuery,
+    inspectEmbeddingIntegrity,
   }));
   vi.doMock('../../src/cli/doctor-pool-probe.js', () => ({
     EXPECTED_POOL_CONNECTIONS: 8,
@@ -119,6 +141,7 @@ async function importRepairSubject(options: {
       createVectorIndex,
       closeLbug,
       executeQuery,
+      inspectEmbeddingIntegrity,
       registerRepo,
       probeDoctorPool,
     },
@@ -179,6 +202,27 @@ describe('runFullAnalysis VECTOR-only repair (#170)', () => {
 
       expect(result.vectorRepairStatus).toBe('not-indexed');
       expect(mocks.loadVectorExtension).not.toHaveBeenCalled();
+      expect(mocks.dropVectorIndex).not.toHaveBeenCalled();
+      expect(mocks.createVectorIndex).not.toHaveBeenCalled();
+      expect(mocks.registerRepo).not.toHaveBeenCalled();
+      expect(await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'))).toEqual(
+        before,
+      );
+    } finally {
+      await indexed.fixture.cleanup();
+    }
+  });
+
+  it('refuses malformed embedding identity before HNSW or metadata mutation', async () => {
+    const indexed = await createIndexedFixture();
+    try {
+      const before = await fs.readFile(path.join(indexed.paths.storagePath, 'gitnexus.json'));
+      const { runFullAnalysis, mocks } = await importRepairSubject({
+        malformedEmbeddingTable: true,
+      });
+      await expect(
+        runFullAnalysis(indexed.fixture.dbPath, { repairVector: true }, { onProgress: () => {} }),
+      ).rejects.toThrow(/source table failed embedding integrity validation/i);
       expect(mocks.dropVectorIndex).not.toHaveBeenCalled();
       expect(mocks.createVectorIndex).not.toHaveBeenCalled();
       expect(mocks.registerRepo).not.toHaveBeenCalled();

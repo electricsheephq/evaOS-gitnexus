@@ -39,8 +39,19 @@ import {
   resolveEmbeddingConfig,
 } from './config.js';
 import { rankExactEmbeddingRows, type ExactEmbeddingRow } from './exact-search.js';
-import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME, STALE_HASH_SENTINEL } from '../lbug/schema.js';
-import { loadVectorExtension, createVectorIndex, dropVectorIndex } from '../lbug/lbug-adapter.js';
+import {
+  EMBEDDING_TABLE_NAME,
+  EMBEDDING_INDEX_NAME,
+  EMBEDDING_DIMS,
+  STALE_HASH_SENTINEL,
+} from '../lbug/schema.js';
+import {
+  loadVectorExtension,
+  createVectorIndex,
+  dropVectorIndex,
+  inspectEmbeddingIntegrity,
+  embeddingIntegrityFailures,
+} from '../lbug/lbug-adapter.js';
 import { escapeCypherString } from '../lbug/cypher-escape.js';
 import { isMissingColumnOrTableError } from '../lbug/schema-errors.js';
 import type { ExtensionInstallPolicy } from '../lbug/extension-loader.js';
@@ -286,6 +297,23 @@ export const batchInsertEmbeddings = async (
     contentHash?: string;
   }>,
 ): Promise<void> => {
+  const identities = new Set<string>();
+  for (const update of updates) {
+    const nodeId = update.nodeId;
+    const identity = `${nodeId}:${update.chunkIndex}`;
+    if (
+      typeof nodeId !== 'string' ||
+      nodeId.trim().length === 0 ||
+      !Number.isSafeInteger(update.chunkIndex) ||
+      update.chunkIndex < 0 ||
+      update.embedding.length !== EMBEDDING_DIMS ||
+      update.embedding.some((value) => !Number.isFinite(value)) ||
+      identities.has(identity)
+    ) {
+      throw new Error('Embedding batch contains an invalid or duplicate identity/vector.');
+    }
+    identities.add(identity);
+  }
   const cypher = `CREATE (e:${EMBEDDING_TABLE_NAME} {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash})`;
   const paramsList = updates.map((u) => ({
     id: `${u.nodeId}:${u.chunkIndex}`,
@@ -296,7 +324,13 @@ export const batchInsertEmbeddings = async (
     embedding: u.embedding,
     contentHash: u.contentHash ?? STALE_HASH_SENTINEL,
   }));
-  await executeWithReusedStatement(cypher, paramsList);
+  // Preserved malformed artifacts passed through the repeated prepared-CREATE
+  // path, although a focused native reproduction did not prove it causal.
+  // Prepare, execute, and drain once per identity as a bounded precaution; the
+  // terminal integrity scan remains the authoritative safety gate.
+  for (const params of paramsList) {
+    await executeWithReusedStatement(cypher, [params]);
+  }
 };
 
 /**
@@ -319,6 +353,14 @@ export const batchInsertEmbeddings = async (
  * dynamic import only (lazy-embeddings convention, #2370).
  */
 export const buildVectorIndex = async (): Promise<boolean> => {
+  const integrity = await inspectEmbeddingIntegrity();
+  if (embeddingIntegrityFailures(integrity) > 0 || integrity.physicalRows !== integrity.validRows) {
+    throw new Error(
+      `Vector index creation refused malformed embedding rows ` +
+        `(physical=${integrity.physicalRows}, valid=${integrity.validRows}, ` +
+        `recoverable=${integrity.recoverableRows}).`,
+    );
+  }
   // This pre-check applies the embedding-specific install policy
   // (resolveEmbeddingInstallPolicy, default `auto` for analyze) before reaching
   // the adapter. The adapter's createVectorIndex() calls loadVectorExtension()
@@ -466,7 +508,10 @@ export const runEmbeddingPipeline = async (
       logger.warn(vectorUnavailableMessage);
     }
     if (pipelineOptions.rebuildVectorIndexBeforeMutation) {
-      if (!vectorAvailable || !(await dropVectorIndex())) {
+      if (
+        !vectorAvailable ||
+        !(await dropVectorIndex({ policy: resolveEmbeddingInstallPolicy() }))
+      ) {
         throw new Error(
           'Cannot safely resume the staged embedding checkpoint because its VECTOR index could not be dropped.',
         );
