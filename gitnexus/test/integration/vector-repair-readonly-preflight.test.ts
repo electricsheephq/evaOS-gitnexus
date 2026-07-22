@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
-import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { getStoragePaths, saveMeta, type RepoMeta } from '../../src/storage/repo-manager.js';
 import { EMBEDDING_DIMS } from '../../src/core/lbug/schema.js';
