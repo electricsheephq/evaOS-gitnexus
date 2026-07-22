@@ -1111,6 +1111,7 @@ const runFullAnalysisImpl = async (
   // promotion journal before any fast path can report success. In particular,
   // a crash at old-backed-up may leave the canonical pathname temporarily
   // absent even when metadata still looks current.
+  let recoveredPendingPromotion = false;
   if (await hasPendingPromotion(promotionPaths)) {
     if (options.incrementalOnly) {
       throw new Error(
@@ -1122,6 +1123,7 @@ const runFullAnalysisImpl = async (
     await promoteStagedGeneration(promotionPaths, commitStagedMetadataAndRegistry, {
       readRepositoryIdentity,
     });
+    recoveredPendingPromotion = true;
     log('Recovered and completed the previous staged promotion.');
   }
 
@@ -1140,8 +1142,27 @@ const runFullAnalysisImpl = async (
     throw new Error('`--staged` cannot be combined with `--repair-fts`; repair is in-place only.');
   }
 
+  if (recoveredPendingPromotion) {
+    const recoveredMeta = await loadMeta(canonicalMetaDir);
+    if (!recoveredMeta) {
+      throw new Error('Recovered staged promotion is missing canonical metadata.');
+    }
+    progress('done', 100, 'Recovered staged promotion');
+    return {
+      repoName:
+        options.registryName ??
+        getInferredRepoName(repoPath) ??
+        path.basename(resolveRepoIdentityRoot(repoPath)),
+      repoPath,
+      stats: recoveredMeta.stats ?? {},
+      alreadyUpToDate: true,
+      isPrimaryBranch: !placement.branch,
+    };
+  }
+
   let stagedWorkspaceResumed = false;
   let stagedWorkspaceExisted = false;
+  let promoteCompletedStageFastPath = false;
   let canonicalDatabaseExistedAtStageStart = false;
   let canonicalMetaAtStageStart: RepoMeta | null = null;
   if (stagedPaths) {
@@ -1209,6 +1230,7 @@ const runFullAnalysisImpl = async (
   let existingMeta = await loadMeta(metaDir);
   if (stagedPaths) {
     const stagedCompletedCandidate =
+      !options.dropEmbeddings &&
       stagedWorkspaceResumed &&
       !!existingMeta &&
       !existingMeta.incrementalInProgress &&
@@ -1228,7 +1250,7 @@ const runFullAnalysisImpl = async (
       // A complete stage that died immediately before promotion should be
       // promoted, even when the original invocation included --force. It is
       // immutable validated output, not a cache/resume surface.
-      options = { ...options, force: false };
+      promoteCompletedStageFastPath = true;
     } else {
       if (
         !options.dropEmbeddings &&
@@ -1627,7 +1649,7 @@ const runFullAnalysisImpl = async (
   if (
     existingMeta &&
     !existingMeta.embeddingCheckpoint &&
-    !options.force &&
+    (!options.force || promoteCompletedStageFastPath) &&
     existingMeta.lastCommit === currentCommit
   ) {
     // Non-git folders have currentCommit = '' — always rebuild since we can't detect changes

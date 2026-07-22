@@ -397,6 +397,120 @@ describe('runFullAnalysis --staged', () => {
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('keeps force when a completed stage fast path falls through on dirty source', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-dirty-force-'));
+    tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+
+    const canonical = getStoragePaths(repo);
+    const canonicalMeta = await loadMeta(canonical.storagePath);
+    if (!canonicalMeta) throw new Error('expected canonical metadata');
+    const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
+    await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
+    const completedAt = '2026-07-20T12:00:00.000Z';
+    await saveMeta(staged.stagedMetaDir, { ...canonicalMeta, indexedAt: completedAt });
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 2;\n');
+
+    const result = await runFullAnalysis(
+      repo,
+      { staged: true, force: true, skipAgentsMd: true, skipSkills: true },
+      { onProgress: () => {} },
+    );
+
+    expect(result.alreadyUpToDate).not.toBe(true);
+    expect((await loadMeta(canonical.storagePath))?.indexedAt).not.toBe(completedAt);
+    await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('replaces rather than promotes a completed stage when drop is explicit', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-completed-drop-'));
+    tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+
+    const canonical = getStoragePaths(repo);
+    const canonicalMeta = await loadMeta(canonical.storagePath);
+    if (!canonicalMeta) throw new Error('expected canonical metadata');
+    const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
+    await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
+    const completedAt = '2026-07-20T12:00:00.000Z';
+    await saveMeta(staged.stagedMetaDir, { ...canonicalMeta, indexedAt: completedAt });
+
+    const result = await runFullAnalysis(
+      repo,
+      {
+        staged: true,
+        force: true,
+        dropEmbeddings: true,
+        skipAgentsMd: true,
+        skipSkills: true,
+      },
+      { onProgress: () => {} },
+    );
+
+    expect(result.alreadyUpToDate).not.toBe(true);
+    expect((await loadMeta(canonical.storagePath))?.indexedAt).not.toBe(completedAt);
+    await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('returns success after recovering a pending staged promotion without drop', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-recovery-success-'));
+    tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+
+    const canonical = getStoragePaths(repo);
+    const canonicalMeta = await loadMeta(canonical.storagePath);
+    if (!canonicalMeta) throw new Error('expected canonical metadata');
+    const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
+    await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
+    const recoveredAt = '2026-07-20T12:00:00.000Z';
+    await saveMeta(staged.stagedMetaDir, { ...canonicalMeta, indexedAt: recoveredAt });
+    await expect(
+      promoteStagedGeneration(staged, async () => 'repo', {
+        afterBoundary: (boundary) => {
+          if (boundary === 'old-backed-up') throw new Error('simulated crash');
+        },
+      }),
+    ).rejects.toThrow('simulated crash');
+
+    const result = await runFullAnalysis(
+      repo,
+      { staged: true, skipAgentsMd: true, skipSkills: true },
+      { onProgress: () => {} },
+    );
+
+    expect(result.alreadyUpToDate).toBe(true);
+    expect((await loadMeta(canonical.storagePath))?.indexedAt).toBe(recoveredAt);
+    await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('finishes committed promotion cleanup after the staged metadata directory is gone', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-committed-cleanup-'));
     tempDirs.push(repo);
