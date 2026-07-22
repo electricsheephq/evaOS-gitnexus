@@ -736,6 +736,54 @@ export const initLbugForMaintenance = async (dbPath: string) =>
   });
 
 /**
+ * Open an existing database for a byte-preserving maintenance preflight.
+ *
+ * This deliberately bypasses the normal read-only recovery path: it never
+ * quarantines a WAL, replays shadow pages through a writable handle, creates
+ * an init lock, or opens the database writable. Callers must close the shared
+ * handle with {@link closeLbug} when their bounded read is complete.
+ */
+export const initLbugReadOnlyNonRecovering = async (dbPath: string) =>
+  runWithSessionLock(async () => {
+    if (conn || db) await safeClose();
+    resetOpenConnectionState();
+
+    const state = await fs.lstat(dbPath);
+    if (!state.isFile() || state.isSymbolicLink()) {
+      throw new Error(`Read-only preflight requires a regular database file at ${dbPath}`);
+    }
+
+    const sidecarState = await preflightLbugSidecars(dbPath, {
+      mode: 'read-only',
+      logger,
+      allowQuarantine: false,
+    });
+    if (sidecarState.kind !== 'clean') {
+      throw new Error(
+        `Read-only preflight refused: LadybugDB sidecar state is ${sidecarState.kind}; ` +
+          'recover the index before retrying.',
+      );
+    }
+
+    const opened = await openLbugConnection(lbug, dbPath, {
+      readOnly: true,
+      throwOnWalReplayFailure: true,
+    });
+    try {
+      await queryAndDrain(opened.conn, READ_ONLY_SHADOW_REPLAY_PROBE);
+    } catch (error) {
+      await closeLbugConnection(opened).catch(() => {});
+      throw error;
+    }
+
+    db = opened.db;
+    conn = opened.conn;
+    currentDbPath = dbPath;
+    currentDbReadOnly = true;
+    return { db, conn };
+  });
+
+/**
  * Execute multiple queries against one repo DB atomically.
  * While the callback runs, no other request can switch the active DB.
  *

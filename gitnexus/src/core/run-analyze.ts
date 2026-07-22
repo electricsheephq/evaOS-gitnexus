@@ -17,6 +17,7 @@ import { resetDegradedParseCounter } from './tree-sitter/safe-parse.js';
 import {
   initLbug,
   initLbugForMaintenance,
+  initLbugReadOnlyNonRecovering,
   loadGraphToLbug,
   getLbugStats,
   executeQuery,
@@ -837,7 +838,6 @@ const runFullAnalysisImpl = async (
 
     const { probeDoctorPool, EXPECTED_POOL_CONNECTIONS } =
       await import('../cli/doctor-pool-probe.js');
-    const beforeProbe = await probeDoctorPool(canonicalPaths.lbugPath);
     const readEmbeddingCount = async (): Promise<number> => {
       let rows: Awaited<ReturnType<typeof executeQuery>>;
       try {
@@ -858,27 +858,64 @@ const runFullAnalysisImpl = async (
     let embeddingCountBefore = 0;
     let repairStatus: AnalyzeResult['vectorRepairStatus'] = 'healthy';
 
+    // A writable LadybugDB open can change database bytes even when no Cypher
+    // mutation is issued. Validate the source table through a native read-only
+    // connection first so malformed and empty indexes fail/return without
+    // touching the database file.
+    let readOnlyPreflight: {
+      stats: { nodes: number; edges: number };
+      embeddingCount: number;
+      integrity: EmbeddingIntegrityReport;
+    };
+    try {
+      await initLbugReadOnlyNonRecovering(canonicalPaths.lbugPath);
+      const embeddingCount = await readEmbeddingCount();
+      readOnlyPreflight = {
+        stats: await getLbugStats(),
+        embeddingCount,
+        integrity: await inspectEmbeddingIntegrity(),
+      };
+    } finally {
+      await closeLbug().catch(() => {});
+    }
+
+    stats = readOnlyPreflight.stats;
+    embeddingCountBefore = readOnlyPreflight.embeddingCount;
+
+    if (embeddingCountBefore === 0) {
+      progress('done', 100, 'No embeddings are indexed; VECTOR repair was not needed.');
+      return {
+        repoName:
+          options.registryName ??
+          getInferredRepoName(repoPath) ??
+          path.basename(resolveRepoIdentityRoot(repoPath)),
+        repoPath,
+        stats: { ...existingMeta.stats, nodes: stats.nodes, edges: stats.edges, embeddings: 0 },
+        vectorRepairStatus: 'not-indexed',
+      };
+    }
+
+    assertEmbeddingIntegrity(
+      readOnlyPreflight.integrity,
+      'Cannot repair VECTOR: source table',
+      embeddingCountBefore,
+    );
+
+    const beforeProbe = await probeDoctorPool(canonicalPaths.lbugPath);
+
     try {
       await initLbugForMaintenance(canonicalPaths.lbugPath);
       stats = await getLbugStats();
-      embeddingCountBefore = await readEmbeddingCount();
-      const integrityBefore = await inspectEmbeddingIntegrity();
-
-      if (embeddingCountBefore === 0) {
-        progress('done', 100, 'No embeddings are indexed; VECTOR repair was not needed.');
-        return {
-          repoName:
-            options.registryName ??
-            getInferredRepoName(repoPath) ??
-            path.basename(resolveRepoIdentityRoot(repoPath)),
-          repoPath,
-          stats: { ...existingMeta.stats, nodes: stats.nodes, edges: stats.edges, embeddings: 0 },
-          vectorRepairStatus: 'not-indexed',
-        };
+      const writableEmbeddingCount = await readEmbeddingCount();
+      if (writableEmbeddingCount !== embeddingCountBefore) {
+        throw new Error(
+          `Cannot repair VECTOR: embedding rows changed after read-only preflight ` +
+            `(${embeddingCountBefore} before, ${writableEmbeddingCount} current).`,
+        );
       }
 
       assertEmbeddingIntegrity(
-        integrityBefore,
+        await inspectEmbeddingIntegrity(),
         'Cannot repair VECTOR: source table',
         embeddingCountBefore,
       );
