@@ -128,6 +128,37 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     expect(opts.repairFts).toBe(true);
   });
 
+  it('passes --repair-vector through to runFullAnalysis', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { repairVector: true });
+
+    const opts = runFullAnalysisMock.mock.calls[0][1];
+    expect(opts.repairVector).toBe(true);
+  });
+
+  it.each([
+    ['--force', { force: true }],
+    ['--staged', { staged: true }],
+    ['--incremental-only', { incrementalOnly: true }],
+    ['--repair-fts', { repairFts: true }],
+    ['--embeddings', { embeddings: true }],
+    ['--drop-embeddings', { dropEmbeddings: true }],
+    ['--skills', { skills: true }],
+    ['--pdg', { pdg: true }],
+    ['--branch', { branch: 'main' }],
+  ])('rejects combining --repair-vector with %s', async (_label, conflicting) => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { repairVector: true, ...conflicting });
+
+    expect(process.exitCode).toBe(1);
+    expect(cliErrorMock).toHaveBeenCalledWith(
+      expect.stringMatching(/cannot combine `--repair-vector`/i),
+    );
+    expect(runFullAnalysisMock).not.toHaveBeenCalled();
+  });
+
   it('passes --incremental-only through to runFullAnalysis', async () => {
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 

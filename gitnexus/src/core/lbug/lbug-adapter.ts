@@ -686,6 +686,44 @@ export const initLbug = async (dbPath: string) => {
 };
 
 /**
+ * Open an existing database for a narrowly-scoped maintenance operation.
+ *
+ * Unlike {@link initLbug}, this path never creates/removes a database, runs
+ * schema DDL, quarantines sidecars, or attempts recovery. Callers must perform
+ * their own storage/metadata preflight before entering this function. The
+ * init lock only closes the race with another LadybugDB opener; it is not a
+ * recovery mechanism.
+ */
+export const initLbugForMaintenance = async (dbPath: string) =>
+  runWithSessionLock(async () => {
+    if (conn || db) await safeClose();
+    resetOpenConnectionState();
+
+    const state = await fs.lstat(dbPath);
+    if (!state.isFile() || state.isSymbolicLink()) {
+      throw new Error(`Maintenance requires a regular, non-symlink database file at ${dbPath}`);
+    }
+
+    await preflightLbugSidecars(dbPath, {
+      mode: 'write',
+      logger,
+      allowQuarantine: false,
+    });
+
+    const releaseInitLock = await acquireInitLock(dbPath);
+    try {
+      const opened = await openLbugConnection(lbug, dbPath);
+      db = opened.db;
+      conn = opened.conn;
+      currentDbPath = dbPath;
+      currentDbReadOnly = false;
+      return { db, conn };
+    } finally {
+      await releaseInitLock();
+    }
+  });
+
+/**
  * Execute multiple queries against one repo DB atomically.
  * While the callback runs, no other request can switch the active DB.
  *
