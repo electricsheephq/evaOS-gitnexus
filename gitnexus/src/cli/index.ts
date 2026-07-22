@@ -31,6 +31,10 @@ program
     'Configure only these coding agents (comma-separated or repeatable)',
     collectCodingAgents,
   )
+  .option(
+    '--hooks-only',
+    'Refresh only Claude Code hook scripts and registrations; leave MCP and skills unchanged',
+  )
   .action(createLazyAction(() => import('./setup.js'), 'setupCommand'));
 
 program
@@ -251,6 +255,7 @@ program
   .option('--recovery-plan', 'Print a read-only interrupted-analysis recovery plan and exit')
   .option('--mcp-config', 'Validate MCP repository policy without binding or opening an index')
   .option('--registry', 'Inspect registry identities, metadata, sidecars, and database counts')
+  .option('--integrations', 'Inspect Codex/Claude MCP consistency and Claude hook freshness')
   .option('--json', 'Print machine-readable output (only with --mcp-config or --registry)')
   .option('--show-paths', 'Reveal absolute registry paths (only with --registry)')
   .action(createLazyAction(() => import('./doctor.js'), 'doctorCommand'));
