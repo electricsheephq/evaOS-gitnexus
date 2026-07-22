@@ -1314,7 +1314,7 @@ const runFullAnalysisImpl = async (
   let embeddingSnapshotInfo: EmbeddingSnapshotInfo | undefined;
   let embeddingSnapshotAvailable = false;
   let embeddingTableRebuildStarted = false;
-  const rebuildStagedEmbeddingTableForResume =
+  let rebuildStagedEmbeddingTableForResume =
     Boolean(stagedPaths) && resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.size > 0;
 
   const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
@@ -1369,12 +1369,13 @@ const runFullAnalysisImpl = async (
         embeddingSnapshotSource,
         expectedSnapshotCount,
       );
-      if (rebuildStagedEmbeddingTableForResume) {
+      if (stagedPaths && resumeEmbeddingCheckpoint) {
         embeddingTableRebuildStarted = await validateEmbeddingTableRebuildMarker(
           embeddingTableRebuildMarkerPath,
           embeddingSnapshotSource,
           embeddingSnapshotInfo,
         );
+        if (embeddingTableRebuildStarted) rebuildStagedEmbeddingTableForResume = true;
         // Before the first destructive rebuild, refresh from the complete live
         // staged table because it may contain checkpoint rows written after an
         // older snapshot. Once the durable marker exists, the table may be
