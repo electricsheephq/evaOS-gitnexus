@@ -27,10 +27,16 @@ const repositoryIdentity = (repo: string): RepositorySourceIdentity => ({
 describe('runFullAnalysis --staged', () => {
   let priorHome: string | undefined;
   let priorInstallPolicy: string | undefined;
+  let priorEmbeddingUrl: string | undefined;
+  let priorEmbeddingModel: string | undefined;
+  let priorEmbeddingDims: string | undefined;
 
   beforeEach(() => {
     priorHome = process.env.GITNEXUS_HOME;
     priorInstallPolicy = process.env.GITNEXUS_LBUG_EXTENSION_INSTALL;
+    priorEmbeddingUrl = process.env.GITNEXUS_EMBEDDING_URL;
+    priorEmbeddingModel = process.env.GITNEXUS_EMBEDDING_MODEL;
+    priorEmbeddingDims = process.env.GITNEXUS_EMBEDDING_DIMS;
     process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = 'never';
   });
 
@@ -39,9 +45,173 @@ describe('runFullAnalysis --staged', () => {
     else process.env.GITNEXUS_HOME = priorHome;
     if (priorInstallPolicy === undefined) delete process.env.GITNEXUS_LBUG_EXTENSION_INSTALL;
     else process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = priorInstallPolicy;
+    if (priorEmbeddingUrl === undefined) delete process.env.GITNEXUS_EMBEDDING_URL;
+    else process.env.GITNEXUS_EMBEDDING_URL = priorEmbeddingUrl;
+    if (priorEmbeddingModel === undefined) delete process.env.GITNEXUS_EMBEDDING_MODEL;
+    else process.env.GITNEXUS_EMBEDDING_MODEL = priorEmbeddingModel;
+    if (priorEmbeddingDims === undefined) delete process.env.GITNEXUS_EMBEDDING_DIMS;
+    else process.env.GITNEXUS_EMBEDDING_DIMS = priorEmbeddingDims;
+    vi.unstubAllGlobals();
     await Promise.all(
       tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })),
     );
+  });
+
+  it('refuses staged embedding preservation unless clean regeneration is explicit', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-no-restore-'));
+    tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+    const canonical = getStoragePaths(repo);
+    const meta = await loadMeta(canonical.storagePath);
+    if (!meta) throw new Error('expected canonical metadata');
+    await saveMeta(canonical.storagePath, {
+      ...meta,
+      stats: { ...meta.stats, embeddings: 1 },
+    });
+    const before = await fs.stat(canonical.lbugPath);
+
+    await expect(
+      runFullAnalysis(
+        repo,
+        { staged: true, embeddings: true, skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      ),
+    ).rejects.toThrow(/--staged --embeddings --drop-embeddings/);
+
+    const after = await fs.stat(canonical.lbugPath);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+  });
+
+  it('regenerates staged embeddings from an empty isolated table when drop is explicit', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-clean-embedding-'));
+    tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    process.env.GITNEXUS_EMBEDDING_URL = 'http://test.invalid/v1';
+    process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+    process.env.GITNEXUS_EMBEDDING_DIMS = String(EMBEDDING_DIMS);
+    const vector = new Array(EMBEDDING_DIMS).fill(0.125);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { input?: unknown[] };
+        const count = Array.isArray(body.input) ? body.input.length : 1;
+        return {
+          ok: true,
+          json: async () => ({
+            data: Array.from({ length: count }, () => ({ embedding: vector })),
+          }),
+        };
+      }),
+    );
+    await fs.writeFile(
+      path.join(repo, 'index.ts'),
+      'export function cleanStageEmbedding() { return 1; }\n',
+    );
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+    const canonical = getStoragePaths(repo);
+    const meta = await loadMeta(canonical.storagePath);
+    if (!meta) throw new Error('expected canonical metadata');
+    await saveMeta(canonical.storagePath, {
+      ...meta,
+      stats: { ...meta.stats, embeddings: 1 },
+    });
+
+    await runFullAnalysis(
+      repo,
+      {
+        staged: true,
+        embeddings: true,
+        dropEmbeddings: true,
+        skipAgentsMd: true,
+        skipSkills: true,
+      },
+      { onProgress: () => {} },
+    );
+
+    const finalMeta = await loadMeta(canonical.storagePath);
+    expect(finalMeta?.stats?.embeddings).toBeGreaterThan(0);
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    await adapter.initLbugReadOnlyNonRecovering(canonical.lbugPath);
+    try {
+      await expect(adapter.inspectEmbeddingIntegrity()).resolves.toMatchObject({
+        physicalRows: finalMeta?.stats?.embeddings,
+        emptyIdRows: 0,
+        emptyNodeIdRows: 0,
+        invalidChunkRows: 0,
+        noncanonicalIdRows: 0,
+        duplicateIdRows: 0,
+        duplicateSemanticRows: 0,
+        orphanRows: 0,
+        wrongDimensionRows: 0,
+      });
+    } finally {
+      await adapter.closeLbug();
+    }
+    const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
+    await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+  }, 120_000);
+
+  it('never resumes a staged embedding checkpoint without an explicit clean rebuild', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-checkpoint-refusal-'));
+    tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+    const canonical = getStoragePaths(repo);
+    const canonicalMeta = await loadMeta(canonical.storagePath);
+    if (!canonicalMeta) throw new Error('expected canonical metadata');
+    const canonicalBefore = await fs.stat(canonical.lbugPath);
+    const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
+    await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
+    await saveMeta(staged.stagedMetaDir, {
+      ...canonicalMeta,
+      embeddingCheckpoint: {
+        at: new Date().toISOString(),
+        nodesProcessed: 0,
+        totalNodes: 1,
+        chunksProcessed: 0,
+        model: 'test-model',
+        dimensions: EMBEDDING_DIMS,
+        pendingNodeIds: ['Function:pending'],
+      },
+    });
+
+    await expect(
+      runFullAnalysis(
+        repo,
+        { staged: true, embeddings: true, skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      ),
+    ).rejects.toThrow(/checkpoint resume is disabled/i);
+    expect((await fs.stat(canonical.lbugPath)).ino).toBe(canonicalBefore.ino);
+    expect((await loadMeta(staged.stagedMetaDir))?.embeddingCheckpoint).toBeDefined();
   });
 
   it('keeps the canonical DB inode unchanged until validated promotion', async () => {
@@ -176,7 +346,7 @@ describe('runFullAnalysis --staged', () => {
 
     const result = await runFullAnalysis(
       repo,
-      { staged: true, skipAgentsMd: true, skipSkills: true },
+      { staged: true, force: true, skipAgentsMd: true, skipSkills: true },
       { onProgress: () => {} },
     );
 

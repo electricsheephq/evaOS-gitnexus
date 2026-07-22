@@ -1139,9 +1139,16 @@ const runFullAnalysisImpl = async (
     throw new Error('`--staged` cannot be combined with `--repair-fts`; repair is in-place only.');
   }
 
+  let stagedWorkspaceResumed = false;
+  let canonicalMetaAtStageStart: RepoMeta | null = null;
   if (stagedPaths) {
-    const canonicalMeta = await loadMeta(canonicalMetaDir);
-    const prepared = await prepareStagedWorkspace(stagedPaths, canonicalMeta, repositorySource);
+    canonicalMetaAtStageStart = await loadMeta(canonicalMetaDir);
+    const prepared = await prepareStagedWorkspace(
+      stagedPaths,
+      canonicalMetaAtStageStart,
+      repositorySource,
+    );
+    stagedWorkspaceResumed = prepared.resumed;
     log(
       prepared.resumed
         ? 'Resuming the existing staged generation; the canonical index remains untouched.'
@@ -1160,6 +1167,62 @@ const runFullAnalysisImpl = async (
   // stores, inspect via LadybugDB, or touch sidecars until every invariant
   // needed for a surgical incremental write is established.
   let existingMeta = await loadMeta(metaDir);
+  if (stagedPaths) {
+    const stagedCompletedCandidate =
+      stagedWorkspaceResumed &&
+      !!existingMeta &&
+      !existingMeta.incrementalInProgress &&
+      !existingMeta.embeddingCheckpoint &&
+      existingMeta.lastCommit === currentCommit &&
+      (!canonicalMetaAtStageStart ||
+        canonicalMetaAtStageStart.lastCommit !== existingMeta.lastCommit ||
+        canonicalMetaAtStageStart.indexedAt !== existingMeta.indexedAt);
+
+    // electric.4-.7 proved that restoring or resuming embedding rows inside a
+    // staged copy is not a safe compatibility surface. Keep the useful part of
+    // staged analyze (isolated full generation + validated promotion), but make
+    // every semantic refresh choose an empty-table rebuild explicitly. A clean,
+    // already-finalized stage remains eligible for the fast-path promotion
+    // below; it is complete derived state, not an embedding checkpoint.
+    if (stagedCompletedCandidate) {
+      // A complete stage that died immediately before promotion should be
+      // promoted, even when the original invocation included --force. It is
+      // immutable validated output, not a cache/resume surface.
+      options = { ...options, force: false };
+    } else {
+      if (existingMeta?.embeddingCheckpoint && !options.dropEmbeddings) {
+        throw new Error(
+          'Staged embedding checkpoint resume is disabled. The canonical index is unchanged. ' +
+            'Preserve the staged artifact for forensics, or restart it as a clean isolated ' +
+            'generation with `--staged --embeddings --drop-embeddings`.',
+        );
+      }
+      if (existingMeta && options.embeddings && !options.dropEmbeddings) {
+        throw new Error(
+          'Staged semantic refresh cannot reuse an existing embedding table. The canonical ' +
+            'index is unchanged. Re-run with `--staged --embeddings --drop-embeddings` to ' +
+            'regenerate embeddings from an empty isolated table.',
+        );
+      }
+      if (
+        (existingMeta?.stats?.embeddings ?? 0) > 0 &&
+        !options.embeddings &&
+        !options.dropEmbeddings
+      ) {
+        throw new Error(
+          'Staged analyze cannot preserve an existing embedding corpus safely. The canonical ' +
+            'index is unchanged. Choose `--staged --embeddings --drop-embeddings` for a clean ' +
+            'semantic regeneration, or `--staged --drop-embeddings` to build graph and FTS only.',
+        );
+      }
+      if (options.dropEmbeddings || (options.embeddings && !existingMeta)) {
+        // The target is the isolated staged DB. Forcing a full write wipes only
+        // that disposable copy; the canonical generation stays readable until
+        // the final integrity scan and journaled promotion both succeed.
+        options = { ...options, force: true };
+      }
+    }
+  }
   if (options.incrementalOnly) {
     if (!existingMeta) {
       incrementalOnlyStop('no existing index metadata is available');
