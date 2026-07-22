@@ -666,12 +666,18 @@ const initPromises = new Map<string, Promise<void>>();
  * Concurrent calls for the same repoId are deduplicated — the second caller
  * awaits the first's in-progress init rather than starting a redundant one.
  */
-export const initLbug = async (repoId: string, dbPath: string): Promise<boolean> => {
+export const initLbug = async (
+  repoId: string,
+  dbPath: string,
+  options: { forceReopen?: boolean } = {},
+): Promise<boolean> => {
   const existing = pool.get(repoId);
   if (existing) {
     existing.lastUsed = Date.now();
     const currentIdentity = await statDbIdentity(dbPath);
-    if (!dbIdentityChanged(existing.dbIdentity, currentIdentity)) return false;
+    if (!options.forceReopen && !dbIdentityChanged(existing.dbIdentity, currentIdentity)) {
+      return false;
+    }
     const aliases = [...pool.entries()].filter(([, entry]) => entry.dbPath === dbPath);
     // Never retire a shared native Database under any in-flight alias.
     // Keep serving the complete old generation and retry rollover once every

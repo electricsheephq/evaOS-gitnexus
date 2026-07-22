@@ -1531,9 +1531,11 @@ export class LocalBackend {
           // callers both detect staleness and double-close the pool.
           const reinit = (async () => {
             try {
-              if (meta.indexedAt) this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
-              const reopened = await initLbug(poolKey, repo.lbugPath);
+              const reopened = await initLbug(poolKey, repo.lbugPath, {
+                forceReopen: stampChanged,
+              });
               if (reopened) {
+                if (meta.indexedAt) this.lastObservedIndexedAt.set(poolKey, meta.indexedAt);
                 this.lastObservedDbIdentity.set(poolKey, await statDbIdentity(repo.lbugPath));
               }
             } finally {
