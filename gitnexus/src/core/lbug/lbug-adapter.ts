@@ -21,12 +21,17 @@ import {
   CREATE_VECTOR_INDEX_QUERY,
   DROP_VECTOR_INDEX_QUERY,
   STALE_HASH_SENTINEL,
+  EMBEDDING_DIMS,
   NodeTableName,
 } from './schema.js';
 import { streamAllCSVsToDisk, type StreamedCSVResult } from './csv-generator.js';
 import type { PdgEmitManifest } from './pdg-emit-sink.js';
 import { getNodeLabel as deriveNodeLabel, type WriteStreamFactory } from './rel-pair-routing.js';
 import { EMBEDDABLE_LABELS, type CachedEmbedding } from '../embeddings/types.js';
+import {
+  embeddingIdentitySetDigest,
+  embeddingSemanticIdentity,
+} from '../embeddings/identity-digest.js';
 import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
 import {
   classifyDeleteAllError,
@@ -937,7 +942,7 @@ const doInitLbug = async (dbPath: string, readOnly: boolean = false) => {
 export type LbugProgressCallback = (message: string) => void;
 
 /**
- * Run a COPY, retrying once with IGNORE_ERRORS=true (which skips row-level
+ * Run a relationship COPY, retrying once with IGNORE_ERRORS=true (which skips row-level
  * errors) on first failure. On a second failure, hand the RAW retry error to
  * `onError` — each call site formats + slices its own message (#2226 F5: node
  * COPY slices to 200 chars and throws; relationship COPY slices to 80 and warns,
@@ -968,9 +973,11 @@ const copyCsvWithRetry = async (
  * Bulk-COPY every node CSV sequentially on the single writable connection
  * (LadybugDB allows one write txn at a time). Extracted from loadGraphToLbug so
  * it can run either at the node-phase boundary — overlapping the relationship
- * emit pass (#2203) — or after emit in the serial escape-hatch path. Each COPY
- * keeps the IGNORE_ERRORS=true retry; a hard failure throws (no node rows ⇒ the
- * relationship COPY would dangle on missing endpoints).
+ * emit pass (#2203) — or after emit in the serial escape-hatch path. Node data
+ * is identity-bearing and has no proven rollback after a partial COPY, so any
+ * COPY failure aborts the generation. In particular, never retry node COPY
+ * with IGNORE_ERRORS=true: that converted native row corruption into a
+ * superficially successful but incomplete graph.
  */
 export interface LbugLoadHooks {
   onNodeCopyCommitted?: (table: NodeTableName, index: number, total: number) => void;
@@ -989,10 +996,12 @@ const copyNodeCSVs = async (
     log(`Loading nodes ${stepsDone}/${totalSteps}: ${table} (${rows.toLocaleString()} rows)`);
 
     const copyQuery = getCopyQuery(table, normalizeCopyPath(csvPath));
-    await copyCsvWithRetry(targetConn, copyQuery, (retryErr) => {
-      const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-      throw new Error(`COPY failed for ${table}: ${retryMsg.slice(0, 200)}`);
-    });
+    try {
+      await queryAndDrain(targetConn, copyQuery);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`COPY failed for ${table}: ${message.slice(0, 200)}`);
+    }
     hooks?.onNodeCopyCommitted?.(table, stepsDone - 1, totalSteps);
   }
 };
@@ -1753,6 +1762,191 @@ export interface LoadCachedEmbeddingsOptions {
   batchSize?: number;
 }
 
+export interface EmbeddingIntegrityReport {
+  tablePresent: boolean;
+  physicalRows: number;
+  validRows: number;
+  recoverableRows: number;
+  emptyIdRows: number;
+  emptyNodeIdRows: number;
+  invalidChunkRows: number;
+  noncanonicalIdRows: number;
+  duplicateIdRows: number;
+  duplicateSemanticRows: number;
+  orphanRows: number;
+  wrongDimensionRows: number;
+  recoverableIdentitySha256: string;
+}
+
+/**
+ * Scan embedding identity without materializing vectors. This deliberately uses
+ * streamed projections instead of primary-key equality: corrupted LadybugDB
+ * artifacts can expose blank keys during a scan while `WHERE e.id = ''`
+ * incorrectly reports zero matches.
+ */
+export const inspectEmbeddingIntegrity = async (): Promise<EmbeddingIntegrityReport> => {
+  const c = conn;
+  if (!c) throw new Error('LadybugDB not initialized. Call initLbug first.');
+
+  return withConnLock(async () => {
+    type IdentityRow = {
+      id: string;
+      nodeId: string;
+      chunkIndex: number;
+      dimensions: number;
+      semanticKey: string;
+    };
+    const rows: IdentityRow[] = [];
+    const seenIds = new Set<string>();
+    const seenSemantic = new Set<string>();
+    const ownerCandidates = new Set<string>();
+    let emptyIdRows = 0;
+    let emptyNodeIdRows = 0;
+    let invalidChunkRows = 0;
+    let noncanonicalIdRows = 0;
+    let duplicateIdRows = 0;
+    let duplicateSemanticRows = 0;
+    let wrongDimensionRows = 0;
+
+    const stream = async (query: string, accept: (row: any) => void): Promise<void> => {
+      const raw = await c.query(query);
+      const results = Array.isArray(raw) ? raw : [raw];
+      let streamError: unknown;
+      try {
+        for (const result of results) {
+          while (await result.hasNext()) accept(await result.getNext());
+        }
+      } catch (error) {
+        streamError = error;
+        throw error;
+      } finally {
+        try {
+          await drainQueryResult(results);
+        } catch (error) {
+          if (streamError === undefined) throw error;
+        }
+      }
+    };
+
+    try {
+      await stream(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.id AS id, e.nodeId AS nodeId, ` +
+          `e.chunkIndex AS chunkIndex, size(e.embedding) AS dimensions`,
+        (row) => {
+          const id = String(row.id ?? row[0] ?? '');
+          const nodeId = String(row.nodeId ?? row[1] ?? '');
+          const rawChunk = row.chunkIndex ?? row[2];
+          const chunkIndex = Number(rawChunk);
+          const dimensions = Number(row.dimensions ?? row[3] ?? -1);
+          const idEmpty = id.trim().length === 0;
+          const nodeIdEmpty = nodeId.trim().length === 0;
+          const chunkInvalid = !Number.isSafeInteger(chunkIndex) || chunkIndex < 0;
+          const semanticKey = embeddingSemanticIdentity(nodeId, chunkIndex);
+          if (idEmpty) emptyIdRows++;
+          if (nodeIdEmpty) emptyNodeIdRows++;
+          if (chunkInvalid) invalidChunkRows++;
+          if (!idEmpty && !nodeIdEmpty && !chunkInvalid && id !== `${nodeId}:${chunkIndex}`) {
+            noncanonicalIdRows++;
+          }
+          if (seenIds.has(id)) duplicateIdRows++;
+          else seenIds.add(id);
+          if (!nodeIdEmpty && !chunkInvalid) {
+            if (seenSemantic.has(semanticKey)) duplicateSemanticRows++;
+            else seenSemantic.add(semanticKey);
+            ownerCandidates.add(nodeId);
+          }
+          if (dimensions !== EMBEDDING_DIMS) wrongDimensionRows++;
+          rows.push({ id, nodeId, chunkIndex, dimensions, semanticKey });
+        },
+      );
+    } catch (error) {
+      if (isMissingEmbeddingTableError(error)) {
+        return {
+          tablePresent: false,
+          physicalRows: 0,
+          validRows: 0,
+          recoverableRows: 0,
+          emptyIdRows: 0,
+          emptyNodeIdRows: 0,
+          invalidChunkRows: 0,
+          noncanonicalIdRows: 0,
+          duplicateIdRows: 0,
+          duplicateSemanticRows: 0,
+          orphanRows: 0,
+          wrongDimensionRows: 0,
+          recoverableIdentitySha256: embeddingIdentitySetDigest(new Set()),
+        };
+      }
+      throw error;
+    }
+
+    // Node ids are small compared with vectors. Delete live owners from the
+    // candidate set one label at a time, retaining no graph payload.
+    for (const label of [...EMBEDDABLE_LABELS, 'File'] as const) {
+      await stream(`MATCH (n:${escapeTableName(label)}) RETURN n.id AS id`, (row) => {
+        const id = String(row.id ?? row[0] ?? '');
+        if (id) ownerCandidates.delete(id);
+      });
+    }
+
+    let orphanRows = 0;
+    let validRows = 0;
+    const recoverable = new Set<string>();
+    const validIds = new Set<string>();
+    const validSemantic = new Set<string>();
+    for (const row of rows) {
+      const idEmpty = row.id.trim().length === 0;
+      const nodeIdEmpty = row.nodeId.trim().length === 0;
+      const chunkInvalid = !Number.isSafeInteger(row.chunkIndex) || row.chunkIndex < 0;
+      const ownerMissing = !nodeIdEmpty && ownerCandidates.has(row.nodeId);
+      if (ownerMissing) orphanRows++;
+      if (!nodeIdEmpty && !chunkInvalid && row.dimensions === EMBEDDING_DIMS && !ownerMissing) {
+        recoverable.add(row.semanticKey);
+      }
+      if (
+        !idEmpty &&
+        !nodeIdEmpty &&
+        !chunkInvalid &&
+        row.dimensions === EMBEDDING_DIMS &&
+        !ownerMissing &&
+        row.id === `${row.nodeId}:${row.chunkIndex}` &&
+        !validIds.has(row.id) &&
+        !validSemantic.has(row.semanticKey)
+      ) {
+        validRows++;
+        validIds.add(row.id);
+        validSemantic.add(row.semanticKey);
+      }
+    }
+
+    return {
+      tablePresent: true,
+      physicalRows: rows.length,
+      validRows,
+      recoverableRows: recoverable.size,
+      emptyIdRows,
+      emptyNodeIdRows,
+      invalidChunkRows,
+      noncanonicalIdRows,
+      duplicateIdRows,
+      duplicateSemanticRows,
+      orphanRows,
+      wrongDimensionRows,
+      recoverableIdentitySha256: embeddingIdentitySetDigest(recoverable),
+    };
+  });
+};
+
+export const embeddingIntegrityFailures = (report: EmbeddingIntegrityReport): number =>
+  report.emptyIdRows +
+  report.emptyNodeIdRows +
+  report.invalidChunkRows +
+  report.noncanonicalIdRows +
+  report.duplicateIdRows +
+  report.duplicateSemanticRows +
+  report.orphanRows +
+  report.wrongDimensionRows;
+
 export const loadCachedEmbeddings = async (
   options: LoadCachedEmbeddingsOptions = {},
 ): Promise<{
@@ -1778,15 +1972,24 @@ export const loadCachedEmbeddings = async (
     const embeddingNodeIds = new Set<string>();
     const embeddings: CachedEmbedding[] = [];
     let pendingBatch: CachedEmbedding[] = [];
+    let unreadableIdentityRows = 0;
+    let unreadableVectorRows = 0;
 
     const acceptRow = async (row: any, hasContentHash: boolean): Promise<void> => {
       const nodeId = String(row.nodeId ?? row[0] ?? '');
-      if (!nodeId) return;
+      const chunkIndex = Number(row.chunkIndex ?? row[1]);
+      if (!nodeId.trim() || !Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
+        unreadableIdentityRows++;
+        return;
+      }
       const embedding = row.embedding ?? row[4];
-      if (!embedding) return;
+      if (!embedding) {
+        unreadableVectorRows++;
+        return;
+      }
       const cached: CachedEmbedding = {
         nodeId,
-        chunkIndex: Number(row.chunkIndex ?? row[1] ?? 0),
+        chunkIndex,
         startLine: Number(row.startLine ?? row[2] ?? 0),
         endLine: Number(row.endLine ?? row[3] ?? 0),
         embedding: Array.isArray(embedding)
@@ -1856,6 +2059,12 @@ export const loadCachedEmbeddings = async (
         } else {
           throw err;
         }
+      }
+      if (unreadableIdentityRows > 0 || unreadableVectorRows > 0) {
+        throw new Error(
+          `Embedding cache scan found ${unreadableIdentityRows} unreadable identity row(s) and ` +
+            `${unreadableVectorRows} unreadable vector row(s); refusing a lossy snapshot.`,
+        );
       }
       if (options.onBatch && pendingBatch.length > 0) await options.onBatch(pendingBatch);
     } catch (error: any) {

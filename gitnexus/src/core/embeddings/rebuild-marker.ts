@@ -8,6 +8,7 @@ interface EmbeddingTableRebuildMarker {
   schema: typeof REBUILD_MARKER_SCHEMA;
   count: number;
   dimensions: number;
+  identitySha256: string;
   sourceLastCommit?: string;
   sourceIndexedAt?: string;
 }
@@ -19,6 +20,7 @@ const markerValue = (
   schema: REBUILD_MARKER_SCHEMA,
   count: snapshot.count,
   dimensions: snapshot.dimensions,
+  identitySha256: snapshot.identitySha256,
   sourceLastCommit: source.lastCommit,
   sourceIndexedAt: source.indexedAt,
 });
@@ -34,6 +36,7 @@ const markerMatches = (
     marker.schema === REBUILD_MARKER_SCHEMA &&
     marker.count === snapshot.count &&
     marker.dimensions === snapshot.dimensions &&
+    marker.identitySha256 === snapshot.identitySha256 &&
     marker.sourceLastCommit === source.lastCommit &&
     marker.sourceIndexedAt === source.indexedAt
   );

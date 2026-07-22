@@ -13,6 +13,7 @@ import {
   withAnalyzeOwnershipLock,
   type RepositorySourceIdentity,
 } from '../../src/core/staged-promotion.js';
+import { EMBEDDING_DIMS } from '../../src/core/lbug/schema.js';
 
 const tempDirs: string[] = [];
 
@@ -184,6 +185,64 @@ describe('runFullAnalysis --staged', () => {
     expect((await loadMeta(canonical.storagePath))?.indexedAt).toBe('2026-07-20T12:00:00.000Z');
     await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.access(staged.backupLbugPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('refuses malformed staged embeddings before the first promotion journal', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-integrity-'));
+    tempDirs.push(repo);
+    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
+    execFileSync('git', ['init'], { cwd: repo });
+    execFileSync('git', ['add', 'index.ts'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-m', 'initial'],
+      { cwd: repo },
+    );
+    await runFullAnalysis(repo, { skipAgentsMd: true, skipSkills: true }, { onProgress: () => {} });
+
+    const canonical = getStoragePaths(repo);
+    const canonicalMeta = await loadMeta(canonical.storagePath);
+    if (!canonicalMeta) throw new Error('expected canonical metadata');
+    const canonicalBefore = await fs.stat(canonical.lbugPath);
+    const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
+    await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
+    await saveMeta(staged.stagedMetaDir, {
+      ...canonicalMeta,
+      indexedAt: '2026-07-22T00:00:00.000Z',
+      // Keep the stale count at zero so the pre-promotion scan, rather than
+      // cache preservation, is the gate exercised by this fixture.
+      stats: { ...canonicalMeta.stats, embeddings: 0 },
+    });
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    await adapter.initLbug(staged.stagedLbugPath);
+    try {
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, ' +
+          'startLine: 1, endLine: 1, embedding: $embedding, contentHash: $contentHash})',
+        [
+          {
+            id: 'malformed:0',
+            nodeId: '',
+            chunkIndex: 0,
+            embedding: new Array(EMBEDDING_DIMS).fill(0),
+            contentHash: 'fixture',
+          },
+        ],
+      );
+    } finally {
+      await adapter.closeLbug();
+    }
+
+    await expect(
+      runFullAnalysis(
+        repo,
+        { staged: true, skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      ),
+    ).rejects.toThrow(/staged DB validation failed embedding integrity/i);
+    expect((await fs.stat(canonical.lbugPath)).ino).toBe(canonicalBefore.ino);
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 

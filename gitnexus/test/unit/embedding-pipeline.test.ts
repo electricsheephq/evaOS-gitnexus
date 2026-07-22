@@ -13,6 +13,27 @@ import { STALE_HASH_SENTINEL } from '../../src/core/lbug/schema.js';
 const CLASS_CHUNK_SIZE = 90;
 const CLASS_OVERLAP = 10;
 
+const cleanEmbeddingIntegrityReport = {
+  tablePresent: true,
+  physicalRows: 0,
+  validRows: 0,
+  recoverableRows: 0,
+  emptyIdRows: 0,
+  emptyNodeIdRows: 0,
+  invalidChunkRows: 0,
+  noncanonicalIdRows: 0,
+  duplicateIdRows: 0,
+  duplicateSemanticRows: 0,
+  orphanRows: 0,
+  wrongDimensionRows: 0,
+  recoverableIdentitySha256: '0'.repeat(64),
+};
+
+const mockEmbeddingIntegrityAdapter = () => ({
+  inspectEmbeddingIntegrity: vi.fn().mockResolvedValue(cleanEmbeddingIntegrityReport),
+  embeddingIntegrityFailures: vi.fn().mockReturnValue(0),
+});
+
 // ────────────────────────────────────────────────────────────────────────────
 // resolveEmbeddingInstallPolicy (offline-first, #1153)
 // ────────────────────────────────────────────────────────────────────────────
@@ -244,6 +265,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
     vectorIndexMock = vi.fn().mockResolvedValue(true);
     vectorIndexDropMock = vi.fn().mockResolvedValue(true);
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vectorIndexMock,
       dropVectorIndex: vectorIndexDropMock,
@@ -506,6 +528,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       isEmbedderReady: vi.fn().mockReturnValue(true),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vi.fn().mockResolvedValue(true),
     }));
@@ -920,7 +943,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(checkpoints).toEqual([2, 3]);
   });
 
-  it('pages 5,001 nodes by 512, checkpoints exactly 5,000, and caps embed calls at 8', async () => {
+  it('pages 5,001 nodes by 512, checkpoints 5,000, and writes one identity per statement', async () => {
     mockEmbedderSetup();
     const nodes = Array.from({ length: 5_001 }, (_, index) =>
       makeNode({
@@ -979,7 +1002,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
     ).toBe(true);
     expect(Math.max(...vi.mocked(embedBatch).mock.calls.map(([texts]) => texts.length))).toBe(8);
     const createCalls = stmtCalls.filter((call) => call.cypher.includes('CREATE'));
-    expect(Math.max(...createCalls.map((call) => call.params.length))).toBe(8);
+    expect(Math.max(...createCalls.map((call) => call.params.length))).toBe(1);
   });
 
   it('deletes pending-window rows whose node is no longer embeddable', async () => {
@@ -1088,6 +1111,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       isEmbedderReady: vi.fn().mockReturnValue(true),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(false),
       createVectorIndex: vi.fn().mockResolvedValue(false),
     }));
@@ -1122,6 +1146,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
     // during HNSW build). The pipeline wrapper must swallow it, log, and fall
     // back to exact-scan rather than failing the whole analyze run (#2114).
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vi.fn().mockRejectedValue(new Error('HNSW build failed')),
     }));
@@ -1155,6 +1180,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       isEmbedderReady: vi.fn().mockReturnValue(true),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vi.fn().mockResolvedValue(true),
     }));
@@ -1209,6 +1235,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       isEmbedderReady: vi.fn().mockReturnValue(true),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
+      ...mockEmbeddingIntegrityAdapter(),
       loadVectorExtension: vi.fn().mockResolvedValue(true),
       createVectorIndex: vi.fn().mockResolvedValue(true),
     }));

@@ -10,7 +10,7 @@ import {
 
 describe('embedding table rebuild marker', () => {
   const source = { lastCommit: 'abc123', indexedAt: '2026-07-22T00:00:00.000Z' };
-  const snapshot = { count: 42, dimensions: 2048 };
+  const snapshot = { count: 42, dimensions: 2048, identitySha256: 'fixture-identity' };
 
   it('distinguishes an untouched table from a matching durable rebuild', async () => {
     const temp = await createTempDir('gitnexus-embedding-rebuild-marker-');
