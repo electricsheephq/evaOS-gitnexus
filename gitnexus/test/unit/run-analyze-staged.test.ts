@@ -397,7 +397,7 @@ describe('runFullAnalysis --staged', () => {
     await expect(fs.access(staged.journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('keeps force when a completed stage fast path falls through on dirty source', async () => {
+  it('refuses a dirty completed stage with embeddings before snapshot preservation', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-dirty-force-'));
     tempDirs.push(repo);
     process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
@@ -416,19 +416,59 @@ describe('runFullAnalysis --staged', () => {
     if (!canonicalMeta) throw new Error('expected canonical metadata');
     const staged = getStagedAnalyzePaths(canonical.lbugPath, canonical.storagePath);
     await prepareStagedWorkspace(staged, canonicalMeta, repositoryIdentity(repo));
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    await adapter.initLbug(staged.stagedLbugPath);
+    try {
+      const [owner] = await adapter.executeQuery(
+        'MATCH (n) WHERE n.id IS NOT NULL RETURN n.id AS id LIMIT 1',
+      );
+      const nodeId = String(owner?.id ?? owner?.[0] ?? '');
+      if (!nodeId) throw new Error('expected a graph node for the embedding fixture');
+      await adapter.executeWithReusedStatement(
+        'CREATE (e:CodeEmbedding {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, ' +
+          'startLine: 1, endLine: 1, embedding: $embedding, contentHash: $contentHash})',
+        [
+          {
+            id: `${nodeId}:0`,
+            nodeId,
+            chunkIndex: 0,
+            embedding: new Array(EMBEDDING_DIMS).fill(0.25),
+            contentHash: 'dirty-completed-stage',
+          },
+        ],
+      );
+    } finally {
+      await adapter.closeLbug();
+    }
     const completedAt = '2026-07-20T12:00:00.000Z';
-    await saveMeta(staged.stagedMetaDir, { ...canonicalMeta, indexedAt: completedAt });
+    await saveMeta(staged.stagedMetaDir, {
+      ...canonicalMeta,
+      indexedAt: completedAt,
+      stats: { ...canonicalMeta.stats, embeddings: 1 },
+    });
+    const before = await fs.stat(staged.stagedLbugPath);
     await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 2;\n');
 
-    const result = await runFullAnalysis(
-      repo,
-      { staged: true, force: true, skipAgentsMd: true, skipSkills: true },
-      { onProgress: () => {} },
+    await expect(
+      runFullAnalysis(
+        repo,
+        { staged: true, force: true, skipAgentsMd: true, skipSkills: true },
+        { onProgress: () => {} },
+      ),
+    ).rejects.toThrow(
+      /completed staged generation cannot be resumed against a dirty working tree/i,
     );
 
-    expect(result.alreadyUpToDate).not.toBe(true);
-    expect((await loadMeta(canonical.storagePath))?.indexedAt).not.toBe(completedAt);
-    await expect(fs.access(staged.stageRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+    const after = await fs.stat(staged.stagedLbugPath);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(await loadMeta(staged.stagedMetaDir)).toMatchObject({
+      indexedAt: completedAt,
+      stats: { embeddings: 1 },
+    });
+    await expect(
+      fs.access(path.join(staged.stagedMetaDir, 'embedding-preservation.jsonl')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('replaces rather than promotes a completed stage when drop is explicit', async () => {
@@ -557,8 +597,9 @@ describe('runFullAnalysis --staged', () => {
 
   it('refuses malformed staged embeddings before the first promotion journal', async () => {
     const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-integrity-'));
-    tempDirs.push(repo);
-    process.env.GITNEXUS_HOME = path.join(repo, '.registry-home');
+    const registryHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-staged-registry-'));
+    tempDirs.push(repo, registryHome);
+    process.env.GITNEXUS_HOME = registryHome;
     await fs.writeFile(path.join(repo, 'index.ts'), 'export const value = 1;\n');
     execFileSync('git', ['init'], { cwd: repo });
     execFileSync('git', ['add', 'index.ts'], { cwd: repo });

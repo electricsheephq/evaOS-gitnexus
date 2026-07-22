@@ -1696,6 +1696,14 @@ const runFullAnalysisImpl = async (
           return true; // conservative on git failure
         }
       })();
+      if (dirty && stagedPaths && promoteCompletedStageFastPath) {
+        throw new Error(
+          'A completed staged generation cannot be resumed against a dirty working tree. ' +
+            'It was left untouched for forensics. Commit or discard the source changes to ' +
+            'promote it unchanged, or re-run with explicit `--drop-embeddings` to replace it ' +
+            'with a clean isolated generation.',
+        );
+      }
       // Registration wrinkle around the fast path (#2264). A prior
       // `analyze --name X` that hit a name collision writes meta.json (meta-save
       // runs before registerRepo) then fails before registering, leaving the
