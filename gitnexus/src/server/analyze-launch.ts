@@ -53,7 +53,8 @@ const MAX_WORKER_RETRIES = 2;
 
 const RECOVERY_ONLY_ERROR =
   'Recovered a previous staged promotion, but the current checkout was not analyzed. ' +
-  'Start a new analysis with dropEmbeddings=true (CLI: `gitnexus analyze --staged --drop-embeddings`).';
+  'Start a new analysis with force=true and dropEmbeddings=true ' +
+  '(CLI: `gitnexus analyze --staged --drop-embeddings`).';
 
 /**
  * Translate the worker's successful terminal result into the server job

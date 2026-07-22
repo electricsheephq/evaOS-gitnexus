@@ -20,7 +20,8 @@ describe('analyze worker recovery-only parent contract', () => {
       repoName: 'demo',
       error:
         'Recovered a previous staged promotion, but the current checkout was not analyzed. ' +
-        'Start a new analysis with dropEmbeddings=true (CLI: `gitnexus analyze --staged --drop-embeddings`).',
+        'Start a new analysis with force=true and dropEmbeddings=true ' +
+        '(CLI: `gitnexus analyze --staged --drop-embeddings`).',
     });
   });
 
