@@ -124,6 +124,11 @@ import {
   validateEmbeddingSnapshot,
   type EmbeddingSnapshotInfo,
 } from './embeddings/cache-snapshot.js';
+import {
+  removeEmbeddingTableRebuildMarker,
+  validateEmbeddingTableRebuildMarker,
+  writeEmbeddingTableRebuildMarker,
+} from './embeddings/rebuild-marker.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME, STALE_HASH_SENTINEL } from './lbug/schema.js';
@@ -1301,12 +1306,14 @@ const runFullAnalysisImpl = async (
   // post-commit hook) safe: a multi-minute embedding pass is no longer
   // silently dropped just because the caller omitted `--embeddings`.
   const embeddingSnapshotPath = path.join(metaDir, EMBEDDING_SNAPSHOT_FILE);
+  const embeddingTableRebuildMarkerPath = path.join(metaDir, 'embedding-table-rebuild.json');
   const embeddingSnapshotSource = {
     lastCommit: existingMeta?.lastCommit,
     indexedAt: existingMeta?.indexedAt,
   };
   let embeddingSnapshotInfo: EmbeddingSnapshotInfo | undefined;
   let embeddingSnapshotAvailable = false;
+  let embeddingTableRebuildStarted = false;
   const rebuildStagedEmbeddingTableForResume =
     Boolean(stagedPaths) && resumeEmbeddingCheckpoint && pendingEmbeddingNodeIds.size > 0;
 
@@ -1357,16 +1364,23 @@ const runFullAnalysisImpl = async (
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       const expectedSnapshotCount = resumeEmbeddingCheckpoint ? undefined : existingEmbeddingCount;
-      // A checkpointed staged generation may contain completed rows written
-      // after the original preservation snapshot. Refresh from the actual
-      // staged table so recreating it below cannot discard those rows.
-      embeddingSnapshotInfo = rebuildStagedEmbeddingTableForResume
-        ? undefined
-        : await validateEmbeddingSnapshot(
-            embeddingSnapshotPath,
-            embeddingSnapshotSource,
-            expectedSnapshotCount,
-          );
+      embeddingSnapshotInfo = await validateEmbeddingSnapshot(
+        embeddingSnapshotPath,
+        embeddingSnapshotSource,
+        expectedSnapshotCount,
+      );
+      if (rebuildStagedEmbeddingTableForResume) {
+        embeddingTableRebuildStarted = await validateEmbeddingTableRebuildMarker(
+          embeddingTableRebuildMarkerPath,
+          embeddingSnapshotSource,
+          embeddingSnapshotInfo,
+        );
+        // Before the first destructive rebuild, refresh from the complete live
+        // staged table because it may contain checkpoint rows written after an
+        // older snapshot. Once the durable marker exists, the table may be
+        // empty or partial; only the already-validated snapshot is authoritative.
+        if (!embeddingTableRebuildStarted) embeddingSnapshotInfo = undefined;
+      }
       if (embeddingSnapshotInfo) {
         embeddingSnapshotAvailable = true;
         log(
@@ -1400,6 +1414,14 @@ const runFullAnalysisImpl = async (
         );
         embeddingSnapshotAvailable = true;
         await closeLbug();
+      }
+      if (rebuildStagedEmbeddingTableForResume && !embeddingTableRebuildStarted) {
+        await writeEmbeddingTableRebuildMarker(
+          embeddingTableRebuildMarkerPath,
+          embeddingSnapshotSource,
+          embeddingSnapshotInfo,
+        );
+        embeddingTableRebuildStarted = true;
       }
       if (
         !resumeEmbeddingCheckpoint &&
@@ -2562,7 +2584,17 @@ const runFullAnalysisImpl = async (
     // reclaim (#2264). Long-lived callers close for real.
     await (options.skipNativeCloseOnExit && !stagedPaths ? closeLbugBeforeExit() : closeLbug());
 
-    if (embeddingSnapshotAvailable) {
+    let embeddingTableRebuildMarkerRemoved = true;
+    if (embeddingTableRebuildStarted) {
+      await removeEmbeddingTableRebuildMarker(embeddingTableRebuildMarkerPath).catch((error) => {
+        embeddingTableRebuildMarkerRemoved = false;
+        log(
+          `Warning: could not remove completed embedding table rebuild marker ` +
+            `(${(error as Error).message}); the validated snapshot remains authoritative.`,
+        );
+      });
+    }
+    if (embeddingSnapshotAvailable && embeddingTableRebuildMarkerRemoved) {
       await removeEmbeddingSnapshot(embeddingSnapshotPath).catch((error) => {
         log(
           `Warning: could not remove completed embedding preservation snapshot ` +
