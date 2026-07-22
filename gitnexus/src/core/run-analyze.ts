@@ -1309,7 +1309,7 @@ const runFullAnalysisImpl = async (
   const embeddingTableRebuildMarkerPath = path.join(metaDir, 'embedding-table-rebuild.json');
   const embeddingSnapshotSource = {
     lastCommit: existingMeta?.lastCommit,
-    indexedAt: existingMeta?.indexedAt,
+    indexedAt: resumeEmbeddingCheckpoint ? undefined : existingMeta?.indexedAt,
   };
   let embeddingSnapshotInfo: EmbeddingSnapshotInfo | undefined;
   let embeddingSnapshotAvailable = false;
@@ -2102,7 +2102,8 @@ const runFullAnalysisImpl = async (
         );
       }
       progress('embeddings', 87, 'Recreating the isolated staged embedding table...');
-      await recreateCodeEmbeddingTable();
+      const { resolveEmbeddingInstallPolicy } = await import('./embeddings/embedding-pipeline.js');
+      await recreateCodeEmbeddingTable({ policy: resolveEmbeddingInstallPolicy() });
       // The table is now empty even if graph writeback was surgical. Restore
       // every live non-pending snapshot row, not only changed-file rows.
       deletedFilePathsForRestore = null;

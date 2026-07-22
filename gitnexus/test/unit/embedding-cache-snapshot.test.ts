@@ -203,6 +203,20 @@ describe('bounded embedding preservation snapshot', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('keeps checkpoint-resume snapshots valid across metadata timestamp rewrites', async () => {
+    const snapshotPath = await makePath();
+    const source = { lastCommit: 'abc', indexedAt: undefined };
+    await createEmbeddingSnapshot(snapshotPath, source, async (emit) => emit(makeRows(1)));
+
+    const checkpointMetadata = { lastCommit: 'abc', indexedAt: '2026-07-22T01:23:45.000Z' };
+    await expect(
+      validateEmbeddingSnapshot(snapshotPath, {
+        lastCommit: checkpointMetadata.lastCommit,
+        indexedAt: undefined,
+      }),
+    ).resolves.toEqual({ count: 1, dimensions: 4 });
+  });
+
   it('rejects a producer batch above the 256-vector cap and removes its temp file', async () => {
     const snapshotPath = await makePath();
     await expect(

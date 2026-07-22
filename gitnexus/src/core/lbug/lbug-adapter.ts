@@ -2909,11 +2909,11 @@ export const createVectorIndex = async (): Promise<boolean> => {
  * already absent), and false when VECTOR cannot be loaded or the DB is
  * read-only. Other failures propagate so resume remains fail-closed.
  */
-export const dropVectorIndex = async (): Promise<boolean> => {
+export const dropVectorIndex = async (opts: ExtensionEnsureOptions = {}): Promise<boolean> => {
   if (!conn) {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
   }
-  if (!(await loadVectorExtension())) return false;
+  if (!(await loadVectorExtension(undefined, opts))) return false;
 
   const indexes = await executeQuery('CALL SHOW_INDEXES() RETURN *');
   const exists = indexes.some(
@@ -2941,11 +2941,13 @@ export const dropVectorIndex = async (): Promise<boolean> => {
  * callers must prove they are operating on disposable staged storage and must
  * restore the snapshot before promotion.
  */
-export const recreateCodeEmbeddingTable = async (): Promise<void> => {
+export const recreateCodeEmbeddingTable = async (
+  opts: ExtensionEnsureOptions = {},
+): Promise<void> => {
   if (!conn) {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
   }
-  if (!(await dropVectorIndex())) {
+  if (!(await dropVectorIndex(opts))) {
     throw new Error('Cannot recreate CodeEmbedding because its VECTOR index could not be dropped.');
   }
 

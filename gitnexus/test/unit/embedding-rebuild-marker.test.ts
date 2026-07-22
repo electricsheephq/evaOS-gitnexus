@@ -1,6 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createTempDir } from '../helpers/test-db.js';
 import {
   removeEmbeddingTableRebuildMarker,
@@ -48,6 +48,38 @@ describe('embedding table rebuild marker', () => {
         validateEmbeddingTableRebuildMarker(markerPath, source, snapshot),
       ).rejects.toThrow('malformed');
     } finally {
+      await temp.cleanup();
+    }
+  });
+
+  it('keeps a durable marker when directory fsync is unsupported', async () => {
+    const temp = await createTempDir('gitnexus-embedding-rebuild-marker-fsync-');
+    const markerPath = path.join(temp.dbPath, 'embedding-table-rebuild.json');
+    const originalOpen = fs.open.bind(fs);
+    const open = vi
+      .spyOn(fs, 'open')
+      .mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+        if (String(args[0]) === path.dirname(markerPath)) {
+          return {
+            sync: async () => {
+              const error = new Error('directory fsync is unsupported') as NodeJS.ErrnoException;
+              error.code = 'EINVAL';
+              throw error;
+            },
+            close: async () => {},
+          } as Awaited<ReturnType<typeof fs.open>>;
+        }
+        return originalOpen(...args);
+      });
+    try {
+      await expect(writeEmbeddingTableRebuildMarker(markerPath, source, snapshot)).resolves.toBe(
+        undefined,
+      );
+      await expect(validateEmbeddingTableRebuildMarker(markerPath, source, snapshot)).resolves.toBe(
+        true,
+      );
+    } finally {
+      open.mockRestore();
       await temp.cleanup();
     }
   });

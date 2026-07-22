@@ -466,7 +466,10 @@ export const runEmbeddingPipeline = async (
       logger.warn(vectorUnavailableMessage);
     }
     if (pipelineOptions.rebuildVectorIndexBeforeMutation) {
-      if (!vectorAvailable || !(await dropVectorIndex())) {
+      if (
+        !vectorAvailable ||
+        !(await dropVectorIndex({ policy: resolveEmbeddingInstallPolicy() }))
+      ) {
         throw new Error(
           'Cannot safely resume the staged embedding checkpoint because its VECTOR index could not be dropped.',
         );

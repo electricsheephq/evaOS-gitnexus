@@ -677,6 +677,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       (call) => call.cypher.includes('DELETE') || call.cypher.includes('CREATE'),
     );
     expect(vectorIndexDropMock).toHaveBeenCalledOnce();
+    expect(vectorIndexDropMock).toHaveBeenCalledWith({ policy: 'auto' });
     expect(mutationCalls[0].cypher).toContain('MATCH (e:CodeEmbedding {id: $id}) DELETE e');
     expect(mutationCalls[0].params).toEqual([{ id: `${node.id}:0` }]);
     expect(mutationCalls.some((call) => call.cypher.includes('CREATE'))).toBe(true);

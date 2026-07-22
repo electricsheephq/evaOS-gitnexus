@@ -39,6 +39,18 @@ const markerMatches = (
   );
 };
 
+const syncDirectory = async (directoryPath: string): Promise<void> => {
+  let directory: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    directory = await fs.open(directoryPath, 'r');
+    await directory.sync();
+  } catch (error: any) {
+    if (!['EINVAL', 'EPERM', 'EISDIR'].includes(error?.code)) throw error;
+  } finally {
+    await directory?.close().catch(() => {});
+  }
+};
+
 /**
  * Returns false when no destructive rebuild has begun. Once a marker exists,
  * it must match the durable snapshot exactly; callers must never replace that
@@ -88,12 +100,7 @@ export const writeEmbeddingTableRebuildMarker = async (
     await handle.sync();
     await handle.close();
     await fs.rename(tempPath, markerPath);
-    const directory = await fs.open(path.dirname(markerPath), 'r');
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
+    await syncDirectory(path.dirname(markerPath));
   } catch (error) {
     await handle.close().catch(() => {});
     await fs.rm(tempPath, { force: true }).catch(() => {});
