@@ -4,6 +4,25 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.10-electric.7] - 2026-07-22
+
+### Added
+
+- **Safe HNSW-only repair** preserves every stored embedding while rebuilding the vector index under fail-closed storage, lock, recovery, and live eight-connection pool checks (#170, #172)
+- **Claude hook-only maintenance and integration doctor** refresh the copied Claude adapter without replacing MCP configuration, remove only obsolete GitNexus hook wiring, cap hook subprocesses globally, and report sanitized runtime consistency (#171, #174)
+
+### Fixed
+
+- **Interrupted staged embedding resumes enforce persisted identity integrity before bounded restore and regeneration**: malformed, duplicate, orphaned, non-canonical, or wrong-dimension rows fail closed; a preservation snapshot can authorize isolated reconstruction only when its exact semantic-identity digest matches; node COPY failures cannot fall through to permissive row dropping (#162, #173)
+- **LadybugDB memory and MCP pool rollover are bounded and freshness-aware**, preventing stale pooled reads after index replacement while retaining explicit operator override behavior (#175, #176)
+- **Readable zero-embedding repositories report `not-indexed`** instead of claiming a broken vector index (#170, #172)
+
+### Changed
+
+- Remote Voyage fleet work remains detached and may use at most two different-remote slots; it has no host memory, swap, RSS, free-memory, or pressure gate.
+- Distribution remains GitHub-only as one tarball plus `SHA256SUMS`; npm and container registries are unchanged.
+- Existing `1.6.10-electric.2` through `.6` installations remain available for rollback.
+
 ## [1.6.10-electric.6] - 2026-07-21
 
 ### Fixed
