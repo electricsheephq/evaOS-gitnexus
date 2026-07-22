@@ -63,6 +63,7 @@ program
     'Refuse recovery, migration, or scale escalation that would require a full rebuild',
   )
   .option('--repair-fts', 'Repair/rebuild search FTS indexes without full re-analysis')
+  .option('--repair-vector', 'Repair/rebuild HNSW without regenerating embedding rows')
   .option(
     '--embeddings [limit]',
     'Enable embedding generation for semantic search (off by default). ' +

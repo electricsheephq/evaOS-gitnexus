@@ -16,6 +16,7 @@ import { runPipelineFromRepo } from './ingestion/pipeline.js';
 import { resetDegradedParseCounter } from './tree-sitter/safe-parse.js';
 import {
   initLbug,
+  initLbugForMaintenance,
   loadGraphToLbug,
   getLbugStats,
   executeQuery,
@@ -32,6 +33,9 @@ import {
   queryImportersBatch,
   loadFTSExtension,
   recreateCodeEmbeddingTable,
+  loadVectorExtension,
+  createVectorIndex,
+  dropVectorIndex,
   wipeLbugDbFiles,
   LbugWipeError,
   DELETE_FILES_CHUNK_SIZE,
@@ -132,6 +136,7 @@ import {
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME, STALE_HASH_SENTINEL } from './lbug/schema.js';
+import { isMissingColumnOrTableError } from './lbug/schema-errors.js';
 import {
   discardStagedWorkspace,
   getStagedAnalyzePaths,
@@ -176,6 +181,8 @@ export interface AnalyzeOptions {
   incrementalOnly?: boolean;
   /** Repair only search indexes without re-running full parsing/indexing. */
   repairFts?: boolean;
+  /** Rebuild only the named HNSW index while preserving every embedding row. */
+  repairVector?: boolean;
   /** Emit per-index FTS create logs. */
   verbose?: boolean;
   embeddings?: boolean;
@@ -323,6 +330,90 @@ const resolveEmbeddingIdentity = async (): Promise<EmbeddingIdentity> => {
   };
 };
 
+const pathKind = (state: Awaited<ReturnType<typeof fs.lstat>>): string => {
+  if (state.isSymbolicLink()) return 'a symbolic link';
+  if (state.isDirectory()) return 'a directory';
+  if (state.isSocket()) return 'a socket';
+  if (state.isFIFO()) return 'a FIFO';
+  if (state.isBlockDevice()) return 'a block device';
+  if (state.isCharacterDevice()) return 'a character device';
+  return 'not a regular file';
+};
+
+const lstatIfPresent = async (targetPath: string) => {
+  try {
+    return await fs.lstat(targetPath);
+  } catch (error) {
+    if (isMissingFilesystemError(error)) return null;
+    throw error;
+  }
+};
+
+/**
+ * Read-only gate for VECTOR maintenance. It deliberately runs before the
+ * analyzer ownership lock creates any file, and refuses rather than recovering
+ * stale state. A second writer that appears after this check is still excluded
+ * by the ownership/init/database locks.
+ */
+export const assertVectorRepairPreflight = async (
+  repoPath: string,
+  options: { allowAnalyzeOwnershipLock?: boolean } = {},
+): Promise<RepoMeta> => {
+  const paths = getStoragePaths(repoPath);
+  const storageState = await lstatIfPresent(paths.storagePath);
+  if (!storageState) {
+    throw new Error('Cannot repair VECTOR: this repository has not been analyzed yet.');
+  }
+  if (!storageState.isDirectory() || storageState.isSymbolicLink()) {
+    throw new Error(
+      `Cannot repair VECTOR: storage at ${paths.storagePath} is ${pathKind(storageState)}; ` +
+        'expected a regular directory.',
+    );
+  }
+
+  const databaseState = await lstatIfPresent(paths.lbugPath);
+  if (!databaseState) {
+    throw new Error(`Cannot repair VECTOR: graph store at ${paths.lbugPath} is missing.`);
+  }
+  if (!databaseState.isFile() || databaseState.isSymbolicLink()) {
+    throw new Error(
+      `Cannot repair VECTOR: graph store at ${paths.lbugPath} is ${pathKind(databaseState)}; ` +
+        'expected a regular file.',
+    );
+  }
+
+  const promotion = getStagedAnalyzePaths(paths.lbugPath, path.dirname(paths.metaPath));
+  const blockedArtifacts = [
+    !options.allowAnalyzeOwnershipLock && path.join(paths.storagePath, 'analyze-staged.lock'),
+    `${paths.lbugPath}.init.lock`,
+    `${paths.lbugPath}.lock`,
+    `${paths.lbugPath}.wal`,
+    `${paths.lbugPath}.shadow`,
+    `${paths.lbugPath}.wal.checkpoint`,
+    promotion.journalPath,
+    promotion.stageIntentPath,
+    promotion.stageRoot,
+    promotion.backupLbugPath,
+  ].filter((artifact): artifact is string => typeof artifact === 'string');
+  for (const artifact of blockedArtifacts) {
+    if (await lstatIfPresent(artifact)) {
+      throw new Error(
+        `Cannot repair VECTOR while lock or recovery state is present at ${artifact}. ` +
+          'Resolve it with the normal analyze/recovery workflow first.',
+      );
+    }
+  }
+
+  const meta = await loadMeta(path.dirname(paths.metaPath));
+  if (!meta) throw new Error('Cannot repair VECTOR: index metadata is missing.');
+  if (meta.incrementalInProgress || meta.embeddingCheckpoint) {
+    throw new Error(
+      'Cannot repair VECTOR while index metadata records an incomplete analysis or embedding checkpoint.',
+    );
+  }
+  return meta;
+};
+
 export interface AnalyzeResult {
   repoName: string;
   repoPath: string;
@@ -339,6 +430,8 @@ export interface AnalyzeResult {
   pipelineResult?: any;
   /** True when analyze only repaired FTS indexes and skipped pipeline re-analysis. */
   ftsRepairedOnly?: boolean;
+  /** Terminal outcome for a VECTOR-only maintenance run. */
+  vectorRepairStatus?: 'repaired' | 'healthy' | 'not-indexed';
   /**
    * True when the FTS extension was unavailable so search-index creation was
    * skipped (offline-first degradation). The graph is fully queryable; only
@@ -694,6 +787,165 @@ const runFullAnalysisImpl = async (
       branch: placement.branch,
     });
   };
+
+  // ── VECTOR-only repair path ──────────────────────────────────────────
+  // The outer entry point has already performed the read-only storage,
+  // recovery, lock, and metadata preflight before acquiring our ownership
+  // lock. This branch intentionally precedes staged-promotion recovery so a
+  // maintenance command never mutates or chooses between recovery artifacts.
+  if (options.repairVector) {
+    const existingMeta = await loadMeta(canonicalMetaDir);
+    if (!existingMeta) throw new Error('Cannot repair VECTOR: index metadata is missing.');
+
+    const { probeDoctorPool, EXPECTED_POOL_CONNECTIONS } =
+      await import('../cli/doctor-pool-probe.js');
+    const beforeProbe = await probeDoctorPool(canonicalPaths.lbugPath);
+    const readEmbeddingCount = async (): Promise<number> => {
+      let rows: Awaited<ReturnType<typeof executeQuery>>;
+      try {
+        rows = await executeQuery(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isMissingColumnOrTableError(message)) return 0;
+        throw error;
+      }
+      const row = rows[0];
+      const count = Number(row?.cnt ?? row?.[0] ?? 0);
+      if (!Number.isSafeInteger(count) || count < 0) {
+        throw new Error('Cannot repair VECTOR: database returned an invalid embedding count.');
+      }
+      return count;
+    };
+    let stats: { nodes: number; edges: number } = { nodes: 0, edges: 0 };
+    let embeddingCountBefore = 0;
+    let repairStatus: AnalyzeResult['vectorRepairStatus'] = 'healthy';
+
+    try {
+      await initLbugForMaintenance(canonicalPaths.lbugPath);
+      stats = await getLbugStats();
+      embeddingCountBefore = await readEmbeddingCount();
+
+      if (embeddingCountBefore === 0) {
+        progress('done', 100, 'No embeddings are indexed; VECTOR repair was not needed.');
+        return {
+          repoName:
+            options.registryName ??
+            getInferredRepoName(repoPath) ??
+            path.basename(resolveRepoIdentityRoot(repoPath)),
+          repoPath,
+          stats: { ...existingMeta.stats, nodes: stats.nodes, edges: stats.edges, embeddings: 0 },
+          vectorRepairStatus: 'not-indexed',
+        };
+      }
+
+      if (beforeProbe.reason || !beforeProbe.vector) {
+        throw new Error(
+          'Cannot repair VECTOR: the production pool could not prove VECTOR availability ' +
+            `(${beforeProbe.vectorIndexReason ?? beforeProbe.reason ?? 'vector-extension-unavailable'}).`,
+        );
+      }
+
+      const vectorAvailable = await loadVectorExtension(undefined, {
+        policy: resolveAnalyzeInstallPolicy(),
+      });
+      if (!vectorAvailable) {
+        const rawReason = getExtensionCapabilities().find((c) => c.name === 'vector')?.reason;
+        throw new Error(
+          'Cannot repair VECTOR: the LadybugDB VECTOR extension is unavailable' +
+            (rawReason ? ` — ${rawReason.replace(/\.$/, '')}` : '') +
+            '.',
+        );
+      }
+
+      if (!beforeProbe.vectorIndex) {
+        progress('vector', 85, 'Rebuilding the HNSW vector index...');
+        if (!(await dropVectorIndex())) {
+          throw new Error('Cannot repair VECTOR: the existing HNSW index could not be removed.');
+        }
+        if (!(await createVectorIndex())) {
+          throw new Error('Cannot repair VECTOR: the HNSW index could not be created.');
+        }
+        repairStatus = 'repaired';
+      }
+
+      const embeddingCountAfter = await readEmbeddingCount();
+      if (embeddingCountAfter !== embeddingCountBefore) {
+        throw new Error(
+          `VECTOR repair changed embedding rows (${embeddingCountBefore} before, ` +
+            `${embeddingCountAfter} after); metadata and registry were not updated.`,
+        );
+      }
+    } finally {
+      await closeLbug().catch(() => {});
+    }
+
+    const afterProbe = await probeDoctorPool(canonicalPaths.lbugPath);
+    if (
+      afterProbe.reason ||
+      !afterProbe.vector ||
+      !afterProbe.vectorIndex ||
+      afterProbe.connectionCount !== EXPECTED_POOL_CONNECTIONS ||
+      afterProbe.exercisedConnections !== EXPECTED_POOL_CONNECTIONS
+    ) {
+      throw new Error(
+        'VECTOR repair did not pass the eight-connection production-pool probe; ' +
+          `metadata and registry were not updated (${afterProbe.vectorIndexReason ?? afterProbe.reason ?? 'pool-probe-unavailable'}).`,
+      );
+    }
+
+    const { getRuntimeCapabilities } = await import('./platform/capabilities.js');
+    const runtimeCapabilities = getRuntimeCapabilities();
+    let repairedMeta: RepoMeta;
+    let projectName: string;
+    await initLbugForMaintenance(canonicalPaths.lbugPath);
+    try {
+      const committedStats = await getLbugStats();
+      const committedEmbeddingCount = await readEmbeddingCount();
+      if (committedEmbeddingCount !== embeddingCountBefore) {
+        throw new Error(
+          `VECTOR repair database changed before metadata commit (${embeddingCountBefore} ` +
+            `verified, ${committedEmbeddingCount} current); metadata and registry were not updated.`,
+        );
+      }
+      repairedMeta = {
+        ...existingMeta,
+        repoPath,
+        remoteUrl: repositoryRemoteUrl ?? existingMeta.remoteUrl,
+        stats: {
+          ...existingMeta.stats,
+          nodes: committedStats.nodes,
+          edges: committedStats.edges,
+          embeddings: committedEmbeddingCount,
+        },
+        capabilities: {
+          graph: { provider: 'ladybugdb', status: 'available' },
+          fts: {
+            provider: 'ladybugdb-fts',
+            status: afterProbe.fts ? 'available' : 'unavailable',
+          },
+          vectorSearch: {
+            provider: 'ladybugdb-vector',
+            status: 'vector-index',
+            exactScanLimit: runtimeCapabilities.exactScanLimit,
+          },
+        },
+      };
+      await saveMeta(canonicalMetaDir, repairedMeta);
+      projectName = await registerRepo(repoPath, repairedMeta, {
+        name: options.registryName,
+        allowDuplicateName: options.allowDuplicateName,
+      });
+    } finally {
+      await closeLbug().catch(() => {});
+    }
+    progress('done', 100, 'VECTOR index verified through all eight pooled connections.');
+    return {
+      repoName: projectName,
+      repoPath,
+      stats: repairedMeta.stats ?? {},
+      vectorRepairStatus: repairStatus,
+    };
+  }
 
   const promoteValidatedStage = async (paths: StagedAnalyzePaths): Promise<string | undefined> => {
     const stagedMeta = await validateStagedGeneration(paths);
@@ -2721,6 +2973,23 @@ export async function runFullAnalysis(
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
 ): Promise<AnalyzeResult> {
+  if (options.repairVector) {
+    const conflicts = [
+      options.force && '--force',
+      options.staged && '--staged',
+      options.incrementalOnly && '--incremental-only',
+      options.repairFts && '--repair-fts',
+      options.embeddings && '--embeddings',
+      options.embeddingsNodeLimit !== undefined && '--embeddings',
+      options.dropEmbeddings && '--drop-embeddings',
+      options.pdg && '--pdg',
+      options.branch && '--branch',
+    ].filter((value): value is string => typeof value === 'string');
+    if (conflicts.length > 0) {
+      throw new Error(`Cannot combine \`--repair-vector\` with ${conflicts.join(', ')}.`);
+    }
+  }
+
   // Repository identity is the first gate. It must run before the analyzer
   // ownership lock creates its storage directory, as well as before metadata,
   // sidecar, or database mutation. registerRepo repeats the check at commit
@@ -2728,12 +2997,19 @@ export async function runFullAnalysis(
   const repoHasGit = hasGitDir(repoPath);
   const repositoryRemoteUrl = repoHasGit ? getRemoteUrl(repoPath) : undefined;
   await assertCanonicalRepositoryIdentity(repoPath, repositoryRemoteUrl);
+  if (options.repairVector) await assertVectorRepairPreflight(repoPath);
 
   const { storagePath } = getStoragePaths(repoPath);
-  return withAnalyzeOwnershipLock(storagePath, () =>
-    runFullAnalysisImpl(repoPath, options, callbacks, {
+  return withAnalyzeOwnershipLock(storagePath, async () => {
+    // The first preflight avoids creating an ownership lock for a known-dirty
+    // index. Repeat it after lock acquisition because a writer may have run
+    // while this command was waiting and left new recovery or dirty state.
+    if (options.repairVector) {
+      await assertVectorRepairPreflight(repoPath, { allowAnalyzeOwnershipLock: true });
+    }
+    return runFullAnalysisImpl(repoPath, options, callbacks, {
       repoHasGit,
       remoteUrl: repositoryRemoteUrl,
-    }),
-  );
+    });
+  });
 }
