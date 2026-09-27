@@ -771,7 +771,10 @@ import { copyV8CacheIfPresent, tryLoadV8Cache, writeV8CacheFile } from './v8-sid
 // records simple-positional call sites and fixed positional method capacity.
 // Warm v100 ParsedFiles lack those facts, so conservative mixin subtype
 // dispatch would suppress unchanged one-argument callers.
-const SCHEMA_BUMP = 101;
+// v102 (local PR #302 private-only successor): simple-positional call entries
+// now carry their count privately, while ordinary Python references no longer
+// receive synthetic arity. Warm v101 ParsedFiles have neither equivalent fact.
+const SCHEMA_BUMP = 102;
 const GITNEXUS_PKG_VERSION = (() => {
   try {
     // package.json sits at gitnexus/package.json — two levels up from

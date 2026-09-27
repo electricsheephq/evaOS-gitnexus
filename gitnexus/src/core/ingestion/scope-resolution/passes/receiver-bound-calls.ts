@@ -337,6 +337,37 @@ export const MAX_INTERFACE_DISPATCH_FANOUT = (() => {
 /** Bound on the sample of over-cap interface members kept for the warning. */
 const MAX_REPORTED_SKIPPED_INTERFACES = 20;
 
+/**
+ * Keep every proven subtype target while making omitted coverage explicit.
+ * `recordUnresolved` intentionally depends on candidate coverage, not edge
+ * emission: collapse-mode dedup can make every `tryEmitEdge` return false even
+ * though the site is already known and complete.
+ */
+export function prepareSubtypeDispatchCoverage<T extends { readonly nodeId: string }>(
+  targets: readonly T[],
+  missingCandidateIds: Iterable<string>,
+  maxTargets: number,
+): {
+  readonly targets: readonly T[];
+  readonly droppedTargets: readonly T[];
+  readonly missingCandidateIds: readonly string[];
+  readonly partialCoverage: boolean;
+  readonly recordUnresolved: boolean;
+} {
+  const keptTargets = targets.slice(0, maxTargets);
+  const droppedTargets = targets.slice(maxTargets);
+  const missing = new Set(missingCandidateIds);
+  for (const target of droppedTargets) missing.add(target.nodeId);
+  const partialCoverage = missing.size > 0;
+  return {
+    targets: keptTargets,
+    droppedTargets,
+    missingCandidateIds: [...missing],
+    partialCoverage,
+    recordUnresolved: partialCoverage || targets.length === 0,
+  };
+}
+
 /** What `emitReceiverBoundCalls` reports back to the orchestrator. */
 export interface ReceiverBoundResult {
   /** CALLS/ACCESSES edges emitted by this pass. */
@@ -2285,9 +2316,9 @@ export function emitReceiverBoundCalls(
           //
           // Multiple concrete subtype implementations are runtime alternatives,
           // not an overload ambiguity, so emit the same bounded fan-out used by
-          // interface dispatch. An ambiguity *within* any subtype is different:
-          // there is no exact target model for it, so suppress the whole site
-          // rather than publishing a partial set as complete.
+          // interface dispatch. An ambiguity *within* one subtype does not erase
+          // proven targets from other subtypes; it marks the site's coverage as
+          // partial so callers cannot mistake the emitted set for completeness.
           const subtypeDecision =
             site.kind === 'call' ? missingReceiverSubtypeDecision(typeRef, site) : false;
           if (subtypeDecision !== false) {
@@ -2365,6 +2396,15 @@ export function emitReceiverBoundCalls(
                   }
                   if (candidate === STATIC_ONLY_FILTERED) continue;
                   if (candidate !== undefined) {
+                    if (isDeclarationOnly(candidate)) {
+                      // An abstract declaration still binds the name for this
+                      // owner. Do not expose a concrete method hidden in a base;
+                      // concrete descendants are visited as their own subtypes.
+                      inheritedCandidates.clear();
+                      ambiguousCandidateIds.add(candidate.nodeId);
+                      subtypeAmbiguous = true;
+                      break;
+                    }
                     if (provider.arityCompatibility(site, candidate) === 'incompatible') {
                       // The owner bound this name. Python-style lookup cannot
                       // skip an incompatible override and expose a hidden base.
@@ -2386,7 +2426,6 @@ export function emitReceiverBoundCalls(
                     }
                     if (
                       candidate.isDeleted === true ||
-                      isDeclarationOnly(candidate) ||
                       isUnreachableByInstanceDispatch(candidate)
                     ) {
                       continue;
@@ -2423,43 +2462,29 @@ export function emitReceiverBoundCalls(
                 reason: 'member-lookup-ambiguous',
                 candidateIds: [...ambiguousCandidateIds],
               });
-              handledSites.add(siteKey);
-              continue;
             }
 
-            if (unknownCompatibilityCandidateIds.size > 0) {
-              options.recordResolutionOutcome?.({
-                kind: 'suppressed',
-                reason: 'receiver-unresolved',
-                receiverOrigin: 'in-program',
-                candidateIds: [...unknownCompatibilityCandidateIds],
-                phase: 'receiver-bound-calls',
-                filePath: parsed.filePath,
-                name: site.name,
-                range: site.atRange,
-                siteKind: site.kind,
-              });
-              handledSites.add(siteKey);
-              continue;
-            }
-
-            const targets = [...subtypeTargets.values()];
-            if (targets.length > MAX_INTERFACE_DISPATCH_FANOUT) {
-              dispatchFanoutSkipped += targets.length - MAX_INTERFACE_DISPATCH_FANOUT;
+            const allTargets = [...subtypeTargets.values()];
+            const coverage = prepareSubtypeDispatchCoverage(
+              allTargets,
+              new Set([...ambiguousCandidateIds, ...unknownCompatibilityCandidateIds]),
+              MAX_INTERFACE_DISPATCH_FANOUT,
+            );
+            const targets = coverage.targets;
+            if (coverage.droppedTargets.length > 0) {
+              dispatchFanoutSkipped += coverage.droppedTargets.length;
               if (dispatchFanoutSkippedNames.length < MAX_REPORTED_SKIPPED_INTERFACES) {
-                const dropped = targets
-                  .slice(MAX_INTERFACE_DISPATCH_FANOUT, MAX_INTERFACE_DISPATCH_FANOUT + 5)
+                const dropped = coverage.droppedTargets
+                  .slice(0, 5)
                   .map((target) => target.qualifiedName ?? target.nodeId);
-                const omitted = targets.length - MAX_INTERFACE_DISPATCH_FANOUT - dropped.length;
+                const omitted = coverage.droppedTargets.length - dropped.length;
                 dispatchFanoutSkippedNames.push(
-                  `${ownerDef.qualifiedName ?? ownerDef.nodeId}.${memberName} (${targets.length} targets; ` +
+                  `${ownerDef.qualifiedName ?? ownerDef.nodeId}.${memberName} (${allTargets.length} targets; ` +
                     `dropped: ${dropped.join(', ')}${omitted > 0 ? `, +${omitted} more` : ''})`,
                 );
               }
-              targets.length = MAX_INTERFACE_DISPATCH_FANOUT;
             }
 
-            let emittedForSite = 0;
             for (const target of targets) {
               const ok = tryEmitEdge(
                 graph,
@@ -2475,16 +2500,15 @@ export function emitReceiverBoundCalls(
               );
               if (ok) {
                 emitted++;
-                emittedForSite++;
               }
             }
 
-            if (emittedForSite === 0) {
+            if (coverage.recordUnresolved) {
               options.recordResolutionOutcome?.({
                 kind: 'suppressed',
                 reason: 'receiver-unresolved',
                 receiverOrigin: 'in-program',
-                candidateIds: [],
+                candidateIds: coverage.missingCandidateIds,
                 phase: 'receiver-bound-calls',
                 filePath: parsed.filePath,
                 name: site.name,

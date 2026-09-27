@@ -27,6 +27,7 @@ import {
   resolvePythonImportTarget,
 } from '../../../../src/core/ingestion/languages/python/index.js';
 import { pythonMissingReceiverSubtypeDecision } from '../../../../src/core/ingestion/languages/python/scope-resolver.js';
+import { prepareSubtypeDispatchCoverage } from '../../../../src/core/ingestion/scope-resolution/passes/receiver-bound-calls.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -55,6 +56,43 @@ const def = (overrides: Partial<SymbolDefinition> = {}): SymbolDefinition => ({
 const binding = (origin: BindingRef['origin'], nodeId = 'd1'): BindingRef => ({
   def: def({ nodeId }),
   origin,
+});
+
+describe('prepareSubtypeDispatchCoverage', () => {
+  const target = (nodeId: string) => ({ nodeId });
+
+  it('retains proven targets while marking ambiguous subtype coverage incomplete', () => {
+    const coverage = prepareSubtypeDispatchCoverage(
+      [target('valid')],
+      ['ambiguous-a', 'ambiguous-b'],
+      32,
+    );
+
+    expect(coverage.targets).toEqual([target('valid')]);
+    expect(coverage.missingCandidateIds).toEqual(['ambiguous-a', 'ambiguous-b']);
+    expect(coverage.partialCoverage).toBe(true);
+    expect(coverage.recordUnresolved).toBe(true);
+  });
+
+  it('keeps the bounded prefix and reports every target dropped by the cap', () => {
+    const coverage = prepareSubtypeDispatchCoverage(
+      [target('one'), target('two'), target('three')],
+      [],
+      2,
+    );
+
+    expect(coverage.targets).toEqual([target('one'), target('two')]);
+    expect(coverage.droppedTargets).toEqual([target('three')]);
+    expect(coverage.missingCandidateIds).toEqual(['three']);
+    expect(coverage.recordUnresolved).toBe(true);
+  });
+
+  it('does not report complete known targets unresolved when edge emission deduplicates', () => {
+    const coverage = prepareSubtypeDispatchCoverage([target('already-emitted')], [], 32);
+
+    expect(coverage.partialCoverage).toBe(false);
+    expect(coverage.recordUnresolved).toBe(false);
+  });
 });
 
 // ─── arityCompatibility ────────────────────────────────────────────────────
