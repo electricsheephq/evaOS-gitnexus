@@ -98,7 +98,7 @@ export function classifyPythonBoundReceiver(fnNode: SyntaxNode): PythonBoundRece
   const functionName = fnNode.childForFieldName('name')?.text;
   // Python applies these descriptor kinds implicitly even without decorators.
   // __new__ is static-like (its class argument is explicit), while
-  // __init_subclass__ receives the class implicitly.
+  // __init_subclass__ and __class_getitem__ receive the class implicitly.
   if (functionName === '__new__') return null;
 
   const params = fnNode.childForFieldName('parameters');
@@ -112,7 +112,9 @@ export function classifyPythonBoundReceiver(fnNode: SyntaxNode): PythonBoundRece
 
   return {
     kind:
-      hasDecorator(fnNode, 'classmethod') || functionName === '__init_subclass__'
+      hasDecorator(fnNode, 'classmethod') ||
+      functionName === '__init_subclass__' ||
+      functionName === '__class_getitem__'
         ? 'class'
         : 'instance',
     parameter,

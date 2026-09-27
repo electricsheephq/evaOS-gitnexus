@@ -60,12 +60,20 @@ class LifecycleReceiverMixin:
         return cls.new_hook()
 
 
+class GenericMixin:
+    def __class_getitem__(cls, item: object) -> int:
+        return cls.class_only()
+
+
 class ArgumentShapeMixin:
     def positional_to_keyword_only(self) -> int:
         return self.keyword_only_target(1)
 
     def keyword_to_positional_only(self) -> int:
         return self.positional_only_target(value=1)
+
+    def positional_missing_required_keyword(self) -> int:
+        return self.required_keyword_target(1)
 
 
 class ArgumentForwardingMixin:

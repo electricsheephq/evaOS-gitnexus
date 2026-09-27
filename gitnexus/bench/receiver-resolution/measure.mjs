@@ -1410,6 +1410,16 @@ async function runCountArm(repoPath) {
     callDropsByOrigin: sortDesc(callDropsByOrigin),
     callDropsByShapeAndExtension: sortDesc(callDropsByShapeAndExt),
     allDropsByExtension: sortDesc(byExtension),
+    // Diagnostic only, excluded from the exact-match gated projection below.
+    // Identify changed Python fixture sites before accepting a count rebaseline.
+    pythonCallDropSites: drops
+      .filter((drop) => drop.siteKind === 'call' && path.extname(drop.filePath) === '.py')
+      .map((drop) => ({
+        file: drop.filePath,
+        line: drop.range?.startLine,
+        name: drop.name,
+        origin: drop.receiverOrigin,
+      })),
   };
 }
 
@@ -1596,6 +1606,12 @@ if (updateBaseline) {
   if (diffs.length > 0) {
     console.error('[receiver-resolution] FAIL — drift against the committed baseline:');
     for (const line of diffs) console.error(`  ${line}`);
+    if (corpusPath === DEFAULT_CORPUS) {
+      console.error(
+        'Python fixture call drops:',
+        JSON.stringify(output.countArm.pythonCallDropSites),
+      );
+    }
     console.error(
       '\nIf this is intended (a fixture was added, or a shape genuinely changed state),' +
         '\nre-run with --update-baseline and explain the movement in the commit message.',

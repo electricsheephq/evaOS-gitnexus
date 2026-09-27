@@ -2365,12 +2365,20 @@ export function emitReceiverBoundCalls(
                   }
                   if (candidate === STATIC_ONLY_FILTERED) continue;
                   if (candidate !== undefined) {
-                    if (provider.arityCompatibility(site, candidate) === 'incompatible') continue;
+                    if (provider.arityCompatibility(site, candidate) === 'incompatible') {
+                      // The owner bound this name. Python-style lookup cannot
+                      // skip an incompatible override and expose a hidden base.
+                      subtypeAmbiguous = true;
+                      break;
+                    }
                     const subtypeCompatibility =
                       provider.missingReceiverSubtypeCandidateCompatibility?.(site, candidate, {
                         callerFilePath: parsed.filePath,
                       });
-                    if (subtypeCompatibility === 'incompatible') continue;
+                    if (subtypeCompatibility === 'incompatible') {
+                      subtypeAmbiguous = true;
+                      break;
+                    }
                     if (subtypeCompatibility === 'unknown') {
                       unknownCompatibilityCandidateIds.add(candidate.nodeId);
                       subtypeAmbiguous = true;

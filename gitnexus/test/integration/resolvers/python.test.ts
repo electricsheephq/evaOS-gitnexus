@@ -1227,6 +1227,13 @@ describe('Python mixin self-dispatch', () => {
     expect(lifecycleCalls).toEqual([]);
   });
 
+  it('does not treat an implicit __class_getitem__ receiver as instance fan-out', () => {
+    const genericCalls = getRelationships(result, 'CALLS').filter(
+      (call) => call.source === '__class_getitem__' && call.target === 'class_only',
+    );
+    expect(genericCalls).toEqual([]);
+  });
+
   it('suppresses positional/keyword binding mismatches during subtype dispatch', () => {
     const shapedCalls = getRelationships(result, 'CALLS').filter(
       (call) =>
@@ -1234,6 +1241,23 @@ describe('Python mixin self-dispatch', () => {
         ['keyword_only_target', 'positional_only_target'].includes(call.target),
     );
     expect(shapedCalls).toEqual([]);
+  });
+
+  it('does not expose a hidden compatible base behind an incompatible override', () => {
+    const hiddenBaseCalls = getRelationships(result, 'CALLS').filter(
+      (call) =>
+        call.source === 'positional_to_keyword_only' && call.target === 'keyword_only_target',
+    );
+    expect(hiddenBaseCalls).toEqual([]);
+  });
+
+  it('suppresses a positional call that leaves a required keyword-only parameter unsatisfied', () => {
+    const requiredKeywordCalls = getRelationships(result, 'CALLS').filter(
+      (call) =>
+        call.source === 'positional_missing_required_keyword' &&
+        call.target === 'required_keyword_target',
+    );
+    expect(requiredKeywordCalls).toEqual([]);
   });
 
   it('resolves both simple one-positional-argument mixin callers', () => {

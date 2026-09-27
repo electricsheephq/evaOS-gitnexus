@@ -3,6 +3,7 @@ from mixins import (
     ArgumentShapeMixin,
     ClassReceiverMixin,
     FieldShadowMixin,
+    GenericMixin,
     HookMixin,
     LifecycleReceiverMixin,
     MroOrderMixin,
@@ -71,12 +72,25 @@ class LifecycleReceiverWorker(LifecycleReceiverMixin):
         return 1
 
 
-class ArgumentShapeWorker(ArgumentShapeMixin):
+class GenericWorker(GenericMixin):
+    def class_only(self) -> int:
+        return 1
+
+
+class CompatibleArgumentBase:
+    def keyword_only_target(self, value: int) -> int:
+        return value
+
+
+class ArgumentShapeWorker(ArgumentShapeMixin, CompatibleArgumentBase):
     def keyword_only_target(self, *, value: int) -> int:
         return value
 
     def positional_only_target(self, value: int, /) -> int:
         return value
+
+    def required_keyword_target(self, value: int = 0, *, required: int) -> int:
+        return value + required
 
 
 class ArgumentForwardingWorker(ArgumentForwardingMixin):

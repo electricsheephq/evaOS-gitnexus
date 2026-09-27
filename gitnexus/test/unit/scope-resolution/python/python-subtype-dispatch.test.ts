@@ -21,11 +21,14 @@ const targetSource = [
   '    def target(self, value):',
   '        return value',
   'class KeywordOnly:',
-  '    def target(self, *, value):',
+  '    def target(self, *, value=0):',
   '        return value',
   'class PositionalOnly:',
   '    def target(self, value, /):',
   '        return value',
+  'class RequiredKeywordOnly:',
+  '    def target(self, value=0, *, required):',
+  '        return value + required',
 ].join('\n');
 
 const candidate = (line: number): SymbolDefinition => ({
@@ -61,8 +64,13 @@ describe('Python missing-member subtype argument shapes', () => {
       pythonMissingReceiverSubtypeCandidateCompatibility('caller.py', positionalSite, candidate(2)),
       pythonMissingReceiverSubtypeCandidateCompatibility('caller.py', positionalSite, candidate(5)),
       pythonMissingReceiverSubtypeCandidateCompatibility('caller.py', keywordSite, candidate(8)),
+      pythonMissingReceiverSubtypeCandidateCompatibility(
+        'caller.py',
+        positionalSite,
+        candidate(11),
+      ),
     ];
-    expect(fresh).toEqual(['compatible', 'incompatible', 'unknown']);
+    expect(fresh).toEqual(['compatible', 'incompatible', 'unknown', 'unknown']);
 
     beginPythonSubtypeDispatchCapture('caller.py');
     beginPythonSubtypeDispatchCapture('targets.py');
@@ -83,6 +91,11 @@ describe('Python missing-member subtype argument shapes', () => {
       pythonMissingReceiverSubtypeCandidateCompatibility('caller.py', positionalSite, candidate(2)),
       pythonMissingReceiverSubtypeCandidateCompatibility('caller.py', positionalSite, candidate(5)),
       pythonMissingReceiverSubtypeCandidateCompatibility('caller.py', keywordSite, candidate(8)),
+      pythonMissingReceiverSubtypeCandidateCompatibility(
+        'caller.py',
+        positionalSite,
+        candidate(11),
+      ),
     ]).toEqual(fresh);
   });
 });

@@ -66,14 +66,16 @@ function sameNodePosition(left: SyntaxNode, right: SyntaxNode): boolean {
 
 /**
  * Count parameters that can receive ordinary positional arguments after
- * Python's descriptor-bound receiver is removed. `*args` is deliberately
- * unknown: this successor proves fixed positional calls only.
+ * Python's descriptor-bound receiver is removed. `*args` and any required
+ * keyword-only parameter are deliberately unknown: this successor proves
+ * fixed positional calls only.
  */
 function positionalCapacity(fnNode: SyntaxNode): number | undefined {
   const parameters = fnNode.childForFieldName('parameters');
   if (parameters === null) return undefined;
   const receiver = classifyPythonBoundReceiver(fnNode)?.parameter;
   let capacity = 0;
+  let keywordOnly = false;
 
   for (const parameter of parameters.namedChildren) {
     if (parameter === null || parameter.type === 'comment') continue;
@@ -81,7 +83,11 @@ function positionalCapacity(fnNode: SyntaxNode): number | undefined {
 
     const binding = parameterBindingNode(parameter);
     if (binding.type === 'positional_separator') continue;
-    if (binding.type === 'keyword_separator' || binding.type === 'dictionary_splat_pattern') break;
+    if (binding.type === 'keyword_separator') {
+      keywordOnly = true;
+      continue;
+    }
+    if (binding.type === 'dictionary_splat_pattern') break;
     if (binding.type === 'list_splat_pattern') return undefined;
     if (
       binding.type !== 'identifier' &&
@@ -90,6 +96,12 @@ function positionalCapacity(fnNode: SyntaxNode): number | undefined {
       parameter.type !== 'typed_default_parameter'
     ) {
       return undefined;
+    }
+    if (keywordOnly) {
+      if (parameter.type !== 'default_parameter' && parameter.type !== 'typed_default_parameter') {
+        return undefined;
+      }
+      continue;
     }
     capacity++;
   }
