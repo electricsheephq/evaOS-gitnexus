@@ -199,10 +199,10 @@
     }
   },
   "countArm": {
-    "callDrops": 114,
-    "totalDropsAllKinds": 160,
+    "callDrops": 118,
+    "totalDropsAllKinds": 164,
     "bySiteKind": {
-      "call": 114,
+      "call": 118,
       "read": 27,
       "write": 19
     },
@@ -213,7 +213,7 @@
       ".ts": 7,
       ".cpp": 7,
       ".tsx": 6,
-      ".py": 6,
+      ".py": 10,
       ".go": 5,
       ".php": 4,
       ".kt": 4,
@@ -228,11 +228,11 @@
       "no-chain": 23,
       "chain-mixed": 2,
       "chain-unwrap": 1,
-      "<<unclassified>>": 1
+      "<<unclassified>>": 5
     },
     "callDropsByOrigin": {
       "external": 44,
-      "in-program": 44,
+      "in-program": 48,
       "unknown": 26
     }
   }
