@@ -415,6 +415,29 @@ jobs:
             "$PREFIX/bin/gitnexus" --version
           fi
 
+      - name: Retain tested local-patch package
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: gitnexus
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          test "$version" = '1.6.12-local.mixin.1'
+          sha256sum "gitnexus-${version}.tgz" > SHA256SUMS
+          git rev-parse HEAD > SOURCE_COMMIT
+
+      - name: Upload tested local-patch package
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gitnexus-local-mixin-package
+          path: |
+            gitnexus/gitnexus-1.6.12-local.mixin.1.tgz
+            gitnexus/SHA256SUMS
+            gitnexus/SOURCE_COMMIT
+          if-no-files-found: error
+          retention-days: 14
+
   # Node engines-floor gate (#2372). A module that statically names an API
   # newer than the supported floor (e.g. `module.registerHooks`, added in
   # 22.15) fails to LINK on the floor — a class vitest/tsx transforms

@@ -763,7 +763,11 @@ import { copyV8CacheIfPresent, tryLoadV8Cache, writeV8CacheFile } from './v8-sid
 // #3190. Old durable ParsedFiles lack the facts needed for scoped binding;
 // invalidate both stores so warm indexing actually applies the correction.
 // origin/main took 98 for #3219; 99 is the next free value.
-const SCHEMA_BUMP = 99;
+// v100 (local #3390 backport): Python call captures now carry
+// `@reference.arity` when the argument count is statically known. Warm v99
+// ParsedFiles lack that fact, so arity-aware method filtering would remain
+// inert for every unchanged file.
+const SCHEMA_BUMP = 100;
 const GITNEXUS_PKG_VERSION = (() => {
   try {
     // package.json sits at gitnexus/package.json — two levels up from

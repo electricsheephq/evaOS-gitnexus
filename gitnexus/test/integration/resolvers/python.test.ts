@@ -9,6 +9,7 @@ import {
   FIXTURES,
   CROSS_FILE_FIXTURES,
   getRelationships,
+  getResolutionOutcomes,
   getNodesByLabel,
   getNodesByLabelFull,
   edgeSet,
@@ -1075,6 +1076,108 @@ describe('Python self resolution', () => {
     const saveCall = calls.find((c) => c.target === 'save' && c.source === 'process');
     expect(saveCall).toBeDefined();
     expect(saveCall!.targetFilePath).toBe('models/user.py');
+  });
+});
+
+describe('Python mixin self-dispatch', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'python-mixin-self-dispatch'), () => {});
+  }, 60000);
+
+  it('resolves each self.helper() through direct and sibling-base implementations', () => {
+    const helperCalls = getRelationships(result, 'CALLS').filter(
+      (call) => call.target === 'helper' && ['first', 'second'].includes(call.source),
+    );
+    expect(helperCalls.map((call) => `${call.source} → ${call.targetFilePath}`).sort()).toEqual([
+      'first → helpers.py',
+      'first → worker.py',
+      'second → helpers.py',
+      'second → worker.py',
+    ]);
+  });
+
+  it('keeps the sibling-base @staticmethod reachable through instance self dispatch', () => {
+    const staticCalls = getRelationships(result, 'CALLS').filter(
+      (call) =>
+        call.target === 'helper' &&
+        call.targetFilePath === 'helpers.py' &&
+        ['first', 'second'].includes(call.source),
+    );
+    expect(staticCalls.map((call) => call.source).sort()).toEqual(['first', 'second']);
+  });
+
+  it('uses self provenance with renamed caller and target receiver parameters', () => {
+    const renamedCalls = getRelationships(result, 'CALLS').filter(
+      (call) => call.source === 'renamed' && call.target === 'helper',
+    );
+    expect(renamedCalls.map((call) => call.targetFilePath).sort()).toEqual([
+      'helpers.py',
+      'worker.py',
+    ]);
+  });
+
+  it('does not fan ordinary annotated receivers out through concrete subtypes', () => {
+    const annotatedFanout = getRelationships(result, 'CALLS').filter(
+      (call) =>
+        call.source === 'call_annotated' &&
+        call.target === 'helper' &&
+        call.rel.reason === 'interface-dispatch',
+    );
+    expect(annotatedFanout).toEqual([]);
+  });
+
+  it('does not treat a renamed classmethod receiver as instance dispatch', () => {
+    const classReceiverFanout = getRelationships(result, 'CALLS').filter(
+      (call) =>
+        call.source === 'invoke' &&
+        call.target === 'class_only' &&
+        call.rel.reason === 'interface-dispatch',
+    );
+    expect(classReceiverFanout).toEqual([]);
+    expect(
+      getResolutionOutcomes(result).some(
+        (outcome) =>
+          outcome.filePath === 'mixins.py' &&
+          outcome.name === 'class_only' &&
+          outcome.reason === 'receiver-unresolved',
+      ),
+    ).toBe(false);
+  });
+
+  it('fans an ambiguous runtime subtype dispatch out instead of picking one target', () => {
+    const runCalls = getRelationships(result, 'CALLS').filter(
+      (call) => call.source === 'dispatch' && call.target === 'run',
+    );
+    expect(runCalls.map((call) => call.targetFilePath).sort()).toEqual([
+      'ambiguous_a.py',
+      'ambiguous_b.py',
+    ]);
+  });
+
+  it('suppresses a missing self member instead of falling back to a same-named free function', () => {
+    const missingCalls = getRelationships(result, 'CALLS').filter(
+      (call) => call.source === 'missing' && call.target === 'missing_target',
+    );
+    expect(missingCalls).toEqual([]);
+    expect(
+      getResolutionOutcomes(result).some(
+        (outcome) =>
+          outcome.kind === 'suppressed' &&
+          outcome.filePath === 'mixins.py' &&
+          outcome.name === 'missing_target' &&
+          outcome.reason === 'receiver-unresolved' &&
+          outcome.receiverOrigin === 'in-program',
+      ),
+    ).toBe(true);
+  });
+
+  it('never routes mixin self-dispatch to receiver-blind decoy functions', () => {
+    const calls = getRelationships(result, 'CALLS').filter((call) =>
+      ['first', 'second', 'renamed', 'call_annotated', 'dispatch', 'missing'].includes(call.source),
+    );
+    expect(calls.some((call) => call.targetFilePath === 'decoys.py')).toBe(false);
   });
 });
 

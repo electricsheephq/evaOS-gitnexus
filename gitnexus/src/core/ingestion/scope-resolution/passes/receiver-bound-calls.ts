@@ -33,7 +33,8 @@
  *      interface-dispatch fan-out when the folded receiver type is an
  *      Interface (#2832) — same call Cases 0 and 4 make.
  *   8. **Case 4 (simple typeBinding)** — `typeRef.rawName` has no dot →
- *      MRO walk + `findOwnedMember`
+ *      MRO walk + `findOwnedMember`, then an opt-in concrete-subtype fan-out
+ *      when the normal member is missing
  *   9. **Case 5 (value-receiver bridge)** — receiver is a `Const`/`Variable`
  *      whose `nodeId` is referenced as an `ownerId` in `model.methods`
  *      (object-literal services). Last-resort fallback for lowercase
@@ -59,7 +60,13 @@
  * resolved to a wrong target.
  */
 
-import type { ParsedFile, ScopeId, SymbolDefinition } from 'gitnexus-shared';
+import type {
+  ParsedFile,
+  ReferenceSite,
+  ScopeId,
+  SymbolDefinition,
+  TypeRef,
+} from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import type { SemanticModel } from '../../model/semantic-model.js';
@@ -100,7 +107,7 @@ import {
   type GroundedTypeArgument,
   type HeritageTypeArguments,
 } from '../utils/generic-instantiation.js';
-import { resolveDefGraphId } from '../graph-bridge/ids.js';
+import { resolveCallerGraphId, resolveDefGraphId } from '../graph-bridge/ids.js';
 import {
   narrowOverloadCandidates,
   isOverloadAmbiguousAfterNormalization,
@@ -179,6 +186,8 @@ type ReceiverBoundProviderSubset = Pick<
   | 'namespaceReceiverPaths'
   | 'resolveReceiverMember'
   | 'resolveThisViaEnclosingClass'
+  | 'resolveMissingReceiverMembersFromSubtypes'
+  | 'arityCompatibility'
   | 'conversionRankFn'
   | 'conversionOnlyArgTypePrefixes'
   | 'constraintCompatibility'
@@ -662,6 +671,18 @@ export function emitReceiverBoundCalls(
     const graphId = resolveDefGraphId(def.filePath, def, nodeLookup);
     if (graphId === undefined) return false;
     return graph.getNode(graphId)?.properties.isStatic === true;
+  };
+
+  const shouldResolveMissingReceiverMembersFromSubtypes = (
+    typeRef: TypeRef,
+    site: ReferenceSite,
+  ): boolean => {
+    const predicate = provider.resolveMissingReceiverMembersFromSubtypes;
+    if (predicate === undefined) return false;
+    const callerGraphId = resolveCallerGraphId(site.inScope, scopes, nodeLookup, site.atRange);
+    const callerIsStatic =
+      callerGraphId === undefined ? undefined : graph.getNode(callerGraphId)?.properties.isStatic;
+    return predicate(typeRef, { callerIsStatic });
   };
 
   /**
@@ -2238,6 +2259,150 @@ export function emitReceiverBoundCalls(
             // if the edge was deduplicated (collapse mode), so
             // `emitReferencesViaLookup` doesn't re-emit from the
             // reference index.
+            handledSites.add(siteKey);
+            continue;
+          }
+
+          // Dynamic subtype dispatch for a receiver whose declared owner and
+          // ancestors do not define the member. The provider predicate keeps
+          // language syntax out of this shared pass; Python opts in only for
+          // instance `self` calls made from mixin-style base classes.
+          //
+          // Multiple concrete subtype implementations are runtime alternatives,
+          // not an overload ambiguity, so emit the same bounded fan-out used by
+          // interface dispatch. An ambiguity *within* any subtype is different:
+          // there is no exact target model for it, so suppress the whole site
+          // rather than publishing a partial set as complete.
+          if (
+            site.kind === 'call' &&
+            shouldResolveMissingReceiverMembersFromSubtypes(typeRef, site)
+          ) {
+            const subtypeTargets = new Map<string, SymbolDefinition>();
+            const ambiguousCandidateIds = new Set<string>();
+            const visitedSubtypeIds = new Set<string>([ownerDef.nodeId]);
+            const subtypeQueue = [ownerDef.nodeId];
+            let subtypeHead = 0;
+
+            while (subtypeHead < subtypeQueue.length) {
+              const supertypeId = subtypeQueue[subtypeHead++]!;
+              for (const subtype of subtypesBySupertypeDefId.get(supertypeId) ?? []) {
+                if (visitedSubtypeIds.has(subtype.nodeId)) continue;
+                visitedSubtypeIds.add(subtype.nodeId);
+                subtypeQueue.push(subtype.nodeId);
+
+                // Select the method this concrete subtype would actually see,
+                // not only one it owns directly. A Python mixin can be paired
+                // with a sibling base that supplies the hook:
+                //
+                //   class Worker(HookMixin, Helpers): ...
+                //
+                // `Helpers` is not itself a subtype of HookMixin, so the
+                // subtype closure cannot discover it. The already-built MRO
+                // for Worker is the authoritative bridge and preserves the
+                // provider's base-order semantics without a second graph.
+                let picked: SymbolDefinition | undefined;
+                let subtypeAmbiguous = false;
+                const effectiveOwners = [
+                  subtype.nodeId,
+                  ...scopes.methodDispatch.mroFor(subtype.nodeId),
+                ];
+                for (const effectiveOwnerId of effectiveOwners) {
+                  const overloads = model.methods.lookupAllByOwner(effectiveOwnerId, memberName);
+                  if (overloads.length === 0) continue;
+                  const candidate = pickFirstNonStaticOnly(
+                    effectiveOwnerId,
+                    memberName,
+                    site,
+                    model,
+                    provider,
+                  );
+                  if (candidate === OVERLOAD_AMBIGUOUS) {
+                    for (const overload of overloads) ambiguousCandidateIds.add(overload.nodeId);
+                    subtypeAmbiguous = true;
+                    break;
+                  }
+                  if (candidate === STATIC_ONLY_FILTERED) continue;
+                  if (candidate !== undefined) {
+                    picked = candidate;
+                    break;
+                  }
+                }
+                if (subtypeAmbiguous || picked === undefined) continue;
+                if (provider.arityCompatibility(site, picked) === 'incompatible') continue;
+                if (
+                  picked.isDeleted === true ||
+                  isDeclarationOnly(picked) ||
+                  isUnreachableByInstanceDispatch(picked)
+                ) {
+                  continue;
+                }
+                subtypeTargets.set(picked.nodeId, picked);
+              }
+            }
+
+            if (ambiguousCandidateIds.size > 0) {
+              options.recordResolutionOutcome?.({
+                kind: 'suppressed',
+                phase: 'receiver-bound-calls',
+                filePath: parsed.filePath,
+                name: site.name,
+                range: site.atRange,
+                reason: 'member-lookup-ambiguous',
+                candidateIds: [...ambiguousCandidateIds],
+              });
+              handledSites.add(siteKey);
+              continue;
+            }
+
+            const targets = [...subtypeTargets.values()];
+            if (targets.length > MAX_INTERFACE_DISPATCH_FANOUT) {
+              dispatchFanoutSkipped += targets.length - MAX_INTERFACE_DISPATCH_FANOUT;
+              if (dispatchFanoutSkippedNames.length < MAX_REPORTED_SKIPPED_INTERFACES) {
+                const dropped = targets
+                  .slice(MAX_INTERFACE_DISPATCH_FANOUT, MAX_INTERFACE_DISPATCH_FANOUT + 5)
+                  .map((target) => target.qualifiedName ?? target.nodeId);
+                const omitted = targets.length - MAX_INTERFACE_DISPATCH_FANOUT - dropped.length;
+                dispatchFanoutSkippedNames.push(
+                  `${ownerDef.qualifiedName ?? ownerDef.nodeId}.${memberName} (${targets.length} targets; ` +
+                    `dropped: ${dropped.join(', ')}${omitted > 0 ? `, +${omitted} more` : ''})`,
+                );
+              }
+              targets.length = MAX_INTERFACE_DISPATCH_FANOUT;
+            }
+
+            let emittedForSite = 0;
+            for (const target of targets) {
+              const ok = tryEmitEdge(
+                graph,
+                scopes,
+                nodeLookup,
+                site,
+                target,
+                'interface-dispatch',
+                seen,
+                0.85,
+                collapse,
+                calleeCapture,
+              );
+              if (ok) {
+                emitted++;
+                emittedForSite++;
+              }
+            }
+
+            if (emittedForSite === 0) {
+              options.recordResolutionOutcome?.({
+                kind: 'suppressed',
+                reason: 'receiver-unresolved',
+                receiverOrigin: 'in-program',
+                candidateIds: [],
+                phase: 'receiver-bound-calls',
+                filePath: parsed.filePath,
+                name: site.name,
+                range: site.atRange,
+                siteKind: site.kind,
+              });
+            }
             handledSites.add(siteKey);
             continue;
           }

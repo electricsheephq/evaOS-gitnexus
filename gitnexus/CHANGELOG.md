@@ -4,6 +4,14 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.12-local.mixin.1] - 2026-09-27
+
+### Local qualification candidate — not an official upstream release
+
+- Backport the Python mixin receiver-resolution correction from upstream PR #3390 onto the v1.6.12 release source. Retain instance-receiver provenance, effective MRO, argument compatibility, bounded ambiguous dispatch and incomplete-coverage reporting.
+- Invalidate pre-fix parsed Python call facts when an index is next analyzed. Existing graphs remain readable; affected graphs need a refresh to acquire corrected call edges. No database schema, native dependency or embedding-provider change is included.
+- This version is a local tarball candidate only, not published to npm. Plugin manifests are version-consistent source artifacts, not an instruction to install this nonexistent npm version. Managed clients must use the qualified local executable path. Preserve the previous installation and index preimages until activation and rollback checks pass.
+
 ## [1.6.12] - 2026-09-12
 
 ### Added
