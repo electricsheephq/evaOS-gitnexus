@@ -190,55 +190,72 @@ globalThis.fetch = async () => {
     });
   }, 90_000);
 
-  it('prints the localized notice on a forced-TTY stderr and keeps stdout clean', () => {
-    const home = tempHome();
-    fs.writeFileSync(
-      path.join(home, 'update-check.json'),
-      `${JSON.stringify({
-        lastCheckAt: new Date().toISOString(),
-        registry: 'https://registry.npmjs.org',
-        latestVersion: '99.0.0',
-      })}\n`,
-    );
-    const project = path.join(home, 'project');
-    const installedPackage = path.join(project, 'node_modules', 'gitnexus');
-    fs.mkdirSync(installedPackage, { recursive: true });
-    fs.cpSync(path.join(repoRoot, 'src'), path.join(installedPackage, 'src'), {
-      recursive: true,
-    });
-    fs.copyFileSync(
-      path.join(repoRoot, 'package.json'),
-      path.join(installedPackage, 'package.json'),
-    );
-    fs.symlinkSync(
-      path.join(repoRoot, 'node_modules'),
-      path.join(installedPackage, 'node_modules'),
-      'dir',
-    );
+  it.each([
+    { fixtureVersion: '1.6.12', expectsNotice: true },
+    { fixtureVersion: '1.6.12-local.mixin.1', expectsNotice: false },
+  ])(
+    'keeps forced-TTY update notices correct for $fixtureVersion',
+    ({ fixtureVersion, expectsNotice }) => {
+      const home = tempHome();
+      fs.writeFileSync(
+        path.join(home, 'update-check.json'),
+        `${JSON.stringify({
+          lastCheckAt: new Date().toISOString(),
+          registry: 'https://registry.npmjs.org',
+          latestVersion: '99.0.0',
+        })}\n`,
+      );
+      const project = path.join(home, 'project');
+      const installedPackage = path.join(project, 'node_modules', 'gitnexus');
+      fs.mkdirSync(installedPackage, { recursive: true });
+      fs.cpSync(path.join(repoRoot, 'src'), path.join(installedPackage, 'src'), {
+        recursive: true,
+      });
+      // The notifier intentionally compares stable versions only. Keep this
+      // fixture independent of whether the test suite runs on a release or RC.
+      fs.writeFileSync(
+        path.join(installedPackage, 'package.json'),
+        JSON.stringify({
+          ...JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')),
+          version: fixtureVersion,
+        }),
+      );
+      fs.symlinkSync(
+        path.join(repoRoot, 'node_modules'),
+        path.join(installedPackage, 'node_modules'),
+        'dir',
+      );
 
-    const preload = path.join(home, 'force-tty.mjs');
-    fs.writeFileSync(
-      preload,
-      `Object.defineProperty(process.stderr, 'isTTY', { value: true, configurable: true });\n`,
-    );
+      const preload = path.join(home, 'force-tty.mjs');
+      fs.writeFileSync(
+        preload,
+        `Object.defineProperty(process.stderr, 'isTTY', { value: true, configurable: true });\n`,
+      );
 
-    const result = spawnSync(
-      process.execPath,
-      [path.join(installedPackage, 'src', 'cli', 'index.ts'), 'list'],
-      {
-        cwd: project,
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...localeEnv(home),
-          NODE_OPTIONS: `--import ${tsxLoaderUrl()} --import ${pathToFileURL(preload).href}`.trim(),
+      const result = spawnSync(
+        process.execPath,
+        [path.join(installedPackage, 'src', 'cli', 'index.ts'), 'list'],
+        {
+          cwd: project,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...localeEnv(home),
+            NODE_OPTIONS:
+              `--import ${tsxLoaderUrl()} --import ${pathToFileURL(preload).href}`.trim(),
+          },
         },
-      },
-    );
+      );
 
-    expect(result.stderr).toContain(
-      `GitNexus 99.0.0 is available (you are running ${installedVersion}).`,
-    );
-    expect(result.stdout).not.toContain('99.0.0 is available');
-  });
+      expect(result.status).toBe(0);
+      if (expectsNotice) {
+        expect(result.stderr).toContain(
+          `GitNexus 99.0.0 is available (you are running ${fixtureVersion}).`,
+        );
+      } else {
+        expect(result.stderr).not.toContain('99.0.0 is available');
+      }
+      expect(result.stdout).not.toContain('99.0.0 is available');
+    },
+  );
 });
