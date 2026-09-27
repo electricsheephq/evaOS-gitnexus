@@ -26,6 +26,7 @@ import {
   pythonBindingScopeFor,
   resolvePythonImportTarget,
 } from '../../../../src/core/ingestion/languages/python/index.js';
+import { pythonMissingReceiverSubtypeDecision } from '../../../../src/core/ingestion/languages/python/scope-resolver.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -138,6 +139,50 @@ describe('pythonReceiverBinding', () => {
   it('returns null for non-Function scopes (Class / Module)', () => {
     expect(pythonReceiverBinding(fnScope({ self: userType }, 'Class'))).toBeNull();
     expect(pythonReceiverBinding(fnScope({ self: userType }, 'Module'))).toBeNull();
+  });
+});
+
+describe('pythonMissingReceiverSubtypeDecision', () => {
+  const selfType: TypeRef = {
+    rawName: 'Mixin',
+    declaredAtScope: 'scope:mixin' as ScopeId,
+    source: 'self',
+  };
+
+  it('admits instance dispatch before candidate argument-shape filtering', () => {
+    expect(
+      pythonMissingReceiverSubtypeDecision(selfType, {
+        receiverBindingIsStatic: false,
+        memberName: 'hook',
+        callArity: 0,
+      }),
+    ).toBe(true);
+    expect(
+      pythonMissingReceiverSubtypeDecision(selfType, {
+        receiverBindingIsStatic: false,
+        memberName: 'hook',
+        callArity: 1,
+      }),
+    ).toBe(true);
+  });
+
+  it('suppresses private-name mangling', () => {
+    expect(
+      pythonMissingReceiverSubtypeDecision(selfType, {
+        receiverBindingIsStatic: false,
+        memberName: '__hook',
+        callArity: 0,
+      }),
+    ).toBe('suppress');
+  });
+
+  it('declines class receivers without suppressing their ordinary resolution path', () => {
+    expect(
+      pythonMissingReceiverSubtypeDecision(
+        { ...selfType, source: 'cls' },
+        { receiverBindingIsStatic: true, memberName: 'hook', callArity: 0 },
+      ),
+    ).toBe(false);
   });
 });
 

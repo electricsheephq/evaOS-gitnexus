@@ -2830,6 +2830,32 @@ class Service:
       });
     });
 
+    it('recognizes implicit descriptor kinds for Python lifecycle methods', () => {
+      const tree = parsePython(`
+class Service:
+    def __init_subclass__(owner, flag):
+        pass
+
+    def __new__(owner, value):
+        pass
+      `);
+      const functions = tree.rootNode.descendantsOfType('function_definition');
+      const byName = new Map(
+        functions.map((node) => [node.childForFieldName('name')?.text, node] as const),
+      );
+
+      expect(
+        pythonMethodConfig
+          .extractParameters(byName.get('__init_subclass__')!)
+          .map((parameter) => parameter.name),
+      ).toEqual(['flag']);
+      expect(
+        pythonMethodConfig
+          .extractParameters(byName.get('__new__')!)
+          .map((parameter) => parameter.name),
+      ).toEqual(['owner', 'value']);
+    });
+
     it('preserves non-receiver splats, keyword-only parameters, and variadic minima', () => {
       const tree = parsePython(`
 class Service:
