@@ -35,6 +35,14 @@ const targetSource = [
   '        return value + required',
 ].join('\n');
 
+const aliasedClassmethodSource = [
+  'from builtins import classmethod as cm',
+  'class AliasedCaller:',
+  '    @cm',
+  '    def dispatch(owner, value):',
+  '        return owner.target(value)',
+].join('\n');
+
 const candidate = (line: number): SymbolDefinition => ({
   nodeId: `def:targets.py#${line}:4:Method:target`,
   filePath: 'targets.py',
@@ -59,6 +67,22 @@ const tooManySite = {
 };
 
 describe('Python missing-member subtype argument shapes', () => {
+  it('keeps unproven decorator aliases out of instance-subtype inference', () => {
+    emitPythonScopeCaptures(aliasedClassmethodSource, 'aliased-caller.py');
+    emitPythonScopeCaptures(targetSource, 'targets.py');
+
+    expect(
+      pythonMissingReceiverSubtypeCandidateCompatibility(
+        'aliased-caller.py',
+        {
+          arity: 1,
+          atRange: { startLine: 5, startCol: 15, endLine: 5, endCol: 34 },
+        },
+        candidate(2),
+      ),
+    ).toBe('unknown');
+  });
+
   it('preserves simple positional compatibility across capture snapshot restore', () => {
     const captures = emitPythonScopeCaptures(callerSource, 'caller.py');
     emitPythonScopeCaptures(targetSource, 'targets.py');

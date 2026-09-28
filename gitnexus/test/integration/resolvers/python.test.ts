@@ -1306,6 +1306,38 @@ describe('Python mixin self-dispatch', () => {
     ).toBe(true);
   });
 
+  it('does not infer instance dispatch through an unproven classmethod alias', () => {
+    const aliasedCalls = getRelationships(result, 'CALLS').filter(
+      (call) => call.source === 'dispatch_aliased' && call.target === 'aliased_hook',
+    );
+    expect(aliasedCalls).toEqual([]);
+    expect(
+      getResolutionOutcomes(result).some(
+        (outcome) =>
+          outcome.filePath === 'mixins.py' &&
+          outcome.name === 'aliased_hook' &&
+          outcome.reason === 'receiver-unresolved',
+      ),
+    ).toBe(true);
+  });
+
+  it('retains proven targets while reporting subtype coverage with no member', () => {
+    const mixedCalls = getRelationships(result, 'CALLS').filter(
+      (call) => call.source === 'dispatch_mixed' && call.target === 'mixed_hook',
+    );
+    expect(mixedCalls).toHaveLength(1);
+    expect(mixedCalls[0]!.rel.targetId).toContain('MixedCoverageResolved.mixed_hook');
+    expect(
+      getResolutionOutcomes(result).some(
+        (outcome) =>
+          outcome.filePath === 'mixins.py' &&
+          outcome.name === 'mixed_hook' &&
+          outcome.reason === 'receiver-unresolved' &&
+          outcome.candidateIds.some((id) => id.includes('MixedCoverageMissing')),
+      ),
+    ).toBe(true);
+  });
+
   it('never routes mixin self-dispatch to receiver-blind decoy functions', () => {
     const calls = getRelationships(result, 'CALLS').filter((call) =>
       [

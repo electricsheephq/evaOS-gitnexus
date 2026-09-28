@@ -257,6 +257,7 @@ function recordPythonSubtypeCallShape(
   // `decorator`, not a `call`, so they intentionally retain their old shape.
   const callNode = nodeMap[callTag];
   if (callNode === undefined || callNode.type !== 'call') return;
+  if (!pythonSubtypeReceiverDecoratorIsProven(callNode)) return;
 
   const argumentList = callNode.childForFieldName('arguments');
   if (argumentList === null || argumentList.type !== 'argument_list') return;
@@ -276,6 +277,29 @@ function recordPythonSubtypeCallShape(
   }
 
   recordPythonSimplePositionalCall(filePath, callNode, args.length);
+}
+
+/**
+ * The private fallback may only treat a receiver as instance-bound when its
+ * enclosing descriptor kind is syntactically proven. Resolving decorator
+ * aliases belongs to ordinary name resolution; an unknown decorator therefore
+ * withholds this private call-shape fact instead of inventing instance fanout.
+ */
+function pythonSubtypeReceiverDecoratorIsProven(callNode: SyntaxNode): boolean {
+  let current: SyntaxNode | null = callNode.parent;
+  while (current !== null) {
+    if (current.type === 'class_definition') return true;
+    if (current.type === 'decorated_definition') {
+      for (const child of current.namedChildren) {
+        if (child === null || child.type !== 'decorator') continue;
+        const text = child.text.replace(/^@/, '').split('(')[0]!.trim();
+        const tail = text.split('.').pop();
+        if (tail !== 'classmethod' && tail !== 'staticmethod') return false;
+      }
+    }
+    current = current.parent;
+  }
+  return true;
 }
 
 /**

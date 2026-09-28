@@ -137,3 +137,20 @@ class DuplicateDefinitionWorker(DuplicateDefinitionMixin):
 
     def duplicate_hook(self, left: int, right: int) -> int:
         return left + right
+
+
+from mixins import AliasedClassReceiverMixin, MixedCoverageMixin
+
+
+class AliasedClassReceiverWorker(AliasedClassReceiverMixin):
+    def aliased_hook(self) -> int:
+        return 1
+
+
+class MixedCoverageResolved(MixedCoverageMixin):
+    def mixed_hook(self) -> int:
+        return 1
+
+
+class MixedCoverageMissing(MixedCoverageMixin):
+    pass

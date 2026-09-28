@@ -102,3 +102,17 @@ class AbstractBoundaryMixin:
 class DuplicateDefinitionMixin:
     def dispatch_duplicate(self) -> int:
         return self.duplicate_hook(1)
+
+
+from builtins import classmethod as cm
+
+
+class AliasedClassReceiverMixin:
+    @cm
+    def dispatch_aliased(owner) -> int:
+        return owner.aliased_hook()
+
+
+class MixedCoverageMixin:
+    def dispatch_mixed(self) -> int:
+        return self.mixed_hook()

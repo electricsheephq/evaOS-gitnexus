@@ -2340,6 +2340,7 @@ export function emitReceiverBoundCalls(
             const subtypeTargets = new Map<string, SymbolDefinition>();
             const ambiguousCandidateIds = new Set<string>();
             const unknownCompatibilityCandidateIds = new Set<string>();
+            const missingMemberSubtypeIds = new Set<string>();
             const visitedSubtypeIds = new Set<string>([ownerDef.nodeId]);
             const subtypeQueue = [ownerDef.nodeId];
             let subtypeHead = 0;
@@ -2447,7 +2448,11 @@ export function emitReceiverBoundCalls(
                     subtypeAmbiguous = true;
                   }
                 }
-                if (subtypeAmbiguous || picked === undefined) continue;
+                if (subtypeAmbiguous) continue;
+                if (picked === undefined) {
+                  missingMemberSubtypeIds.add(subtype.nodeId);
+                  continue;
+                }
                 subtypeTargets.set(picked.nodeId, picked);
               }
             }
@@ -2467,7 +2472,11 @@ export function emitReceiverBoundCalls(
             const allTargets = [...subtypeTargets.values()];
             const coverage = prepareSubtypeDispatchCoverage(
               allTargets,
-              new Set([...ambiguousCandidateIds, ...unknownCompatibilityCandidateIds]),
+              new Set([
+                ...ambiguousCandidateIds,
+                ...unknownCompatibilityCandidateIds,
+                ...missingMemberSubtypeIds,
+              ]),
               MAX_INTERFACE_DISPATCH_FANOUT,
             );
             const targets = coverage.targets;
