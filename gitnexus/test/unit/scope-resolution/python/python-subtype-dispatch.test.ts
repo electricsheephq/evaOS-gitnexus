@@ -115,6 +115,36 @@ describe('Python missing-member subtype argument shapes', () => {
     ).toBe('unknown');
   });
 
+  it('declines unknown target decorators without losing known descriptor targets', () => {
+    emitPythonScopeCaptures(callerSource, 'caller.py');
+    emitPythonScopeCaptures(targetSource, 'targets.py');
+
+    expect(
+      pythonMissingReceiverSubtypeCandidateCompatibility(
+        'caller.py',
+        positionalSite,
+        candidate(2),
+        ['@am'],
+      ),
+    ).toBe('unknown');
+    expect(
+      pythonMissingReceiverSubtypeCandidateCompatibility(
+        'caller.py',
+        positionalSite,
+        candidate(2),
+        ['@staticmethod'],
+      ),
+    ).toBe('compatible');
+    expect(
+      pythonMissingReceiverSubtypeCandidateCompatibility(
+        'caller.py',
+        positionalSite,
+        candidate(2),
+        ['@builtins.classmethod'],
+      ),
+    ).toBe('compatible');
+  });
+
   it('preserves simple positional compatibility across capture snapshot restore', () => {
     const captures = emitPythonScopeCaptures(callerSource, 'caller.py');
     emitPythonScopeCaptures(targetSource, 'targets.py');

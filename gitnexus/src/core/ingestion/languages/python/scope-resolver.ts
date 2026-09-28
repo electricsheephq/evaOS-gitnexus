@@ -61,7 +61,19 @@ export function pythonMissingReceiverSubtypeCandidateCompatibility(
   callerFilePath: string,
   callsite: Pick<ReferenceSite, 'atRange'>,
   candidate: SymbolDefinition,
+  candidateAnnotations: readonly string[] = [],
 ): ArityVerdict {
+  // The extractor proves Python's built-in descriptor kinds by their literal
+  // spelling. Any other decorator may replace the callable or mark it abstract;
+  // its alias cannot be resolved from these private call-shape facts.
+  if (
+    candidateAnnotations.some((annotation) => {
+      const name = annotation.replace(/^@/, '').split('.').pop();
+      return name !== 'staticmethod' && name !== 'classmethod';
+    })
+  ) {
+    return 'unknown';
+  }
   const positionalCount = pythonSubtypeCallPositionalCount(callerFilePath, callsite.atRange);
   if (positionalCount === undefined) return 'unknown';
 
@@ -137,7 +149,12 @@ const pythonScopeResolver: ScopeResolver = {
   // target cannot be represented by the existing call-site facts.
   resolveMissingReceiverMembersFromSubtypes: pythonMissingReceiverSubtypeDecision,
   missingReceiverSubtypeCandidateCompatibility: (callsite, candidate, context) =>
-    pythonMissingReceiverSubtypeCandidateCompatibility(context.callerFilePath, callsite, candidate),
+    pythonMissingReceiverSubtypeCandidateCompatibility(
+      context.callerFilePath,
+      callsite,
+      candidate,
+      context.candidateAnnotations,
+    ),
 
   // Python permits both @staticmethod and @classmethod access through an
   // instance. The graph's generic `isStatic` bit therefore does not mean

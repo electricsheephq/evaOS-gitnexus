@@ -1437,7 +1437,10 @@ export interface ScopeResolver {
   readonly missingReceiverSubtypeCandidateCompatibility?: (
     callsite: ReferenceSite,
     candidate: SymbolDefinition,
-    context: { readonly callerFilePath: string },
+    context: {
+      readonly callerFilePath: string;
+      readonly candidateAnnotations?: readonly string[];
+    },
   ) => ArityVerdict;
 
   /**
