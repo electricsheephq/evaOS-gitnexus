@@ -1355,6 +1355,36 @@ describe('Python mixin self-dispatch', () => {
   });
 });
 
+describe('Python aliased abstract subtype target', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'python-aliased-abstract'), () => {});
+  }, 60000);
+
+  it('keeps concrete targets and marks the aliased abstract candidate unresolved', () => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (call) => call.source === 'dispatch' && call.target === 'hook',
+    );
+    expect(calls.map((call) => call.rel.targetId).sort()).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('GoodWorker.hook'),
+        expect.stringContaining('ConcreteWorker.hook'),
+      ]),
+    );
+    expect(calls).toHaveLength(2);
+    expect(
+      getResolutionOutcomes(result).some(
+        (outcome) =>
+          outcome.filePath === 'mixins.py' &&
+          outcome.name === 'hook' &&
+          outcome.reason === 'receiver-unresolved' &&
+          outcome.candidateIds.some((id) => id.includes('AliasedAbstractWorker.hook')),
+      ),
+    ).toBe(true);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Parent class resolution: EXTENDS edge
 // ---------------------------------------------------------------------------

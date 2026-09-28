@@ -2406,6 +2406,22 @@ export function emitReceiverBoundCalls(
                       subtypeAmbiguous = true;
                       break;
                     }
+                    const candidateGraphId = resolveDefGraphId(
+                      candidate.filePath,
+                      candidate,
+                      nodeLookup,
+                    );
+                    if (
+                      candidateGraphId !== undefined &&
+                      (graph.getNode(candidateGraphId)?.properties.annotations?.length ?? 0) > 0
+                    ) {
+                      // An unproven decorator may change whether this member
+                      // can be called at all. Keep the name boundary and mark
+                      // coverage incomplete rather than inventing a target.
+                      unknownCompatibilityCandidateIds.add(candidate.nodeId);
+                      subtypeAmbiguous = true;
+                      break;
+                    }
                     if (provider.arityCompatibility(site, candidate) === 'incompatible') {
                       // The owner bound this name. Python-style lookup cannot
                       // skip an incompatible override and expose a hidden base.
