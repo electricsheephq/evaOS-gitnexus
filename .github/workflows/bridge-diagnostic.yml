@@ -1,0 +1,23 @@
+name: Bounded bridge timestamp diagnostic
+
+on:
+  push:
+    branches: [diagnostic/bridge-b1d4c399]
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-order:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-gitnexus
+        with:
+          build: 'true'
+      - name: Capture synthetic database and metadata ordering
+        working-directory: gitnexus
+        run: node node_modules/vitest/vitest.mjs run test/unit/group/bridge-meta-swap-window.test.ts --maxWorkers=2 --coverage --coverage.thresholds.lines=0 --coverage.thresholds.functions=0 --coverage.thresholds.branches=0 --coverage.thresholds.statements=0

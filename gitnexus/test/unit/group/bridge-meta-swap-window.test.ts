@@ -145,13 +145,88 @@ describe('writeBridge meta.json swap window', () => {
     // still paired to a database, though: `writeBridge` renames the database in
     // and writes the metadata after, so this pair's write order is intact and
     // that is what it is judged on.
-    await writeBridge(groupDir, input([]));
-    const meta = await readBridgeMeta(groupDir);
-    const legacy = { ...meta };
-    delete legacy.bridgeSize;
-    delete legacy.bridgeMtimeMs;
+    type StampSample = {
+      phase: 'write' | 'verify';
+      file: 'db' | 'meta';
+      size: number;
+      mtimeMs: number;
+      ctimeMs: number;
+    };
+    const samples: StampSample[] = [];
+    let phase: StampSample['phase'] = 'write';
+    const nativeStat = fsp.stat.bind(fsp);
+    const statSpy = vi.spyOn(fsp, 'stat').mockImplementation(async (filePath) => {
+      const stat = await nativeStat(filePath);
+      const text = String(filePath);
+      const file = text.endsWith('bridge.lbug')
+        ? 'db'
+        : text.endsWith('meta.json')
+          ? 'meta'
+          : undefined;
+      if (file !== undefined) {
+        samples.push({
+          phase,
+          file,
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          ctimeMs: stat.ctimeMs,
+        });
+      }
+      return stat;
+    });
 
-    await expect(bridgeMetaMatchesFile(groupDir, legacy)).resolves.toBe(true);
+    try {
+      await writeBridge(groupDir, input([]));
+      const meta = await readBridgeMeta(groupDir);
+      const legacy = { ...meta };
+      delete legacy.bridgeSize;
+      delete legacy.bridgeMtimeMs;
+
+      phase = 'verify';
+      const verdict = await bridgeMetaMatchesFile(groupDir, legacy);
+      const settleSamples = samples.filter(
+        (sample) => sample.phase === 'write' && sample.file === 'db',
+      );
+      const verifyDb = samples.find((sample) => sample.phase === 'verify' && sample.file === 'db');
+      const verifyMeta = samples.find(
+        (sample) => sample.phase === 'verify' && sample.file === 'meta',
+      );
+      expect(settleSamples.length).toBeGreaterThanOrEqual(2);
+      expect(verifyDb).toBeDefined();
+      expect(verifyMeta).toBeDefined();
+
+      let delayed:
+        | { db: Omit<StampSample, 'phase' | 'file'>; meta: Omit<StampSample, 'phase' | 'file'> }
+        | undefined;
+      if (!verdict) {
+        // The verdict is already fixed. This post-failure sample cannot turn a
+        // red green; it only shows whether the native writer is STILL moving.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const [db, metaFile] = await Promise.all([
+          nativeStat(path.join(groupDir, 'bridge.lbug')),
+          nativeStat(path.join(groupDir, 'meta.json')),
+        ]);
+        delayed = {
+          db: { size: db.size, mtimeMs: db.mtimeMs, ctimeMs: db.ctimeMs },
+          meta: { size: metaFile.size, mtimeMs: metaFile.mtimeMs, ctimeMs: metaFile.ctimeMs },
+        };
+      }
+
+      process.stderr.write(
+        `[bridge-meta-order-diagnostic] ${JSON.stringify({
+          version: 1,
+          platform: process.platform,
+          node: process.version,
+          verdict,
+          stampsRemoved: legacy.bridgeSize === undefined && legacy.bridgeMtimeMs === undefined,
+          samples,
+          delayed,
+        })}\n`,
+      );
+      expect(verdict).toBe(true);
+    } finally {
+      statSpy.mockRestore();
+    }
   });
 
   it('rejects a stamp when the database is gone entirely', async () => {
