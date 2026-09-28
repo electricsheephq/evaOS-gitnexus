@@ -1379,7 +1379,7 @@ describe('Python aliased abstract subtype target', () => {
           outcome.filePath === 'mixins.py' &&
           outcome.name === 'hook' &&
           outcome.reason === 'receiver-unresolved' &&
-          outcome.candidateIds.some((id) => id.includes('AliasedAbstractWorker.hook')),
+          outcome.candidateIds.includes('def:worker.py#13:4:Method:hook'),
       ),
     ).toBe(true);
   });

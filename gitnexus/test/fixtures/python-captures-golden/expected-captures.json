@@ -19,6 +19,14 @@
     "captureGroups": 13,
     "digest": "cec30bb7577edfb751bcd4f5026a0c9d77ed235071421a2a46f87580c7bcdf47"
   },
+  "python-aliased-abstract/mixins.py": {
+    "captureGroups": 9,
+    "digest": "39dd43fa895c15c0d2aaa16592cdfd722e66f57ab5d3f2c8f7414fa032a7ee99"
+  },
+  "python-aliased-abstract/worker.py": {
+    "captureGroups": 30,
+    "digest": "c63350ba6236611b3100aa85539bc07d908007b6556910a454588d964f4297b8"
+  },
   "python-ambiguous/models/__init__.py": {
     "captureGroups": 0,
     "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
