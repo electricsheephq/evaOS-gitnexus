@@ -43,6 +43,19 @@ const aliasedClassmethodSource = [
   '        return owner.target(value)',
 ].join('\n');
 
+const zeroArgumentTargetsSource = [
+  'class ReceiverlessWorker:',
+  '    def target():',
+  '        return 1',
+  'class InstanceWorker:',
+  '    def target(self):',
+  '        return 1',
+  'class StaticWorker:',
+  '    @staticmethod',
+  '    def target():',
+  '        return 1',
+].join('\n');
+
 const candidate = (line: number): SymbolDefinition => ({
   nodeId: `def:targets.py#${line}:4:Method:target`,
   filePath: 'targets.py',
@@ -67,6 +80,25 @@ const tooManySite = {
 };
 
 describe('Python missing-member subtype argument shapes', () => {
+  it('rejects receiverless instance methods while preserving zero-argument descriptors', () => {
+    emitPythonScopeCaptures(callerSource, 'caller.py');
+    emitPythonScopeCaptures(zeroArgumentTargetsSource, 'zero-targets.py');
+
+    const zeroCandidate = (line: number): SymbolDefinition => ({
+      nodeId: `def:zero-targets.py#${line}:4:Method:target`,
+      filePath: 'zero-targets.py',
+      type: 'Method',
+      parameterCount: 0,
+      requiredParameterCount: 0,
+    });
+
+    expect([
+      pythonMissingReceiverSubtypeCandidateCompatibility('caller.py', tooFewSite, zeroCandidate(2)),
+      pythonMissingReceiverSubtypeCandidateCompatibility('caller.py', tooFewSite, zeroCandidate(5)),
+      pythonMissingReceiverSubtypeCandidateCompatibility('caller.py', tooFewSite, zeroCandidate(9)),
+    ]).toEqual(['unknown', 'compatible', 'compatible']);
+  });
+
   it('keeps unproven decorator aliases out of instance-subtype inference', () => {
     emitPythonScopeCaptures(aliasedClassmethodSource, 'aliased-caller.py');
     emitPythonScopeCaptures(targetSource, 'targets.py');

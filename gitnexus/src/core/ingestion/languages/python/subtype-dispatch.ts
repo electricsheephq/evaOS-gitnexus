@@ -69,6 +69,17 @@ function sameNodePosition(left: SyntaxNode, right: SyntaxNode): boolean {
   );
 }
 
+function hasLiteralDecorator(fnNode: SyntaxNode, decoratorName: string): boolean {
+  const parent = fnNode.parent;
+  if (parent === null || parent.type !== 'decorated_definition') return false;
+  for (const child of parent.namedChildren) {
+    if (child === null || child.type !== 'decorator') continue;
+    const text = child.text.replace(/^@/, '').split('(')[0]!.trim();
+    if (text.split('.').pop() === decoratorName) return true;
+  }
+  return false;
+}
+
 /**
  * Count parameters that can receive ordinary positional arguments after
  * Python's descriptor-bound receiver is removed. `*args` and any required
@@ -79,6 +90,13 @@ function positionalCapacity(fnNode: SyntaxNode): number | undefined {
   const parameters = fnNode.childForFieldName('parameters');
   if (parameters === null) return undefined;
   const receiver = classifyPythonBoundReceiver(fnNode)?.parameter;
+  if (
+    receiver === undefined &&
+    fnNode.childForFieldName('name')?.text !== '__new__' &&
+    !hasLiteralDecorator(fnNode, 'staticmethod')
+  ) {
+    return undefined;
+  }
   let capacity = 0;
   let keywordOnly = false;
 
